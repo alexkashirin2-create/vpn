@@ -25,8 +25,10 @@
 # МОСТ — если зарубежный сервер не открывается из России. Телефоны подключаются
 # к российскому серверу; российские сайты он открывает сам, а зарубежные — через
 # зарубежный сервер. Запускать на РОССИЙСКОМ сервере и выбрать «2) Мост»: скрипт
-# спросит IP и пароль root зарубежного сервера и сам настроит его по SSH.
-# Без меню: EXIT_HOST=IP-зарубежного-сервера bash <(curl -fsSL …)
+# спросит IP, логин и пароль зарубежного сервера и сам настроит его по SSH.
+# Всё одной командой, без вопросов — IP, логин и пароль зарубежного сервера прямо в команде:
+#   EXIT_HOST=IP EXIT_USER=root EXIT_PASS='пароль' DOMAIN=auto bash <(curl -fsSL …)
+# (логин не root — подойдёт пользователь с правами sudo)
 #
 # Повторный запуск на том же сервере безопасен: ключи VPN сохраняются (меняется
 # только пароль панели); после смены IP сервера ссылки сами переходят на новый IP.
@@ -47,7 +49,8 @@ LABEL="${LABEL:-MyVPN-Reality}"       # имя подключения и под�
 BLOCK_ADS="${BLOCK_ADS:-1}"           # 1 — блокировать рекламу и трекеры, 0 — не блокировать
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
-EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль root зарубежного сервера (пусто — спросить)
+EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
+EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль этого логина (пусто — спросить)
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"  # мост: порт SSH зарубежного сервера
 EXIT_VPN_PORT="${EXIT_VPN_PORT:-443}" # мост: порт, на котором зарубежный сервер ждёт российский
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh}"
@@ -117,6 +120,7 @@ apt_retry() {  # apt-get с ожиданием: на новом сервере �
 BRIDGE=0
 BRIDGE_FILE="/etc/x-ui/vpn-bridge.json"   # параметры зарубежного выхода — для повторных запусков
 SAVED_EXIT="$(sed -n 's/.*"host": *"\([^"]*\)".*/\1/p' "$BRIDGE_FILE" 2>/dev/null | head -n 1 || true)"
+SAVED_EXIT_USER="$(sed -n 's/.*"user": *"\([^"]*\)".*/\1/p' "$BRIDGE_FILE" 2>/dev/null | head -n 1 || true)"
 if [ "$VPN_ROLE" = "exit" ]; then
   EXIT_HOST=""
 else
@@ -152,11 +156,21 @@ if [ -n "$EXIT_HOST" ]; then
   EXIT_HOST="$(printf '%s' "$EXIT_HOST" | tr -d '[:space:]')"
   is_ipv4 "$EXIT_HOST" || [[ "$EXIT_HOST" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] \
     || die "IP зарубежного сервера указан неверно: ${EXIT_HOST}"
+  EXIT_SAVED=0
+  if [ "$EXIT_HOST" = "$SAVED_EXIT" ] && [ -s "$BRIDGE_FILE" ]; then EXIT_SAVED=1; fi
+  DEF_USER="root"
+  if [ "$EXIT_SAVED" = "1" ] && [ -n "$SAVED_EXIT_USER" ]; then DEF_USER="$SAVED_EXIT_USER"; fi
+  if [ -z "$EXIT_USER" ] && [ -z "$EXIT_PASS" ] && [ "$EXIT_SAVED" = "0" ] && [ "$HAS_TTY" = "1" ]; then
+    tty_read EXIT_USER "Логин на ${EXIT_HOST} [${DEF_USER}]: "
+    EXIT_USER="${EXIT_USER// /}"
+  fi
+  EXIT_USER="${EXIT_USER:-$DEF_USER}"
+  [[ "$EXIT_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die "Логин зарубежного сервера указан неверно: ${EXIT_USER}"
   if [ -z "$EXIT_PASS" ] && [ "$HAS_TTY" = "1" ]; then
-    if [ "$EXIT_HOST" = "$SAVED_EXIT" ] && [ -s "$BRIDGE_FILE" ]; then
-      tty_read EXIT_PASS "Пароль root на ${EXIT_HOST} (просто Enter — не трогать, он уже настроен): " -s
+    if [ "$EXIT_SAVED" = "1" ]; then
+      tty_read EXIT_PASS "Пароль ${EXIT_USER} на ${EXIT_HOST} (просто Enter — не трогать, он уже настроен): " -s
     else
-      tty_read EXIT_PASS "Пароль root на ${EXIT_HOST} (при вводе не отображается): " -s
+      tty_read EXIT_PASS "Пароль ${EXIT_USER} на ${EXIT_HOST} (при вводе не отображается): " -s
     fi
   fi
 fi
@@ -335,10 +349,13 @@ exit_ssh() {   # exit_ssh команда — выполнить на заруб�
               -o ServerAliveInterval=20 -o ServerAliveCountMax=9 -o LogLevel=ERROR)
   if [ -n "$EXIT_PASS" ]; then
     SSHPASS="$EXIT_PASS" sshpass -e ssh "${opts[@]}" -o PubkeyAuthentication=no \
-      -o NumberOfPasswordPrompts=1 "root@${EXIT_HOST}" "$@"
+      -o NumberOfPasswordPrompts=1 "${EXIT_USER}@${EXIT_HOST}" "$@"
   else
-    ssh "${opts[@]}" -o BatchMode=yes "root@${EXIT_HOST}" "$@"
+    ssh "${opts[@]}" -o BatchMode=yes "${EXIT_USER}@${EXIT_HOST}" "$@"
   fi
+}
+exit_input() {   # что подать на вход удалённой команде: пароль для sudo (логин не root) или ничего
+  if [ "$EXIT_USER" != "root" ] && [ -n "$EXIT_PASS" ]; then printf '%s\n' "$EXIT_PASS"; fi
 }
 exit_filter() {   # вывод зарубежного сервера — на экран с отступом, параметры подключения — в файл
   local line
@@ -350,7 +367,7 @@ exit_filter() {   # вывод зарубежного сервера — на э
   done
 }
 setup_exit() {
-  local out rc try cmd self="$WORK/self.sh"
+  local out rc try cmd sudo="" self="$WORK/self.sh"
   tcp_ok "$EXIT_HOST" "$EXIT_SSH_PORT" || die "Этот сервер не может подключиться к ${EXIT_HOST} (SSH, порт ${EXIT_SSH_PORT}).
 Если IP верный — связь между серверами закрыта, и мост через этот зарубежный сервер не заработает."
   for try in 1 2 3; do
@@ -362,12 +379,17 @@ setup_exit() {
         die "SSH-ключ сервера ${EXIT_HOST} сменился (его переустанавливали?). Выполните: ssh-keygen -R ${EXIT_HOST} — и запустите скрипт снова." ;;
     esac
     if [ "$rc" = "5" ] || [[ "$out" == *"Permission denied"* ]]; then
-      { [ "$HAS_TTY" = "1" ] && [ "$try" -lt 3 ]; } || die "Не удалось войти на ${EXIT_HOST}: неверный пароль root."
-      tty_read EXIT_PASS "Пароль не подошёл. Пароль root на ${EXIT_HOST}: " -s
+      { [ "$HAS_TTY" = "1" ] && [ "$try" -lt 3 ]; } || die "Не удалось войти на ${EXIT_HOST}: неверный логин или пароль (логин ${EXIT_USER})."
+      tty_read EXIT_PASS "Пароль не подошёл. Пароль ${EXIT_USER} на ${EXIT_HOST}: " -s
       continue
     fi
     die "Не удалось подключиться к ${EXIT_HOST} по SSH: $(printf '%s' "$out" | tail -n 2)"
   done
+  if [ "$EXIT_USER" != "root" ]; then   # не root — настраиваем через sudo
+    if [ -n "$EXIT_PASS" ]; then sudo="sudo -S -p '' env"; else sudo="sudo -n env"; fi
+    exit_input | exit_ssh "${sudo} true" >/dev/null 2>&1 \
+      || die "У пользователя ${EXIT_USER} на ${EXIT_HOST} нет прав sudo. Нужен root или пользователь с правами sudo."
+  fi
   # на зарубежный сервер уходит этот же скрипт
   if [ -f "$0" ] && grep -q 'VPN_ROLE' "$0" 2>/dev/null; then
     cp "$0" "$self"
@@ -376,12 +398,12 @@ setup_exit() {
       || die "Не удалось скачать скрипт для зарубежного сервера: ${SCRIPT_URL}"
   fi
   grep -q 'VPN_ROLE' "$self" || die "По адресу ${SCRIPT_URL} лежит старая версия скрипта — загрузите новую в репозиторий."
-  exit_ssh "cat > /root/install-vpn-all.sh && chmod 700 /root/install-vpn-all.sh" < "$self" \
+  exit_ssh "cat > install-vpn-all.sh && chmod 700 install-vpn-all.sh" < "$self" \
     || die "Не удалось передать скрипт на ${EXIT_HOST}."
-  printf -v cmd 'VPN_ROLE=exit VPN_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q bash /root/install-vpn-all.sh' \
-    "$EXIT_VPN_PORT" "$SNI" "bridge-exit" "$XUI_VERSION"
+  printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q bash install-vpn-all.sh' \
+    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER"
   rm -f "$WORK/exit.json"
-  if ! exit_ssh "$cmd" 2>&1 </dev/null | exit_filter; then
+  if ! exit_input | exit_ssh "$cmd" 2>&1 | exit_filter; then
     die "Настройка зарубежного сервера не удалась (подробности — выше)."
   fi
   [ -s "$WORK/exit.json" ] || die "Зарубежный сервер не вернул параметры подключения (подробности — выше)."
@@ -391,16 +413,17 @@ EXIT_PORT=""
 if [ "$BRIDGE" = "1" ]; then
   step "Настраиваю зарубежный сервер ${EXIT_HOST} — выход моста..."
   [ "$EXIT_HOST" != "$SERVER_IP" ] || die "${EXIT_HOST} — это IP самого сервера. Для моста нужен второй, зарубежный сервер."
-  if [ -z "$EXIT_PASS" ] && [ "$EXIT_HOST" = "$SAVED_EXIT" ] && [ -s "$BRIDGE_FILE" ]; then
+  if [ -z "$EXIT_PASS" ] && [ "$EXIT_SAVED" = "1" ]; then
     grn "    Зарубежный сервер уже настроен — беру его прежние параметры."
     cp "$BRIDGE_FILE" "$WORK/exit.json"
   else
     setup_exit
   fi
-  EXIT_HOST="$EXIT_HOST" python3 - "$WORK/exit.json" "$WORK/bridge.json" "$WORK/bridge-out.json" > "$WORK/exit-port" <<'PY' || die "Не удалось разобрать параметры зарубежного сервера."
+  EXIT_HOST="$EXIT_HOST" EXIT_USER="$EXIT_USER" python3 - "$WORK/exit.json" "$WORK/bridge.json" "$WORK/bridge-out.json" > "$WORK/exit-port" <<'PY' || die "Не удалось разобрать параметры зарубежного сервера."
 import json, os, sys
 p = json.load(open(sys.argv[1]))
 p["host"] = os.environ["EXIT_HOST"]          # адрес — тот, по которому этот сервер до него достаёт
+p["user"] = os.environ["EXIT_USER"]           # логин — чтобы при повторном запуске предложить его же
 if not all(p.get(k) for k in ("port", "id", "pbk", "sni")):
     raise SystemExit(1)
 p.setdefault("flow", "xtls-rprx-vision")
@@ -720,7 +743,7 @@ if [ "$VPN_ROLE" = "exit" ]; then   # зарубежный сервер мост
 Настраивается с российского сервера тем же скриптом (режим «Мост»).
 
 === Веб-панель 3X-UI (открыта только изнутри сервера) ===
-Открыть с компьютера: ssh -L 8080:127.0.0.1:${PANEL_PORT} root@${SERVER_IP}
+Открыть с компьютера: ssh -L 8080:127.0.0.1:${PANEL_PORT} ${EXIT_LOGIN:-root}@${SERVER_IP}
 и затем в браузере:   ${API_SCHEME}://127.0.0.1:8080/${WEBPATH}
 Логин:  ${PANEL_USER}
 Пароль: ${PANEL_PASS}

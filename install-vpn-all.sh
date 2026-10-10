@@ -3,7 +3,10 @@
 # ЕДИНЫЙ УСТАНОВЩИК ДЛЯ НОВОГО СЕРВЕРА (одна команда):
 #   • панель 3X-UI (веб-интерфейс)
 #   • подключение VLESS + XTLS-Reality с уникальными ключами
-#   • бесплатный домен DuckDNS + SSL Let's Encrypt (панель и подписка) + авто-продление
+#   • адрес для подключения на выбор:
+#       1) домен, который создаётся автоматически (ИП-сервера.sslip.io) — без регистрации;
+#       2) IP сервера;  3) свой домен.
+#     SSL-сертификат Let's Encrypt на этот адрес (панель и подписка) + авто-продление
 #   • ПОДПИСКА С РАЗДЕЛЬНОЙ МАРШРУТИЗАЦИЕЙ И ФИЛЬТРАЦИЕЙ:
 #       российские сайты и российские IP-адреса (.ru .su .рф, Яндекс, VK,
 #       Госуслуги, банки, маркетплейсы…) — напрямую, через интернет пользователя;
@@ -14,26 +17,21 @@
 #     настраивать не нужно — только один раз добавить ссылку-подписку.
 #     Реклама дополнительно режется и на самом сервере — для любых приложений.
 #
-# ПЕРЕД ЗАПУСКОМ:
-#   Откройте https://www.duckdns.org, войдите, в поле "sub domain" впишите имя
-#   (например myvpn) и нажмите "add domain". Это имя подставьте в SUB ниже.
+# ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
+# Скрипт спросит, как подключаться (просто Enter — домен создастся автоматически).
+# Без вопросов: DOMAIN=auto | DOMAIN=ip | DOMAIN=vpn.example.ru  bash <(curl -fsSL …)
 #
-# ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root:
-#   SUB=myvpn bash install-vpn-all.sh
-#
-# Повторный запуск на том же сервере безопасен: ключи VPN и ссылка-подписка
-# сохраняются (меняется только пароль панели) — так можно, например, дочинить SSL.
+# Повторный запуск на том же сервере безопасен: ключи VPN сохраняются (меняется
+# только пароль панели); после смены IP сервера ссылки сами переходят на новый IP.
 #
 # Списки можно поменять в панели: Настройки → Подписка →
 # «Профиль маршрутизации для JSON-подписки» (после правки увеличьте LastUpdated).
 #
 set -euo pipefail
 
-# ============================ ЗАПОЛНИТЬ ============================
-SUB="${SUB:-}"                                           # имя поддомена DuckDNS (без .duckdns.org)
-TOKEN="${TOKEN:-c67abc8d-4f66-41b8-87bb-db7883241572}"   # токен DuckDNS
-EMAIL="${EMAIL:-alexkashirin2@gmail.com}"                # почта для Let's Encrypt
-# ===================== опционально (можно не трогать) =====================
+# ===================== настройки (можно не трогать) =====================
+DOMAIN="${DOMAIN:-}"                  # auto — домен создастся сам, ip — по IP, или свой домен; пусто — спросить
 SNI="${SNI:-www.microsoft.com}"       # домен-маскировка Reality (TLS 1.3, открыт из РФ)
 VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
 PANEL_PORT="${PANEL_PORT:-}"          # порт панели (пусто = случайный, при повторном запуске — прежний)
@@ -45,7 +43,6 @@ XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = пос�
 # ==========================================================================
 
 XUI_TESTED_VERSION="v3.9.0"           # проверенная версия — запасной вариант
-DOMAIN="${SUB}.duckdns.org"
 XUI_DIR="/usr/local/x-ui"
 XUI_BIN="${XUI_DIR}/x-ui"
 DB="/etc/x-ui/x-ui.db"
@@ -63,8 +60,6 @@ die() { red "$*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Запустите под root (sudo -i)."
 command -v apt-get >/dev/null 2>&1 || die "Нужен Ubuntu/Debian (apt)."
-[ -n "$SUB" ] || die "Укажите имя поддомена DuckDNS: SUB=myvpn bash install-vpn-all.sh"
-[ -n "$TOKEN" ] || die "Не задан токен DuckDNS (TOKEN=...)."
 [ "$BLOCK_ADS" = "0" ] || BLOCK_ADS=1
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
 
@@ -163,10 +158,10 @@ github_diag() {  # понятная причина, если GitHub не отд�
 grn "[1/10] Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
-apt-get install -y curl openssl qrencode python3 certbot ca-certificates >/dev/null
+apt-get install -y curl openssl qrencode python3 socat cron ca-certificates >/dev/null
 
 # ============================================================================
-grn "[2/10] Определяю IP сервера и привязываю домен ${DOMAIN}..."
+grn "[2/10] Определяю IP сервера..."
 SERVER_IP=""
 for u in https://api.ipify.org https://ipv4.icanhazip.com https://4.ident.me https://ifconfig.me/ip; do
   SERVER_IP="$(curl -4 -fsS --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
@@ -174,19 +169,54 @@ for u in https://api.ipify.org https://ipv4.icanhazip.com https://4.ident.me htt
   SERVER_IP=""
 done
 [ -n "$SERVER_IP" ] || die "Не удалось определить внешний IPv4 сервера."
-DUCK_OK=0
-DUCK_RESP="$(curl -fsS --max-time 20 "https://www.duckdns.org/update?domains=${SUB}&token=${TOKEN}&ip=${SERVER_IP}" 2>/dev/null || true)"
-if [ "$DUCK_RESP" = "OK" ]; then
-  DUCK_OK=1
-  grn "    DuckDNS: OK (${DOMAIN} → ${SERVER_IP})"
-  # авто-обновление IP домена раз в сутки
-  mkdir -p /opt/duckdns
-  printf '#!/usr/bin/env bash\ncurl -s "https://www.duckdns.org/update?domains=%s&token=%s&ip=" >/dev/null 2>&1\n' "$SUB" "$TOKEN" > /opt/duckdns/update.sh
-  chmod 700 /opt/duckdns/update.sh
-  ( crontab -l 2>/dev/null | grep -v '/opt/duckdns/update.sh' || true; echo "17 4 * * * /opt/duckdns/update.sh" ) | crontab - 2>/dev/null || true
-else
-  ylw "    DuckDNS вернул '${DUCK_RESP:-нет ответа}' (ожидалось OK). Проверьте имя поддомена и токен."
+grn "    IP сервера: ${SERVER_IP}"
+ADDR_FILE="/etc/x-ui/vpn-address"     # запоминаем выбор для повторных запусков
+SAVED_MODE="$(cat "$ADDR_FILE" 2>/dev/null || true)"     # auto | ip | свой домен
+AUTO_DOMAIN="${SERVER_IP//./-}.sslip.io"                  # «быстрый» домен: сразу указывает на IP
+norm_domain() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's#^[a-z]+://##; s#[/:].*$##; s#\.$##; s#[[:space:]]##g'; }
+is_ipv4() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+MODE="$DOMAIN"
+if [ -z "$MODE" ] && { : </dev/tty; } 2>/dev/null; then
+  case "$SAVED_MODE" in ip) DEF=2 ;; ""|auto) DEF=1 ;; *) DEF=3 ;; esac
+  {
+    echo
+    echo "Как телефоны будут подключаться к серверу?"
+    echo "  1) Домен создастся автоматически: ${AUTO_DOMAIN} — быстро, без регистрации"
+    echo "  2) По IP ${SERVER_IP}"
+    echo "  3) Свой домен$([ "$DEF" = "3" ] && echo " (сейчас: ${SAVED_MODE})") — он должен указывать на ${SERVER_IP}"
+    printf 'Ваш выбор [%s]: ' "$DEF"
+  } > /dev/tty
+  IFS= read -r CHOICE < /dev/tty || CHOICE=""
+  CHOICE="${CHOICE// /}"
+  case "${CHOICE:-$DEF}" in
+    1) MODE=auto ;;
+    2) MODE=ip ;;
+    3) if [ "$DEF" = "3" ]; then printf 'Домен [%s]: ' "$SAVED_MODE" > /dev/tty; else printf 'Домен (например, vpn.example.ru): ' > /dev/tty; fi
+       IFS= read -r MODE < /dev/tty || MODE=""
+       [ -n "${MODE// /}" ] || { [ "$DEF" = "3" ] && MODE="$SAVED_MODE"; }
+       [ -n "${MODE// /}" ] || die "Домен не указан." ;;
+    *) die "Нужно ввести 1, 2 или 3." ;;
+  esac
 fi
+[ -n "$MODE" ] || MODE="${SAVED_MODE:-auto}"
+case "$MODE" in
+  auto) ADDR="$AUTO_DOMAIN" ;;
+  ip) ADDR="$SERVER_IP" ;;
+  *)
+    MODE="$(norm_domain "$MODE")"
+    if is_ipv4 "$MODE"; then MODE=ip; ADDR="$SERVER_IP"
+    else
+      [[ "$MODE" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]] || die "Домен указан неверно: ${MODE}"
+      ADDR="$MODE"
+      DNS_IPS="$(python3 -c 'import socket,sys;print(" ".join(sorted({a[4][0] for a in socket.getaddrinfo(sys.argv[1],443,socket.AF_INET)})))' "$ADDR" 2>/dev/null || true)"
+      if [ -z "$DNS_IPS" ]; then
+        ylw "    Домен ${ADDR} пока не находится в DNS — сертификат может не выпуститься."
+      elif [[ " $DNS_IPS " != *" $SERVER_IP "* ]]; then
+        ylw "    Домен ${ADDR} указывает на ${DNS_IPS}, а IP сервера ${SERVER_IP} — проверьте A-запись домена."
+      fi
+    fi ;;
+esac
+grn "    Адрес для подключения: ${ADDR}"
 
 # ============================================================================
 grn "[3/10] Устанавливаю панель 3X-UI..."
@@ -256,7 +286,62 @@ systemctl start x-ui
 wait_api || die "Панель не запустилась. Логи: journalctl -u x-ui -e"
 
 # ============================================================================
-grn "[5/10] Готовлю подключение VLESS + Reality..."
+grn "[5/10] Выпускаю SSL-сертификат на ${ADDR}..."
+SSL_OK=0
+CERT=""; KEY=""
+ACME="/root/.acme.sh/acme.sh"
+cert_fresh() {   # есть ли сертификат именно на этот адрес, действующий ещё хотя бы сутки
+  local text
+  [ -s "$CERT" ] && [ -s "$KEY" ] || return 1
+  openssl x509 -in "$CERT" -noout -checkend 86400 >/dev/null 2>&1 || return 1
+  text="$(openssl x509 -in "$CERT" -noout -text 2>/dev/null || true)"
+  if is_ipv4 "$ADDR"; then
+    [[ "$text" =~ IP\ Address:${ADDR//./\\.}(,|[[:space:]]|$) ]]
+  else
+    [[ "$text" =~ DNS:${ADDR//./\\.}(,|[[:space:]]|$) ]]
+  fi
+}
+setup_ssl() {
+  CERT="/root/cert/${ADDR}/fullchain.pem"; KEY="/root/cert/${ADDR}/privkey.pem"
+  if cert_fresh; then return 0; fi
+  if [ ! -x "$ACME" ]; then
+    curl -fsSL https://get.acme.sh | HOME=/root sh >"$WORK/acme-install.log" 2>&1 || true
+  fi
+  [ -x "$ACME" ] || { ylw "    Не удалось установить acme.sh."; return 1; }
+  "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  # на IP Let's Encrypt даёт сертификат на ~6 дней, на домен — на 90; acme.sh сам продлевает по cron
+  local life=(--days 60)
+  is_ipv4 "$ADDR" && life=(--certificate-profile shortlived --days 3)
+  if ! "$ACME" --issue -d "$ADDR" --standalone --httpport 80 --server letsencrypt \
+       "${life[@]}" --force >"$WORK/acme.log" 2>&1; then
+    ylw "    Let's Encrypt не выдал сертификат (порт 80 должен быть открыт снаружи):"
+    tail -n 4 "$WORK/acme.log"
+    return 1
+  fi
+  mkdir -p "/root/cert/${ADDR}"
+  "$ACME" --install-cert -d "$ADDR" --key-file "$KEY" --fullchain-file "$CERT" \
+    --reloadcmd "systemctl restart x-ui" >"$WORK/acme-inst.log" 2>&1 || true
+  chmod 600 "$KEY" 2>/dev/null || true
+  cert_fresh || { ylw "    Файлы сертификата не найдены после выпуска."; return 1; }
+  return 0
+}
+if setup_ssl; then
+  SSL_OK=1
+elif [ "$MODE" = "auto" ]; then
+  # у «быстрого» домена есть запасные варианты: зеркало nip.io, затем сам IP
+  for alt in "${SERVER_IP}.nip.io" "$SERVER_IP"; do
+    ylw "    Пробую запасной адрес: ${alt}"
+    ADDR="$alt"
+    if setup_ssl; then SSL_OK=1; break; fi
+  done
+  [ "$SSL_OK" = "1" ] || ADDR="$SERVER_IP"
+fi
+if [ "$SSL_OK" = "1" ]; then
+  grn "    SSL: OK (сертификат на ${ADDR}, продлевается автоматически)"
+fi
+
+# ============================================================================
+grn "[6/10] Готовлю подключение VLESS + Reality..."
 XRAY_BIN=""
 for f in "$XUI_DIR"/bin/xray-linux-*; do
   if [ -x "$f" ]; then XRAY_BIN="$f"; break; fi
@@ -314,7 +399,7 @@ create_inbound() {
   # (например, подключение удаляли), берём следующее свободное имя
   for n in $(seq 1 20); do
     UUID="$UUID" PRIVATE_KEY="$PRIVATE_KEY" PUBLIC_KEY="$PUBLIC_KEY" SHORT_ID="$SHORT_ID" SUB_ID="$SUB_ID" \
-    SNI="$SNI" VPN_PORT="$VPN_PORT" LABEL="$LABEL" SERVER_IP="$SERVER_IP" CLIENT_EMAIL="user${n}" \
+    SNI="$SNI" VPN_PORT="$VPN_PORT" LABEL="$LABEL" SHARE_ADDR="$ADDR" CLIENT_EMAIL="user${n}" \
     python3 - > "$WORK/inbound.json" <<'PY'
 import json, os
 e = os.environ
@@ -335,8 +420,8 @@ sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"],
             "metadataOnly": False, "routeOnly": False}
 print(json.dumps({"remark": e["LABEL"], "enable": True, "listen": "", "port": int(e["VPN_PORT"]),
                   "protocol": "vless", "expiryTime": 0, "total": 0,
-                  # в ссылках всегда IP сервера — подключение не зависит от DNS
-                  "shareAddrStrategy": "custom", "shareAddr": e["SERVER_IP"],
+                  # адрес в ссылках — выбранный IP или домен
+                  "shareAddrStrategy": "custom", "shareAddr": e["SHARE_ADDR"],
                   "settings": json.dumps(settings), "streamSettings": json.dumps(stream),
                   "sniffing": json.dumps(sniffing)}))
 PY
@@ -351,11 +436,46 @@ PY
   die "Не удалось подобрать свободное имя клиента."
 }
 
+sync_share_addr() {   # ссылки в подписке должны вести на выбранный адрес (важно после смены IP или домена)
+  local st
+  api GET "/inbounds/get/${INB_ID}" > "$WORK/inb-get.json" || return 1
+  st="$(SHARE_ADDR="$ADDR" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
+import json, os, sys
+ib = json.load(open(sys.argv[1]))["obj"]
+if isinstance(ib, str):
+    ib = json.loads(ib)
+ip = os.environ["SHARE_ADDR"]
+if ib.get("shareAddrStrategy") == "custom" and ib.get("shareAddr") == ip:
+    print("same"); raise SystemExit
+ib["shareAddrStrategy"], ib["shareAddr"] = "custom", ip
+for key in ("settings", "streamSettings", "sniffing"):
+    value = ib.get(key)
+    if not isinstance(value, str):
+        ib[key] = json.dumps(value or {})
+ib.pop("clientStats", None)
+json.dump(ib, open(sys.argv[2], "w"))
+print("changed")
+PY
+)"
+  case "$st" in
+    same) return 0 ;;
+    changed)
+      api POST "/inbounds/update/${INB_ID}" "$WORK/inb-upd.json" > "$WORK/inb-res.json" || return 1
+      if api_ok "$WORK/inb-res.json" >/dev/null; then
+        grn "    Адрес в ссылках обновлён: ${ADDR}"
+        return 0
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
 case "${STATE:-error}" in
   reuse)
     [ "$SHORT_ID" = "-" ] && SHORT_ID=""
     [ "$OLD_SNI" != "-" ] && SNI="$OLD_SNI"
     grn "    На порту ${VPN_PORT} уже есть подключение — оставляю его, ключи прежние."
+    sync_share_addr || ylw "    Не удалось обновить адрес сервера в ссылках — проверьте подключение в панели."
     ;;
   replace)
     ylw "    Порт ${VPN_PORT} занят другим подключением — заменяю его."
@@ -372,9 +492,9 @@ esac
 
 # ============================================================================
 if [ "$BLOCK_ADS" = "1" ]; then
-  grn "[6/10] Включаю фильтр рекламы и трекеров на сервере..."
+  grn "[7/10] Включаю фильтр рекламы и трекеров на сервере..."
 else
-  grn "[6/10] Фильтр рекламы на сервере выключен (BLOCK_ADS=0)..."
+  grn "[7/10] Фильтр рекламы на сервере выключен (BLOCK_ADS=0)..."
 fi
 # Правило в маршрутизации самого сервера: даже приложение, которое не умеет
 # принимать правила из подписки, не получит рекламу через VPN.
@@ -418,37 +538,6 @@ if [ "$SERVER_FILTER" = "1" ]; then
   if [ "$BLOCK_ADS" = "1" ]; then grn "    Сервер блокирует рекламу и трекеры для всего VPN-трафика."; fi
 else
   ylw "    Не удалось изменить правила сервера — фильтр будет работать только в приложениях."
-fi
-
-# ============================================================================
-grn "[7/10] Настраиваю домен ${DOMAIN} и SSL..."
-SSL_OK=0
-CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-KEY="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-setup_ssl() {
-  [ "$DUCK_OK" = "1" ] || { ylw "    Домен не привязан (DuckDNS) — SSL пропущен."; return 1; }
-  local r ok=0 _
-  for _ in $(seq 1 30); do
-    r="$(python3 -c 'import socket,sys;print(socket.gethostbyname(sys.argv[1]))' "$DOMAIN" 2>/dev/null || true)"
-    [ "$r" = "$SERVER_IP" ] && { ok=1; break; }
-    sleep 5
-  done
-  [ "$ok" = "1" ] || { ylw "    Домен пока не указывает на ${SERVER_IP} — SSL отложен."; return 1; }
-  if ! certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" \
-       --deploy-hook "systemctl restart x-ui" >"$WORK/certbot.log" 2>&1; then
-    ylw "    certbot не выпустил сертификат (порт 80 должен быть открыт снаружи):"
-    tail -n 5 "$WORK/certbot.log"
-    return 1
-  fi
-  { [ -s "$CERT" ] && [ -s "$KEY" ]; } || { ylw "    Файлы сертификата не найдены."; return 1; }
-  return 0
-}
-if setup_ssl; then
-  SSL_OK=1
-  grn "    SSL: OK"
-elif [ -s "$CERT" ] && [ -s "$KEY" ]; then
-  SSL_OK=1
-  ylw "    Использую ранее выпущенный сертификат."
 fi
 
 # ============================================================================
@@ -525,18 +614,21 @@ read -r SUB_PATH JSON_PATH < "$WORK/paths"
 if [ "$SSL_OK" = "1" ]; then
   # одна команда ставит сертификат и на панель, и на сервер подписки
   "$XUI_BIN" setting -webCert "$CERT" -webCertKey "$KEY" >/dev/null 2>&1 || SSL_OK=0
+elif [[ "$("$XUI_BIN" setting -getCert 2>/dev/null || true)" =~ cert:\ *[^[:space:]] ]]; then
+  # старый сертификат (например, на прежний домен) не подходит для работы по IP
+  "$XUI_BIN" cert -reset >/dev/null 2>&1 || true
 fi
 systemctl start x-ui
 wait_api || die "Панель не запустилась после настройки подписки. Логи: journalctl -u x-ui -e"
 
 # ============================================================================
 grn "[9/10] Проверяю подписку и фильтры..."
-if [ "$SSL_OK" = "1" ]; then SUB_BASE="https://${DOMAIN}:${SUB_PORT}"; else SUB_BASE="http://${SERVER_IP}:${SUB_PORT}"; fi
+if [ "$SSL_OK" = "1" ]; then SUB_BASE="https://${ADDR}:${SUB_PORT}"; else SUB_BASE="http://${ADDR}:${SUB_PORT}"; fi
 SUB_URL="${SUB_BASE}${SUB_PATH}${SUB_ID}"
 JSON_URL="${SUB_BASE}${JSON_PATH}${SUB_ID}"
 fetch_local() {   # fetch_local USER-AGENT /путь  ->  $WORK/h (заголовки), $WORK/b (тело)
   local _ target=("http://127.0.0.1:${SUB_PORT}$2")
-  [ "$SSL_OK" = "1" ] && target=(--resolve "${DOMAIN}:${SUB_PORT}:127.0.0.1" "https://${DOMAIN}:${SUB_PORT}$2")
+  [ "$SSL_OK" = "1" ] && target=("https://127.0.0.1:${SUB_PORT}$2")
   for _ in $(seq 1 10); do
     if curl -sk --noproxy '*' --connect-timeout 3 --max-time 10 -A "$1" -D "$WORK/h" -o "$WORK/b" "${target[@]}" 2>/dev/null \
        && head -n 1 "$WORK/h" | grep -q ' 200'; then
@@ -590,11 +682,11 @@ esac
 
 # ============================================================================
 grn "[10/10] Формирую профиль..."
-VLESS_URL="vless://${UUID}@${SERVER_IP}:${VPN_PORT}?type=tcp&encryption=none&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#${LABEL}"
+VLESS_URL="vless://${UUID}@${ADDR}:${VPN_PORT}?type=tcp&encryption=none&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#${LABEL}"
 if [ "$API_SCHEME" = "https" ] && [ "$SSL_OK" = "1" ]; then
-  PANEL_URL="https://${DOMAIN}:${PANEL_PORT}/${WEBPATH}"
+  PANEL_URL="https://${ADDR}:${PANEL_PORT}/${WEBPATH}"
 else
-  PANEL_URL="${API_SCHEME}://${SERVER_IP}:${PANEL_PORT}/${WEBPATH}"
+  PANEL_URL="${API_SCHEME}://${ADDR}:${PANEL_PORT}/${WEBPATH}"
 fi
 if [ "$BLOCK_ADS" = "1" ]; then ADS_TEXT="блокируются"; else ADS_TEXT="не блокируются (BLOCK_ADS=0)"; fi
 
@@ -603,7 +695,7 @@ ylw "==================== ВЕБ-ПАНЕЛЬ 3X-UI ===================="
 echo "Адрес:  ${PANEL_URL}"
 echo "Логин:  ${PANEL_USER}"
 echo "Пароль: ${PANEL_PASS}"
-if [ "$SSL_OK" = "1" ]; then echo "SSL:    включён (https), заходите по домену ${DOMAIN}"; fi
+if [ "$SSL_OK" = "1" ]; then echo "SSL:    включён (https, сертификат на ${ADDR})"; fi
 echo
 ylw "========================== ПОДПИСКА =========================="
 echo "Добавьте в приложение ЭТУ ссылку (один раз):"
@@ -623,20 +715,21 @@ echo "JSON-вариант той же подписки (для приложен�
 echo "  ${JSON_URL}"
 if [ "$SSL_OK" != "1" ]; then
   echo
-  ylw "SSL не настроился (причина — выше, на шаге 7), поэтому подписка пока работает по http."
+  ylw "SSL не настроился (причина — выше, на шаге 5), поэтому подписка пока работает по http."
   ylw "v2rayNG примет её только с галочкой «Разрешать незащищённые HTTP-адреса» в настройках подписки."
-  ylw "Когда домен заработает, запустите скрипт ещё раз — ключи VPN сохранятся, а подписка"
-  ylw "переедет на https://${DOMAIN}:${SUB_PORT}/… (её нужно будет добавить в приложение заново):"
-  echo  "   SUB=${SUB} bash install-vpn-all.sh"
+  ylw "Откройте снаружи порт 80 и запустите установку ещё раз той же командой — ключи VPN"
+  ylw "сохранятся, а подписка переедет на https://${ADDR}:${SUB_PORT}/… (её нужно будет"
+  ylw "добавить в приложение заново)."
 fi
 
 umask 077
+printf '%s\n' "$MODE" > "$ADDR_FILE" 2>/dev/null || true
 cat > "$PROFILE" <<TXT
 === Веб-панель 3X-UI ===
 Адрес:  ${PANEL_URL}
 Логин:  ${PANEL_USER}
 Пароль: ${PANEL_PASS}
-SSL:    $([ "$SSL_OK" = "1" ] && echo "включён (домен ${DOMAIN})" || echo "не настроен")
+SSL:    $([ "$SSL_OK" = "1" ] && echo "включён (сертификат на ${ADDR})" || echo "не настроен")
 
 === Подписка (добавлять в приложение) ===
 Ссылка:      ${SUB_URL}
@@ -644,7 +737,7 @@ JSON-версия: ${JSON_URL}
 Правила: РФ-сайты и РФ-IP — напрямую; реклама и трекеры — ${ADS_TEXT}; остальное — через VPN.
 
 === Подключение VLESS + Reality ===
-Сервер:    ${SERVER_IP}:${VPN_PORT}
+Сервер:    ${ADDR}:${VPN_PORT} (IP ${SERVER_IP})
 SNI:       ${SNI}
 UUID:      ${UUID}
 PublicKey: ${PUBLIC_KEY}

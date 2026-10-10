@@ -47,7 +47,7 @@ LABEL="${LABEL:-MyVPN-Reality}"       # имя подключения и под�
 BLOCK_ADS="${BLOCK_ADS:-1}"           # 1 — блокировать рекламу и трекеры, 0 — не блокировать
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
-EXIT_PASS="${EXIT_PASS:oHQXPwM6r0Kb}"            # мост: пароль root зарубежного сервера (пусто — спросить)
+EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль root зарубежного сервера (пусто — спросить)
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"  # мост: порт SSH зарубежного сервера
 EXIT_VPN_PORT="${EXIT_VPN_PORT:-443}" # мост: порт, на котором зарубежный сервер ждёт российский
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh}"

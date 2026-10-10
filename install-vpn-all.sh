@@ -82,16 +82,25 @@ wait_api() {   # ждёт, пока панель ответит; сам опре
   done
   return 1
 }
+api_curl() {   # запрос к панели; если она как раз перезапускается — подождать и повторить
+  local rc _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl "$@" && return 0
+    rc=$?
+    case "$rc" in 7|28|35|52|56) sleep 3 ;; *) return "$rc" ;; esac
+  done
+  return 1
+}
 api() {        # api МЕТОД /путь [файл-с-JSON]
   local args=(-sk --noproxy '*' --max-time 60 -X "$1" -H "Authorization: Bearer ${API_TOKEN}")
   if [ -n "${3:-}" ]; then args+=(-H 'Content-Type: application/json' --data-binary "@$3"); fi
-  curl "${args[@]}" "${API_SCHEME}://127.0.0.1:${PANEL_PORT}/${WEBPATH}/panel/api$2"
+  api_curl "${args[@]}" "${API_SCHEME}://127.0.0.1:${PANEL_PORT}/${WEBPATH}/panel/api$2"
 }
 api_form() {   # api_form /путь поле=значение... (форма, как отправляет сама панель)
   local path="$1" args=(-sk --noproxy '*' --max-time 60 -X POST -H "Authorization: Bearer ${API_TOKEN}") f
   shift
   for f in "$@"; do args+=(--data-urlencode "$f"); done
-  curl "${args[@]}" "${API_SCHEME}://127.0.0.1:${PANEL_PORT}/${WEBPATH}/panel/api${path}"
+  api_curl "${args[@]}" "${API_SCHEME}://127.0.0.1:${PANEL_PORT}/${WEBPATH}/panel/api${path}"
 }
 api_ok() {     # api_ok файл-ответа — успешен ли ответ панели (иначе печатает причину)
   python3 -c 'import json,sys
@@ -339,6 +348,8 @@ fi
 if [ "$SSL_OK" = "1" ]; then
   grn "    SSL: OK (сертификат на ${ADDR}, продлевается автоматически)"
 fi
+# acme.sh после выпуска сам перезапускает панель — дожидаемся, пока она снова ответит
+wait_api || die "Панель не запустилась после выпуска сертификата. Логи: journalctl -u x-ui -e"
 
 # ============================================================================
 grn "[6/10] Готовлю подключение VLESS + Reality..."

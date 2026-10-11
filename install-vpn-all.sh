@@ -16,6 +16,10 @@
 #     (Happ, v2rayNG, v2rayN), обновляются автоматически. На телефонах ничего
 #     настраивать не нужно — только один раз добавить ссылку-подписку.
 #     Реклама дополнительно режется и на самом сервере — для любых приложений.
+#   • СКОРОСТЬ: BBR и большие буферы TCP, QUIC переводится на TCP, IPv4 без ожидания IPv6;
+#     в подписке два подключения — XHTTP с переиспользованием соединений (как у
+#     коммерческих VPN, сайты открываются быстрее) и обычное Reality (запасное).
+#     В конце скрипт сам меряет скорость и показывает, где узкое место.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -42,21 +46,28 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"                  # auto — домен создастся сам, ip — по IP, или свой домен; пусто — спросить
 SNI="${SNI:-www.microsoft.com}"       # домен-маскировка Reality (TLS 1.3, открыт из РФ)
 VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
+XHTTP_PORT="${XHTTP_PORT:-8443}"      # второе подключение VLESS + XHTTP (сайты открываются быстрее); 0 — не создавать
+WS_PORT="${WS_PORT:-2083}"            # третье подключение VLESS + WebSocket + TLS (как «LTE»-профили, проходит через CDN); 0 — нет
 PANEL_PORT="${PANEL_PORT:-}"          # порт панели (пусто = случайный, при повторном запуске — прежний)
 SUB_PORT="${SUB_PORT:-2096}"          # порт, с которого приложения забирают подписку
 PANEL_USER="${PANEL_USER:-admin}"     # логин в панель
 LABEL="${LABEL:-MyVPN-Reality}"       # имя подключения и подписки в приложении
 BLOCK_ADS="${BLOCK_ADS:-1}"           # 1 — блокировать рекламу и трекеры, 0 — не блокировать
+BLOCK_QUIC="${BLOCK_QUIC:-1}"         # 1 — QUIC (UDP 443) через VPN гасится: приложения сразу берут TCP, так быстрее
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
 EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
 EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль этого логина (пусто — спросить)
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"  # мост: порт SSH зарубежного сервера
 EXIT_VPN_PORT="${EXIT_VPN_PORT:-443}" # мост: порт, на котором зарубежный сервер ждёт российский
+EXIT_XHTTP_PORT="${EXIT_XHTTP_PORT:-8443}" # мост: порт XHTTP на зарубежном сервере (0 — только TCP)
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh}"
 # ==========================================================================
 VPN_ROLE="${VPN_ROLE:-}"              # служебное: exit — так скрипт запускается на зарубежном сервере моста
 TUNNEL_TEST_URLS="${TUNNEL_TEST_URLS:-https://api.ipify.org https://ipv4.icanhazip.com https://4.ident.me}"
+SPEED_URLS="${SPEED_URLS:-https://speed.cloudflare.com/__down?bytes=100000000 http://speedtest.tele2.net/100MB.zip}"
+# XHTTP: сколько запросов идёт по одному соединению и как долго оно живёт (как у коммерческих VPN)
+XMUX_JSON='{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":30}'
 
 XUI_TESTED_VERSION="v3.9.0"           # проверенная версия — запасной вариант
 XUI_DIR="/usr/local/x-ui"
@@ -77,6 +88,11 @@ die() { red "$*"; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "Запустите под root (sudo -i)."
 command -v apt-get >/dev/null 2>&1 || die "Нужен Ubuntu/Debian (apt)."
 [ "$BLOCK_ADS" = "0" ] || BLOCK_ADS=1
+[ "$BLOCK_QUIC" = "0" ] || BLOCK_QUIC=1
+if ! [[ "$XHTTP_PORT" =~ ^[0-9]+$ ]] || [ "$XHTTP_PORT" -gt 65535 ]; then die "XHTTP_PORT указан неверно: ${XHTTP_PORT}"; fi
+XHTTP_LABEL="${XHTTP_LABEL:-${LABEL%-Reality}-XHTTP}"
+if ! [[ "$WS_PORT" =~ ^[0-9]+$ ]] || [ "$WS_PORT" -gt 65535 ]; then die "WS_PORT указан неверно: ${WS_PORT}"; fi
+WS_LABEL="${WS_LABEL:-${LABEL%-Reality}-WS}"
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
 
 WORK="$(mktemp -d)"
@@ -114,6 +130,52 @@ apt_retry() {  # apt-get с ожиданием: на новом сервере �
   done
   tail -n 5 "$WORK/apt.err"
   return 1
+}
+
+tune_network() {   # ускорение TCP: BBR, большие буферы, без «засыпания» соединений (сразу и после перезагрузки)
+  local conf=/etc/sysctl.d/99-vpn-speed.conf
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  {
+    echo "# install-vpn-all.sh: ускорение TCP для VPN"
+    echo "net.core.default_qdisc = fq"
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+      echo "net.ipv4.tcp_congestion_control = bbr"
+    fi
+    echo "net.core.rmem_max = 33554432"
+    echo "net.core.wmem_max = 33554432"
+    echo "net.ipv4.tcp_rmem = 4096 131072 33554432"
+    echo "net.ipv4.tcp_wmem = 4096 65536 33554432"
+    echo "net.core.netdev_max_backlog = 16384"
+    echo "net.ipv4.tcp_mtu_probing = 1"
+    echo "net.ipv4.tcp_slow_start_after_idle = 0"
+    echo "net.ipv4.tcp_notsent_lowat = 131072"
+    echo "net.ipv4.tcp_tw_reuse = 1"
+    echo "net.ipv4.tcp_fin_timeout = 15"
+  } > "$conf"
+  echo "tcp_bbr" > /etc/modules-load.d/vpn-bbr.conf 2>/dev/null || true
+  sysctl -p "$conf" >/dev/null 2>&1 || true   # в контейнерах (OpenVZ, LXC) часть параметров менять нельзя — это не ошибка
+  if [ "$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+    grn "    Сеть ускорена: BBR и увеличенные буферы TCP."
+  else
+    ylw "    BBR на этом сервере недоступен (ограничение ядра или виртуализации) — оставляю стандартный режим."
+  fi
+}
+speed_mbit() {   # speed_mbit [прокси] — скорость скачивания за ~10 секунд, Мбит/с (пусто — не удалось измерить)
+  local u bps mbit urls=() args=()
+  read -ra urls <<< "$SPEED_URLS"
+  if [ -n "${1:-}" ]; then args=(-x "$1"); fi
+  for u in "${urls[@]}"; do
+    bps="$(env -u no_proxy -u NO_PROXY curl -s -o /dev/null --connect-timeout 8 --max-time 10 "${args[@]}" \
+      -w '%{speed_download}' "$u" 2>/dev/null || true)"
+    mbit="$(python3 -c 'import sys
+try:
+    v = float(sys.argv[1]) * 8 / 1e6
+except ValueError:
+    v = 0
+print(int(v) if v >= 1 else "")' "${bps:-0}" 2>/dev/null || true)"
+    if [ -n "$mbit" ]; then echo "$mbit"; return 0; fi
+  done
+  echo ""
 }
 
 # ---------- режим: один сервер или мост (этот сервер в России → зарубежный) ----------
@@ -175,7 +237,7 @@ if [ -n "$EXIT_HOST" ]; then
   fi
 fi
 
-if [ "$VPN_ROLE" = "exit" ]; then TOTAL=6; elif [ "$BRIDGE" = "1" ]; then TOTAL=11; else TOTAL=10; fi
+if [ "$VPN_ROLE" = "exit" ]; then TOTAL=7; elif [ "$BRIDGE" = "1" ]; then TOTAL=11; else TOTAL=10; fi
 STEP=0
 step() { STEP=$((STEP + 1)); grn "[${STEP}/${TOTAL}] $*"; }
 
@@ -277,12 +339,13 @@ github_diag() {  # понятная причина, если GitHub не отд�
 }
 
 # ============================================================================
-step "Устанавливаю зависимости..."
+step "Устанавливаю зависимости и ускоряю сеть..."
 export DEBIAN_FRONTEND=noninteractive
-PKGS=(curl openssl qrencode python3 socat cron ca-certificates)
+PKGS=(curl openssl qrencode python3 socat cron ca-certificates kmod)
 if [ "$BRIDGE" = "1" ]; then PKGS+=(openssh-client sshpass); fi
 apt_retry update -y || die "Не удалось обновить список пакетов (apt-get update)."
 apt_retry install -y "${PKGS[@]}" || die "Не удалось установить пакеты: ${PKGS[*]}"
+tune_network
 
 # ============================================================================
 step "Определяю IP сервера..."
@@ -400,8 +463,8 @@ setup_exit() {
   grep -q 'VPN_ROLE' "$self" || die "По адресу ${SCRIPT_URL} лежит старая версия скрипта — загрузите новую в репозиторий."
   exit_ssh "cat > install-vpn-all.sh && chmod 700 install-vpn-all.sh" < "$self" \
     || die "Не удалось передать скрипт на ${EXIT_HOST}."
-  printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q bash install-vpn-all.sh' \
-    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER"
+  printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q XHTTP_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q bash install-vpn-all.sh' \
+    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$EXIT_XHTTP_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER"
   rm -f "$WORK/exit.json"
   if ! exit_input | exit_ssh "$cmd" 2>&1 | exit_filter; then
     die "Настройка зарубежного сервера не удалась (подробности — выше)."
@@ -409,7 +472,7 @@ setup_exit() {
   [ -s "$WORK/exit.json" ] || die "Зарубежный сервер не вернул параметры подключения (подробности — выше)."
 }
 
-EXIT_PORT=""
+EXIT_PORT=""; EXIT_NET_SPEED=""; EXIT_RTT=""; EXIT_XPORT=""
 if [ "$BRIDGE" = "1" ]; then
   step "Настраиваю зарубежный сервер ${EXIT_HOST} — выход моста..."
   [ "$EXIT_HOST" != "$SERVER_IP" ] || die "${EXIT_HOST} — это IP самого сервера. Для моста нужен второй, зарубежный сервер."
@@ -418,8 +481,10 @@ if [ "$BRIDGE" = "1" ]; then
     cp "$BRIDGE_FILE" "$WORK/exit.json"
   else
     setup_exit
+    EXIT_FRESH=1
   fi
-  EXIT_HOST="$EXIT_HOST" EXIT_USER="$EXIT_USER" python3 - "$WORK/exit.json" "$WORK/bridge.json" "$WORK/bridge-out.json" > "$WORK/exit-port" <<'PY' || die "Не удалось разобрать параметры зарубежного сервера."
+  rm -f "$WORK/bridge-out-x.json"
+  EXIT_HOST="$EXIT_HOST" EXIT_USER="$EXIT_USER" XMUX="$XMUX_JSON" python3 - "$WORK/exit.json" "$WORK/bridge.json" "$WORK/bridge-out.json" > "$WORK/exit-port" <<'PY' || die "Не удалось разобрать параметры зарубежного сервера."
 import json, os, sys
 p = json.load(open(sys.argv[1]))
 p["host"] = os.environ["EXIT_HOST"]          # адрес — тот, по которому этот сервер до него достаёт
@@ -440,12 +505,48 @@ out = {"tag": "bridge-exit", "protocol": "vless",
                                               "shortId": p["sid"], "fingerprint": p["fp"] or "chrome",
                                               "spiderX": "/"}}}
 json.dump(out, open(sys.argv[3], "w"))
-print(int(p["port"]))
+# второй выход — XHTTP с переиспользованием соединений (xmux), если он есть на зарубежном сервере
+x = p.get("xhttp") or {}
+xport = "-"
+if all(x.get(k) for k in ("port", "pbk", "sni", "path")):
+    xo = {"tag": "bridge-exit-x", "protocol": "vless",
+          "settings": {"vnext": [{"address": p["host"], "port": int(x["port"]),
+                                  "users": [{"id": p["id"], "encryption": "none"}]}]},
+          "streamSettings": {"network": "xhttp", "security": "reality",
+                             "xhttpSettings": {"path": x["path"], "mode": "auto",
+                                               "extra": {"xPaddingBytes": "100-1000",
+                                                         "xmux": json.loads(os.environ["XMUX"])}},
+                             "realitySettings": {"serverName": x["sni"], "publicKey": x["pbk"],
+                                                 "shortId": x.get("sid") or "", "fingerprint": "chrome",
+                                                 "spiderX": "/"}}}
+    json.dump(xo, open(sys.argv[3].replace(".json", "-x.json"), "w"))
+    xport = int(x["port"])
+print(int(p["port"]), p.get("speed") or "-", xport)
 PY
-  read -r EXIT_PORT < "$WORK/exit-port" || true
+  read -r EXIT_PORT EXIT_NET_SPEED EXIT_XPORT < "$WORK/exit-port" || true
+  # скорость интернета выхода показываем, только если её только что измерили
+  if [ "${EXIT_FRESH:-0}" != "1" ] || ! [[ "$EXIT_NET_SPEED" =~ ^[0-9]+$ ]]; then EXIT_NET_SPEED=""; fi
   tcp_ok "$EXIT_HOST" "$EXIT_PORT" \
     || die "С этого сервера не открывается ${EXIT_HOST}:${EXIT_PORT} — мост через этот зарубежный сервер не заработает."
-  grn "    Выход моста готов: ${EXIT_HOST}:${EXIT_PORT}"
+  EXIT_RTT="$(python3 - "$EXIT_HOST" "$EXIT_PORT" <<'PY' 2>/dev/null || true
+import socket, sys, time
+best = None
+for _ in range(3):                      # задержка до выхода — лучшая из трёх попыток
+    t = time.time()
+    try:
+        socket.create_connection((sys.argv[1], int(sys.argv[2])), 5).close()
+    except OSError:
+        continue
+    ms = (time.time() - t) * 1000
+    best = ms if best is None else min(best, ms)
+print(int(best) if best is not None else "")
+PY
+)"
+  if [ -s "$WORK/bridge-out-x.json" ] && ! tcp_ok "$EXIT_HOST" "$EXIT_XPORT"; then
+    ylw "    XHTTP-порт ${EXIT_XPORT} зарубежного сервера недоступен — мост пойдёт только по TCP."
+    rm -f "$WORK/bridge-out-x.json"
+  fi
+  grn "    Выход моста готов: ${EXIT_HOST}:${EXIT_PORT}$([ -s "$WORK/bridge-out-x.json" ] && echo " и XHTTP :${EXIT_XPORT}")${EXIT_RTT:+, задержка ${EXIT_RTT} мс}"
 fi
 
 # ============================================================================
@@ -505,10 +606,12 @@ if [ "$FRESH" = "0" ]; then   # прежние порт и путь панели
 fi
 LISTEN_ARGS=()
 OPEN_PORTS=("$VPN_PORT" "$PANEL_PORT" "$SUB_PORT" 80)
-if [ "$VPN_ROLE" = "exit" ]; then   # у выхода моста панель не видна из интернета, открыт только порт VPN
+if [ "$VPN_ROLE" = "exit" ]; then   # у выхода моста панель не видна из интернета, открыты только порты VPN
   LISTEN_ARGS=(-listenIP 127.0.0.1)
   OPEN_PORTS=("$VPN_PORT")
 fi
+if [ "$XHTTP_PORT" != "0" ]; then OPEN_PORTS+=("$XHTTP_PORT"); fi
+if [ "$WS_PORT" != "0" ] && [ "$VPN_ROLE" != "exit" ]; then OPEN_PORTS+=("$WS_PORT"); fi
 systemctl stop x-ui >/dev/null 2>&1 || true   # базу панели меняем, пока она остановлена
 "$XUI_BIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$WEBPATH" \
   "${LISTEN_ARGS[@]}" >/dev/null 2>&1 \
@@ -613,14 +716,14 @@ for ib in data.get("obj") or []:
         c = clients[0]
         print("reuse", ib["id"], c["id"], c["subId"], pub,
               (rs.get("shortIds") or [""])[0] or "-", (rs.get("serverNames") or ["-"])[0] or "-",
-              ib.get("tag") or "-", c.get("flow") or "-")
+              ib.get("tag") or "-", c.get("flow") or "-", c.get("email") or "-")
     else:
         print("replace", ib["id"])
     break
 else:
     print("none")
 PY
-read -r STATE INB_ID UUID SUB_ID PUBLIC_KEY SHORT_ID OLD_SNI INB_TAG CLIENT_FLOW < "$WORK/state" || true
+read -r STATE INB_ID UUID SUB_ID PUBLIC_KEY SHORT_ID OLD_SNI INB_TAG CLIENT_FLOW CLIENT_EMAIL < "$WORK/state" || true
 
 create_inbound() {
   local keys="" n msg
@@ -670,6 +773,7 @@ PY
     if msg="$(api_ok "$WORK/add.json")"; then
       INB_TAG="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["obj"].get("tag") or "-")' "$WORK/add.json" 2>/dev/null || echo "-")"
       CLIENT_FLOW="xtls-rprx-vision"
+      CLIENT_EMAIL="user${n}"
       return 0
     fi
     case "$msg" in *"Duplicate email"*) continue ;; esac
@@ -678,9 +782,9 @@ PY
   die "Не удалось подобрать свободное имя клиента."
 }
 
-sync_share_addr() {   # ссылки в подписке должны вести на выбранный адрес (важно после смены IP или домена)
-  local st
-  api GET "/inbounds/get/${INB_ID}" > "$WORK/inb-get.json" || return 1
+sync_share_addr() {   # sync_share_addr [id] — ссылки в подписке должны вести на выбранный адрес (после смены IP или домена)
+  local st id="${1:-$INB_ID}"
+  api GET "/inbounds/get/${id}" > "$WORK/inb-get.json" || return 1
   st="$(SHARE_ADDR="$ADDR" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
 import json, os, sys
 ib = json.load(open(sys.argv[1]))["obj"]
@@ -702,7 +806,7 @@ PY
   case "$st" in
     same) return 0 ;;
     changed)
-      api POST "/inbounds/update/${INB_ID}" "$WORK/inb-upd.json" > "$WORK/inb-res.json" || return 1
+      api POST "/inbounds/update/${id}" "$WORK/inb-upd.json" > "$WORK/inb-res.json" || return 1
       if api_ok "$WORK/inb-res.json" >/dev/null; then
         grn "    Адрес в ссылках обновлён: ${ADDR}"
         return 0
@@ -733,38 +837,273 @@ case "${STATE:-error}" in
     ;;
 esac
 
-# ============================================================================
-if [ "$VPN_ROLE" = "exit" ]; then   # зарубежный сервер моста готов: отдаём параметры российскому
-  step "Выход моста готов."
-  umask 077
-  cat > "$PROFILE" <<TXT
-=== Этот сервер — выход моста ===
-Принимает подключения российского сервера на порту ${VPN_PORT} (VLESS + Reality, SNI ${SNI}).
-Настраивается с российского сервера тем же скриптом (режим «Мост»).
-
-=== Веб-панель 3X-UI (открыта только изнутри сервера) ===
-Открыть с компьютера: ssh -L 8080:127.0.0.1:${PANEL_PORT} ${EXIT_LOGIN:-root}@${SERVER_IP}
-и затем в браузере:   ${API_SCHEME}://127.0.0.1:8080/${WEBPATH}
-Логин:  ${PANEL_USER}
-Пароль: ${PANEL_PASS}
-TXT
-  chmod 600 "$PROFILE"
-  grn "    Панель закрыта от интернета, доступы к ней — в ${PROFILE} на этом сервере."
-  SERVER_IP="$SERVER_IP" VPN_PORT="$VPN_PORT" UUID="$UUID" CLIENT_FLOW="$CLIENT_FLOW" SNI="$SNI" \
-  PUBLIC_KEY="$PUBLIC_KEY" SHORT_ID="$SHORT_ID" python3 -c 'import json, os
+# Второе подключение — VLESS + XHTTP + Reality, как у коммерческих VPN: соединения
+# переиспользуются (xmux), поэтому новые сайты открываются без лишних рукопожатий.
+XHTTP_OK=0; XHTTP_ID=""; XHTTP_PBK=""; XHTTP_SID=""; XHTTP_SNI=""; XHTTP_PATH=""
+ensure_xhttp() {
+  local st keys priv has msg
+  if [ "$XHTTP_PORT" = "0" ]; then return 0; fi
+  if [ "$XHTTP_PORT" = "$VPN_PORT" ]; then ylw "    XHTTP_PORT совпадает с VPN_PORT — XHTTP пропускаю."; return 0; fi
+  if [ "${CLIENT_EMAIL:--}" = "-" ]; then ylw "    Не нашёл имя клиента — XHTTP пропускаю."; return 0; fi
+  api GET /inbounds/list > "$WORK/inbounds-x.json" || return 1
+  st="$(XHTTP_PORT="$XHTTP_PORT" UUID="$UUID" python3 - "$WORK/inbounds-x.json" <<'PY' 2>/dev/null || echo "error"
+import json, os, sys
+data = json.load(open(sys.argv[1]))
+if not data.get("success"):
+    print("error"); raise SystemExit
+def obj(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v) if v else {}
+        except ValueError:
+            return {}
+    return v or {}
+port = int(os.environ["XHTTP_PORT"])
+for ib in data.get("obj") or []:
+    if int(ib.get("port") or 0) != port:
+        continue
+    s, st = obj(ib.get("settings")), obj(ib.get("streamSettings"))
+    rs, xs = st.get("realitySettings") or {}, st.get("xhttpSettings") or {}
+    pub = (rs.get("settings") or {}).get("publicKey") or ""
+    if ib.get("protocol") == "vless" and st.get("network") == "xhttp" and st.get("security") == "reality" and pub:
+        has = any(c.get("id") == os.environ["UUID"] for c in (s.get("clients") or []))
+        print("reuse", ib["id"], pub, (rs.get("shortIds") or [""])[0] or "-",
+              (rs.get("serverNames") or ["-"])[0] or "-", xs.get("path") or "/", "yes" if has else "no")
+    else:
+        print("replace", ib["id"])
+    break
+else:
+    print("none")
+PY
+)"
+  read -r st XHTTP_ID XHTTP_PBK XHTTP_SID XHTTP_SNI XHTTP_PATH has <<< "$st" || true
+  case "$st" in
+    reuse)
+      [ "$XHTTP_SID" = "-" ] && XHTTP_SID=""
+      [ "$XHTTP_SNI" = "-" ] && XHTTP_SNI="$SNI"
+      sync_share_addr "$XHTTP_ID" || true ;;
+    replace|none)
+      if [ "$st" = "replace" ]; then
+        ylw "    Порт ${XHTTP_PORT} занят другим подключением — заменяю его на XHTTP."
+        api POST "/inbounds/del/${XHTTP_ID}" >/dev/null || true
+      fi
+      api GET /server/getNewX25519Cert > "$WORK/xkeys.json" 2>/dev/null || true
+      keys="$(python3 -c 'import json,sys;o=json.load(open(sys.argv[1]))["obj"];print(o["privateKey"],o["publicKey"])' "$WORK/xkeys.json" 2>/dev/null || true)"
+      priv="${keys%% *}"; XHTTP_PBK="${keys##* }"
+      if [ -z "$keys" ]; then
+        keys="$("$XRAY_BIN" x25519 2>/dev/null || true)"
+        priv="$(printf '%s\n' "$keys" | awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}')"
+        XHTTP_PBK="$(printf '%s\n' "$keys" | awk -F': *' 'tolower($1) ~ /public|password/ {print $2; exit}')"
+      fi
+      if [ -z "$priv" ] || [ -z "$XHTTP_PBK" ]; then ylw "    Не удалось сгенерировать ключи для XHTTP."; return 1; fi
+      XHTTP_SID="$(openssl rand -hex 8)"; XHTTP_SNI="$SNI"
+      XHTTP_PATH="/assets/$(openssl rand -hex 4)/media"
+      PRIV="$priv" PUB="$XHTTP_PBK" SID="$XHTTP_SID" XSNI="$XHTTP_SNI" XPATH="$XHTTP_PATH" XPORT="$XHTTP_PORT" \
+      XLABEL="$XHTTP_LABEL" SHARE_ADDR="$ADDR" XMUX="$XMUX_JSON" python3 - > "$WORK/xinb.json" <<'PY'
+import json, os
 e = os.environ
-print("VPN_EXIT_PARAMS=" + json.dumps({"host": e["SERVER_IP"], "port": int(e["VPN_PORT"]), "id": e["UUID"],
-      "flow": e["CLIENT_FLOW"], "sni": e["SNI"], "pbk": e["PUBLIC_KEY"], "sid": e["SHORT_ID"], "fp": "chrome"}))'
-  exit 0
+stream = {"network": "xhttp", "security": "reality", "externalProxy": [],
+          "xhttpSettings": {"path": e["XPATH"], "host": "", "headers": {}, "mode": "auto",
+                            "xPaddingBytes": "100-1000", "scStreamUpServerSecs": "20-80",
+                            "noSSEHeader": False, "xmux": json.loads(e["XMUX"])},
+          "realitySettings": {"show": False, "xver": 0, "target": e["XSNI"] + ":443",
+                              "serverNames": [e["XSNI"]], "privateKey": e["PRIV"],
+                              "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
+                              "shortIds": [e["SID"]], "mldsa65Seed": "",
+                              "settings": {"publicKey": e["PUB"], "fingerprint": "chrome",
+                                           "serverName": "", "spiderX": "/", "mldsa65Verify": ""}}}
+settings = {"clients": [], "decryption": "none", "encryption": "none", "fallbacks": []}
+sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"],
+            "metadataOnly": False, "routeOnly": False}
+print(json.dumps({"remark": e["XLABEL"], "enable": True, "listen": "", "port": int(e["XPORT"]),
+                  "protocol": "vless", "expiryTime": 0, "total": 0,
+                  "shareAddrStrategy": "custom", "shareAddr": e["SHARE_ADDR"],
+                  "disableFlow": True,      # у XHTTP без шифрования VLESS поток vision не используется
+                  "subSortIndex": -1,       # в подписке — первым
+                  "settings": json.dumps(settings), "streamSettings": json.dumps(stream),
+                  "sniffing": json.dumps(sniffing)}))
+PY
+      api POST /inbounds/add "$WORK/xinb.json" > "$WORK/xadd.json" || return 1
+      if ! msg="$(api_ok "$WORK/xadd.json")"; then ylw "    Панель не приняла XHTTP: ${msg:-нет ответа}"; return 1; fi
+      XHTTP_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["obj"]["id"])' "$WORK/xadd.json" 2>/dev/null || true)"
+      [ -n "$XHTTP_ID" ] || return 1
+      has="no" ;;
+    *) return 1 ;;
+  esac
+  if [ "$has" != "yes" ]; then   # тот же клиент (тот же ключ и та же подписка) — и на XHTTP
+    printf '{"inboundIds":[%s]}' "$XHTTP_ID" > "$WORK/attach.json"
+    api POST "/clients/${CLIENT_EMAIL}/attach" "$WORK/attach.json" > "$WORK/attach-res.json" || return 1
+    if ! msg="$(api_ok "$WORK/attach-res.json")"; then ylw "    Не удалось подключить клиента к XHTTP: ${msg:-нет ответа}"; return 1; fi
+  fi
+  XHTTP_OK=1
+}
+if ensure_xhttp && [ "$XHTTP_OK" = "1" ]; then
+  grn "    Второе подключение XHTTP на порту ${XHTTP_PORT}: соединения переиспользуются — сайты открываются быстрее."
+elif [ "$XHTTP_PORT" != "0" ]; then
+  ylw "    XHTTP не настроился — остаётся обычное подключение."
+fi
+
+# Третье подключение — VLESS + WebSocket + настоящий TLS, как «LTE»-профили коммерческих VPN:
+# обычный HTTPS с WebSocket, который можно пустить и через CDN. Нужен SSL-сертификат.
+WS_OK=0; WS_ID=""; WS_PATH=""
+ensure_ws() {
+  local st has msg p
+  if [ "$WS_PORT" = "0" ] || [ "$VPN_ROLE" = "exit" ]; then return 0; fi
+  if [ "$SSL_OK" != "1" ]; then ylw "    WebSocket пропускаю: для него нужен SSL-сертификат (шаг с SSL не прошёл)."; return 0; fi
+  for p in "$VPN_PORT" "$XHTTP_PORT" "$SUB_PORT" "$PANEL_PORT" 80; do
+    if [ "$WS_PORT" = "$p" ]; then ylw "    WS_PORT совпадает с другим портом — WebSocket пропускаю."; return 0; fi
+  done
+  if [ "${CLIENT_EMAIL:--}" = "-" ]; then return 0; fi
+  api GET /inbounds/list > "$WORK/inbounds-ws.json" || return 1
+  st="$(WS_PORT="$WS_PORT" UUID="$UUID" ADDR="$ADDR" CERT="$CERT" python3 - "$WORK/inbounds-ws.json" <<'PY' 2>/dev/null || echo "error"
+import json, os, sys
+data = json.load(open(sys.argv[1]))
+if not data.get("success"):
+    print("error"); raise SystemExit
+def obj(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v) if v else {}
+        except ValueError:
+            return {}
+    return v or {}
+port = int(os.environ["WS_PORT"])
+for ib in data.get("obj") or []:
+    if int(ib.get("port") or 0) != port:
+        continue
+    s, st = obj(ib.get("settings")), obj(ib.get("streamSettings"))
+    ts, ws = st.get("tlsSettings") or {}, st.get("wsSettings") or {}
+    cert = ((ts.get("certificates") or [{}])[0]).get("certificateFile")
+    if (ib.get("protocol") == "vless" and st.get("network") == "ws" and st.get("security") == "tls"
+            and ts.get("serverName") == os.environ["ADDR"] and cert == os.environ["CERT"]):
+        has = any(c.get("id") == os.environ["UUID"] for c in (s.get("clients") or []))
+        print("reuse", ib["id"], ws.get("path") or "/", "yes" if has else "no")
+    else:
+        print("replace", ib["id"])      # чужое подключение или сертификат на другой адрес — создаём заново
+    break
+else:
+    print("none")
+PY
+)"
+  read -r st WS_ID WS_PATH has <<< "$st" || true
+  case "$st" in
+    reuse) sync_share_addr "$WS_ID" || true ;;
+    replace|none)
+      if [ "$st" = "replace" ]; then api POST "/inbounds/del/${WS_ID}" >/dev/null || true; fi
+      WS_PATH="/gateway/v1/ws/$(openssl rand -hex 16)"
+      WPORT="$WS_PORT" WPATH="$WS_PATH" WLABEL="$WS_LABEL" ADDR="$ADDR" CERT="$CERT" KEY="$KEY" \
+      python3 - > "$WORK/wsinb.json" <<'PY'
+import json, os
+e = os.environ
+stream = {"network": "ws", "security": "tls", "externalProxy": [],
+          "wsSettings": {"acceptProxyProtocol": False, "path": e["WPATH"], "host": e["ADDR"],
+                         "headers": {}, "heartbeatPeriod": 30},
+          "tlsSettings": {"serverName": e["ADDR"], "minVersion": "1.2", "maxVersion": "1.3",
+                          "cipherSuites": "", "rejectUnknownSni": False, "disableSystemRoot": False,
+                          "enableSessionResumption": False,
+                          "certificates": [{"certificateFile": e["CERT"], "keyFile": e["KEY"],
+                                            "ocspStapling": 3600, "oneTimeLoading": False,
+                                            "usage": "encipherment", "buildChain": False}],
+                          "alpn": ["http/1.1"],
+                          "settings": {"allowInsecure": False, "fingerprint": "firefox", "echConfigList": ""}}}
+settings = {"clients": [], "decryption": "none", "encryption": "none", "fallbacks": []}
+sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"],
+            "metadataOnly": False, "routeOnly": False}
+print(json.dumps({"remark": e["WLABEL"], "enable": True, "listen": "", "port": int(e["WPORT"]),
+                  "protocol": "vless", "expiryTime": 0, "total": 0,
+                  "shareAddrStrategy": "custom", "shareAddr": e["ADDR"],
+                  "disableFlow": True, "subSortIndex": 2,   # в подписке — последним
+                  "settings": json.dumps(settings), "streamSettings": json.dumps(stream),
+                  "sniffing": json.dumps(sniffing)}))
+PY
+      api POST /inbounds/add "$WORK/wsinb.json" > "$WORK/wsadd.json" || return 1
+      if ! msg="$(api_ok "$WORK/wsadd.json")"; then ylw "    Панель не приняла WebSocket: ${msg:-нет ответа}"; return 1; fi
+      WS_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["obj"]["id"])' "$WORK/wsadd.json" 2>/dev/null || true)"
+      [ -n "$WS_ID" ] || return 1
+      has="no" ;;
+    *) return 1 ;;
+  esac
+  if [ "$has" != "yes" ]; then   # тот же клиент, та же подписка
+    printf '{"inboundIds":[%s]}' "$WS_ID" > "$WORK/attach-ws.json"
+    api POST "/clients/${CLIENT_EMAIL}/attach" "$WORK/attach-ws.json" > "$WORK/attach-ws-res.json" || return 1
+    if ! msg="$(api_ok "$WORK/attach-ws-res.json")"; then ylw "    Не удалось подключить клиента к WebSocket: ${msg:-нет ответа}"; return 1; fi
+  fi
+  WS_OK=1
+}
+if ensure_ws && [ "$WS_OK" = "1" ]; then
+  grn "    Третье подключение WebSocket + TLS на порту ${WS_PORT} — как «LTE»-профили, можно пустить через CDN."
+elif [ "$WS_PORT" != "0" ] && [ "$VPN_ROLE" != "exit" ] && [ "$SSL_OK" = "1" ]; then
+  ylw "    WebSocket не настроился — остаются другие подключения."
 fi
 
 # ============================================================================
-if [ "$BRIDGE" = "1" ]; then
+route_of() {   # route_of домен — куда сервер отправит этот сайт (метка выхода в Xray)
+  local _
+  for _ in 1 2 3 4 5; do
+    if api_form /xray/routeTest "domain=$1" "port=443" "network=tcp" "inboundTag=${INB_TAG}" > "$WORK/route.json" \
+       && python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+if not d.get("success"): sys.exit(1)
+print((d.get("obj") or {}).get("outboundTag") or "-")' "$WORK/route.json" 2>/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "?"
+}
+tunnel_test() {   # tunnel_test файл-выхода — настоящий запрос через этот выход (временный Xray); итог в T_IP и T_SPEED
+  local port u ip="" _ urls=()
+  T_IP=""; T_SPEED=""
+  read -ra urls <<< "$TUNNEL_TEST_URLS"
+  port=$(( (RANDOM % 20000) + 20000 ))
+  python3 - "$1" "$port" > "$WORK/tunnel.json" <<'PY' || return 0
+import json, sys
+print(json.dumps({"log": {"loglevel": "warning"},
+                  "inbounds": [{"listen": "127.0.0.1", "port": int(sys.argv[2]), "protocol": "socks",
+                                "settings": {"udp": False}}],
+                  "outbounds": [json.load(open(sys.argv[1]))]}))
+PY
+  "$XRAY_BIN" run -c "$WORK/tunnel.json" > "$WORK/tunnel.log" 2>&1 &
+  TUNNEL_PID=$!
+  for _ in $(seq 1 20); do
+    if tcp_ok 127.0.0.1 "$port"; then break; fi
+    sleep 0.5
+  done
+  for u in "${urls[@]}"; do
+    ip="$(env -u no_proxy -u NO_PROXY curl -s --max-time 15 -x "socks5h://127.0.0.1:${port}" "$u" 2>/dev/null \
+      | tr -d '[:space:]' || true)"
+    if is_ipv4 "$ip"; then T_IP="$ip"; break; fi
+  done
+  if [ -n "$T_IP" ]; then T_SPEED="$(speed_mbit "socks5h://127.0.0.1:${port}")"; fi
+  kill "$TUNNEL_PID" 2>/dev/null || true
+  wait "$TUNNEL_PID" 2>/dev/null || true
+  TUNNEL_PID=""
+}
+
+if [ "$VPN_ROLE" = "exit" ]; then
+  step "Настраиваю Xray на скорость..."
+elif [ "$BRIDGE" = "1" ]; then
   step "Настраиваю маршруты сервера: РФ — напрямую, остальное — через ${EXIT_HOST}..."
 elif [ "$BLOCK_ADS" = "1" ]; then
   step "Включаю фильтр рекламы и трекеров на сервере..."
 else
   step "Фильтр рекламы на сервере выключен (BLOCK_ADS=0)..."
+fi
+# Мост: проверяем оба канала до зарубежного сервера настоящими запросами и выбираем.
+TCP_IP=""; TCP_SPEED=""; X_IP=""; X_SPEED=""; BRIDGE_LEGS="tcp"
+if [ "$BRIDGE" = "1" ]; then
+  grn "    Проверяю каналы моста настоящими запросами через ${EXIT_HOST}..."
+  tunnel_test "$WORK/bridge-out.json"; TCP_IP="$T_IP"; TCP_SPEED="$T_SPEED"
+  if [ -s "$WORK/bridge-out-x.json" ]; then
+    tunnel_test "$WORK/bridge-out-x.json"; X_IP="$T_IP"; X_SPEED="$T_SPEED"
+  fi
+  if [ -n "$TCP_IP" ] && [ -n "$X_IP" ]; then
+    BRIDGE_LEGS="both"
+    # XHTTP вдвое медленнее TCP — тогда оставляем только TCP
+    if [ -n "$X_SPEED" ] && [ -n "$TCP_SPEED" ] && [ $((X_SPEED * 2)) -lt "$TCP_SPEED" ]; then BRIDGE_LEGS="tcp"; fi
+  elif [ -n "$X_IP" ]; then
+    BRIDGE_LEGS="x"
+  fi
 fi
 # Правила в маршрутизации самого сервера: даже приложение, которое не умеет
 # принимать правила из подписки, не получит рекламу через VPN. В режиме моста
@@ -772,7 +1111,8 @@ fi
 SERVER_FILTER=0
 FILTER_STATE=""
 if api POST /xray/ > "$WORK/xray-get.json" && api_ok "$WORK/xray-get.json" >/dev/null; then
-  FILTER_STATE="$(BLOCK_ADS="$BLOCK_ADS" BRIDGE="$BRIDGE" BRIDGE_OUT="$WORK/bridge-out.json" \
+  FILTER_STATE="$(BLOCK_ADS="$BLOCK_ADS" BLOCK_QUIC="$BLOCK_QUIC" BRIDGE="$BRIDGE" BRIDGE_OUT="$WORK/bridge-out.json" \
+    BRIDGE_OUT_X="$WORK/bridge-out-x.json" BRIDGE_LEGS="$BRIDGE_LEGS" \
     python3 - "$WORK/xray-get.json" "$WORK/xray-new.json" <<'PY' || echo "error"
 import json, os, sys
 obj = json.load(open(sys.argv[1]))["obj"]
@@ -789,22 +1129,55 @@ ADS, EXIT = "geosite:category-ads-all", "bridge-exit"
 is_ads = lambda r: r.get("domain") == [ADS] and r.get("outboundTag") == "blocked"
 is_ru = lambda r: r.get("outboundTag") == "direct" and (
     r.get("domain") == ["geosite:category-ru"] or r.get("ip") == ["geoip:ru"])
+is_quic = lambda r: r.get("network") == "udp" and str(r.get("port")) == "443" and r.get("outboundTag") == "blocked"
 # свои прежние правила убираем и ставим заново — повторный запуск ничего не дублирует
-rules[:] = [r for r in rules if not is_ads(r) and not is_ru(r) and r.get("outboundTag") != EXIT]
-outs[:] = [o for o in outs if o.get("tag") != EXIT]
+ours_exit = lambda r: str(r.get("outboundTag") or "").startswith(EXIT) or r.get("balancerTag") == "bridge"
+rules[:] = [r for r in rules if not is_ads(r) and not is_ru(r) and not is_quic(r) and not ours_exit(r)]
+outs[:] = [o for o in outs if not str(o.get("tag") or "").startswith(EXIT)]
+routing = tpl["routing"]
+balancers = [b for b in routing.get("balancers") or [] if b.get("tag") != "bridge"]
+if balancers:
+    routing["balancers"] = balancers
+else:
+    routing.pop("balancers", None)
+if (tpl.get("observatory") or {}).get("subjectSelector") == [EXIT]:
+    tpl.pop("observatory")
 pos = next((i + 1 for i, r in enumerate(rules) if r.get("outboundTag") == "api"), 0)
 add = []
 if os.environ["BLOCK_ADS"] == "1":
     if "blocked" not in tags:
         print("no-blocked-outbound"); raise SystemExit
     add.append({"type": "field", "domain": [ADS], "outboundTag": "blocked"})
+if os.environ["BLOCK_QUIC"] == "1":
+    # QUIC (UDP 443) внутри TCP-туннеля работает медленно; без него браузеры и YouTube сразу берут TCP
+    if "blocked" not in tags:
+        print("no-blocked-outbound"); raise SystemExit
+    add.append({"type": "field", "network": "udp", "port": "443", "outboundTag": "blocked"})
+# прямой выход: сайты по IPv4, без задержек на неработающий IPv6
+for o in outs:
+    if o.get("tag") == "direct" and o.get("protocol") == "freedom":
+        (o.get("settings") or {}).pop("domainStrategy", None)      # устаревшее место настройки
+        o.setdefault("streamSettings", {}).setdefault("sockopt", {})["domainStrategy"] = "UseIPv4"
 if os.environ["BRIDGE"] == "1":
     if "direct" not in tags:
         print("no-direct-outbound"); raise SystemExit
     add.append({"type": "field", "domain": ["geosite:category-ru"], "outboundTag": "direct"})
     add.append({"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
-    outs.append(json.load(open(os.environ["BRIDGE_OUT"])))
-    rules.append({"type": "field", "network": "tcp,udp", "outboundTag": EXIT})   # всё остальное — за рубеж
+    legs = os.environ["BRIDGE_LEGS"]
+    if legs in ("tcp", "both"):
+        outs.append(json.load(open(os.environ["BRIDGE_OUT"])))
+    if legs in ("x", "both"):
+        outs.append(json.load(open(os.environ["BRIDGE_OUT_X"])))
+    if legs == "both":
+        # мост сам выбирает канал: какой быстрее отвечает, тот и работает; отказал один — работает другой
+        routing.setdefault("balancers", []).append({"tag": "bridge", "selector": [EXIT],
+                                                    "strategy": {"type": "leastPing"}, "fallbackTag": EXIT})
+        tpl["observatory"] = {"subjectSelector": [EXIT], "probeUrl": "https://www.gstatic.com/generate_204",
+                              "probeInterval": "1m", "enableConcurrency": True}
+        rules.append({"type": "field", "network": "tcp,udp", "balancerTag": "bridge"})   # всё остальное — за рубеж
+    else:
+        rules.append({"type": "field", "network": "tcp,udp",
+                      "outboundTag": EXIT + ("-x" if legs == "x" else "")})   # всё остальное — за рубеж
 rules[pos:pos] = add
 if json.dumps(tpl, sort_keys=True) == before:
     print("same"); raise SystemExit
@@ -821,12 +1194,49 @@ PY
   esac
 fi
 if [ "$SERVER_FILTER" = "1" ]; then
-  if [ "$BLOCK_ADS" = "1" ]; then grn "    Сервер блокирует рекламу и трекеры для всего VPN-трафика."; fi
+  if [ "$BLOCK_ADS" = "1" ] && [ "$VPN_ROLE" != "exit" ]; then grn "    Сервер блокирует рекламу и трекеры для всего VPN-трафика."; fi
   if [ "$BRIDGE" = "1" ]; then grn "    Российские сайты сервер открывает сам, остальное — через ${EXIT_HOST}."; fi
+  if [ "$BLOCK_QUIC" = "1" ]; then grn "    Для скорости: QUIC переведён на TCP, сайты открываются по IPv4 без ожидания IPv6."
+  else grn "    Для скорости: сайты открываются по IPv4 без ожидания IPv6."; fi
 elif [ "$BRIDGE" = "1" ]; then
   die "Не удалось записать маршруты моста в настройки сервера (${FILTER_STATE:-панель не ответила})."
 else
   ylw "    Не удалось изменить правила сервера — фильтр будет работать только в приложениях."
+fi
+
+# ============================================================================
+if [ "$VPN_ROLE" = "exit" ]; then   # зарубежный сервер моста готов: отдаём параметры российскому
+  step "Проверяю скорость интернета этого сервера..."
+  EXIT_NET_SPEED="$(speed_mbit)"
+  if [ -n "$EXIT_NET_SPEED" ]; then grn "    Скорость интернета этого сервера ≈ ${EXIT_NET_SPEED} Мбит/с"
+  else ylw "    Скорость измерить не удалось."; fi
+  umask 077
+  cat > "$PROFILE" <<TXT
+=== Этот сервер — выход моста ===
+Принимает подключения российского сервера на порту ${VPN_PORT} (VLESS + Reality, SNI ${SNI})$([ "$XHTTP_OK" = "1" ] && echo " и ${XHTTP_PORT} (XHTTP)").
+Настраивается с российского сервера тем же скриптом (режим «Мост»).
+
+=== Веб-панель 3X-UI (открыта только изнутри сервера) ===
+Открыть с компьютера: ssh -L 8080:127.0.0.1:${PANEL_PORT} ${EXIT_LOGIN:-root}@${SERVER_IP}
+и затем в браузере:   ${API_SCHEME}://127.0.0.1:8080/${WEBPATH}
+Логин:  ${PANEL_USER}
+Пароль: ${PANEL_PASS}
+TXT
+  chmod 600 "$PROFILE"
+  grn "    Панель закрыта от интернета, доступы к ней — в ${PROFILE} на этом сервере."
+  SERVER_IP="$SERVER_IP" VPN_PORT="$VPN_PORT" UUID="$UUID" CLIENT_FLOW="$CLIENT_FLOW" SNI="$SNI" \
+  PUBLIC_KEY="$PUBLIC_KEY" SHORT_ID="$SHORT_ID" NET_SPEED="$EXIT_NET_SPEED" XHTTP_OK="$XHTTP_OK" \
+  XHTTP_PORT="$XHTTP_PORT" XHTTP_PBK="$XHTTP_PBK" XHTTP_SID="$XHTTP_SID" XHTTP_SNI="$XHTTP_SNI" \
+  XHTTP_PATH="$XHTTP_PATH" python3 -c 'import json, os
+e = os.environ
+p = {"host": e["SERVER_IP"], "port": int(e["VPN_PORT"]), "id": e["UUID"],
+     "flow": e["CLIENT_FLOW"], "sni": e["SNI"], "pbk": e["PUBLIC_KEY"], "sid": e["SHORT_ID"], "fp": "chrome",
+     "speed": e["NET_SPEED"]}
+if e["XHTTP_OK"] == "1":
+    p["xhttp"] = {"port": int(e["XHTTP_PORT"]), "pbk": e["XHTTP_PBK"], "sid": e["XHTTP_SID"],
+                  "sni": e["XHTTP_SNI"], "path": e["XHTTP_PATH"]}
+print("VPN_EXIT_PARAMS=" + json.dumps(p))'
+  exit 0
 fi
 
 # ============================================================================
@@ -934,79 +1344,52 @@ CHECK_JSON=0
 if fetch_local "Happ/3.0" "${SUB_PATH}${SUB_ID}" && grep -qi '^routing: *happ://routing/onadd/' "$WORK/h"; then
   CHECK_HAPP=1
 fi
-if fetch_local "v2rayNG/1.10.0" "${SUB_PATH}${SUB_ID}" && BLOCK_ADS="$BLOCK_ADS" python3 - "$WORK/b" "$WORK/client.json" <<'PY'
+JSON_COUNT=0
+if fetch_local "v2rayNG/1.10.0" "${SUB_PATH}${SUB_ID}" && BLOCK_ADS="$BLOCK_ADS" python3 - "$WORK/b" "$WORK/client" > "$WORK/client-count" <<'PY'
 import json, os, sys
 data = json.load(open(sys.argv[1]))
-conf = data[0] if isinstance(data, list) else data
-rules = json.dumps(conf.get("routing", {}))
-assert "geosite:category-ru" in rules and "geoip:ru" in rules
-if os.environ["BLOCK_ADS"] == "1":
-    assert "geosite:category-ads-all" in rules
-json.dump(conf, open(sys.argv[2], "w"))
+confs = data if isinstance(data, list) else [data]
+for i, conf in enumerate(confs):
+    rules = json.dumps(conf.get("routing", {}))
+    assert "geosite:category-ru" in rules and "geoip:ru" in rules
+    if os.environ["BLOCK_ADS"] == "1":
+        assert "geosite:category-ads-all" in rules
+    json.dump(conf, open("%s-%d.json" % (sys.argv[2], i), "w"))
+print(len(confs))
 PY
 then
-  # тот же конфиг, что получит телефон, проверяем самим Xray
-  if XRAY_LOCATION_ASSET="${XUI_DIR}/bin" "$XRAY_BIN" run -test -c "$WORK/client.json" >"$WORK/xtest.log" 2>&1; then
-    CHECK_JSON=1
-  fi
-fi
-route_of() {   # route_of домен — куда сервер отправит этот сайт (метка выхода в Xray)
-  local _
-  for _ in 1 2 3 4 5; do
-    if api_form /xray/routeTest "domain=$1" "port=443" "network=tcp" "inboundTag=${INB_TAG}" > "$WORK/route.json" \
-       && python3 -c 'import json,sys
-d = json.load(open(sys.argv[1]))
-if not d.get("success"): sys.exit(1)
-print((d.get("obj") or {}).get("outboundTag") or "-")' "$WORK/route.json" 2>/dev/null; then
-      return 0
+  # те же конфиги, что получит телефон (обычный и XHTTP), проверяем самим Xray
+  CHECK_JSON=1
+  read -r JSON_COUNT < "$WORK/client-count" || JSON_COUNT=0
+  for f in "$WORK"/client-*.json; do
+    if ! XRAY_LOCATION_ASSET="${XUI_DIR}/bin" "$XRAY_BIN" run -test -c "$f" >"$WORK/xtest.log" 2>&1; then
+      CHECK_JSON=0; break
     fi
-    sleep 2
   done
-  echo "?"
-}
-tunnel_test() {   # настоящий запрос через зарубежный выход: временный Xray только с этим выходом
-  local port u ip _ urls=()
-  CHECK_TUNNEL="fail"
-  read -ra urls <<< "$TUNNEL_TEST_URLS"
-  port=$(( (RANDOM % 20000) + 20000 ))
-  python3 - "$WORK/bridge-out.json" "$port" > "$WORK/tunnel.json" <<'PY' || return 0
-import json, sys
-print(json.dumps({"log": {"loglevel": "warning"},
-                  "inbounds": [{"listen": "127.0.0.1", "port": int(sys.argv[2]), "protocol": "socks",
-                                "settings": {"udp": False}}],
-                  "outbounds": [json.load(open(sys.argv[1]))]}))
-PY
-  "$XRAY_BIN" run -c "$WORK/tunnel.json" > "$WORK/tunnel.log" 2>&1 &
-  TUNNEL_PID=$!
-  for _ in $(seq 1 20); do
-    if tcp_ok 127.0.0.1 "$port"; then break; fi
-    sleep 0.5
-  done
-  for u in "${urls[@]}"; do
-    ip="$(curl -s --max-time 15 -x "socks5h://127.0.0.1:${port}" "$u" 2>/dev/null | tr -d '[:space:]' || true)"
-    if is_ipv4 "$ip"; then TUNNEL_IP="$ip"; CHECK_TUNNEL="ok"; break; fi
-  done
-  kill "$TUNNEL_PID" 2>/dev/null || true
-  wait "$TUNNEL_PID" 2>/dev/null || true
-  TUNNEL_PID=""
-}
+fi
 # проверяем маршруты на самом сервере (без реального трафика)
 CHECK_SERVER="skip"
 if [ "$BLOCK_ADS" = "1" ] && [ "$SERVER_FILTER" = "1" ] && [ "${INB_TAG:--}" != "-" ]; then
   if [ "$(route_of doubleclick.net)" = "blocked" ]; then CHECK_SERVER="ok"; else CHECK_SERVER="fail"; fi
 fi
-CHECK_ROUTES="skip"; CHECK_TUNNEL="skip"; TUNNEL_IP=""
+CHECK_ROUTES="skip"; SERVER_SPEED=""
+TUNNEL_IP="${TCP_IP:-$X_IP}"; TUNNEL_SPEED=""
+if [ "$BRIDGE_LEGS" != "x" ] && [ -n "$TCP_SPEED" ]; then TUNNEL_SPEED="$TCP_SPEED"; fi
+if [ "$BRIDGE_LEGS" != "tcp" ] && [ -n "$X_SPEED" ]; then
+  if [ -z "$TUNNEL_SPEED" ] || [ "$X_SPEED" -gt "$TUNNEL_SPEED" ]; then TUNNEL_SPEED="$X_SPEED"; fi
+fi
 if [ "$BRIDGE" = "1" ]; then
   CHECK_ROUTES="fail"
-  if [ "${INB_TAG:--}" != "-" ] && [ "$(route_of www.google.com)" = "bridge-exit" ] \
+  if [ "${INB_TAG:--}" != "-" ] && [[ "$(route_of www.google.com)" == bridge-exit* ]] \
      && [ "$(route_of ya.ru)" = "direct" ]; then
     CHECK_ROUTES="ok"
   fi
-  tunnel_test
+else
+  SERVER_SPEED="$(speed_mbit)"   # один сервер: сколько даёт его интернет
 fi
 if [ "$CHECK_HAPP" = "1" ]; then grn "    ✓ Happ: правила приходят вместе с подпиской"
 else ylw "    ✗ Happ: правила в ответе подписки не найдены"; fi
-if [ "$CHECK_JSON" = "1" ]; then grn "    ✓ v2rayNG / v2rayN: конфиг с правилами прошёл проверку Xray"
+if [ "$CHECK_JSON" = "1" ]; then grn "    ✓ v2rayNG / v2rayN: конфиги с правилами (${JSON_COUNT} шт.) прошли проверку Xray"
 else ylw "    ✗ v2rayNG / v2rayN: конфиг не прошёл проверку"; tail -n 3 "$WORK/xtest.log" 2>/dev/null || true; fi
 case "$CHECK_SERVER" in
   ok)   grn "    ✓ Сервер: рекламный домен уходит в блок" ;;
@@ -1015,8 +1398,36 @@ esac
 if [ "$BRIDGE" = "1" ]; then
   if [ "$CHECK_ROUTES" = "ok" ]; then grn "    ✓ Сервер: российские сайты — напрямую, зарубежные — через ${EXIT_HOST}"
   else ylw "    ✗ Сервер: маршруты моста не прошли проверку"; fi
-  if [ "$CHECK_TUNNEL" = "ok" ]; then grn "    ✓ Мост работает: зарубежные сайты видят IP ${TUNNEL_IP}"
-  else ylw "    ✗ Мост: запрос через ${EXIT_HOST} не прошёл"; tail -n 3 "$WORK/tunnel.log" 2>/dev/null || true; fi
+  if [ -n "$TUNNEL_IP" ]; then
+    grn "    ✓ Мост работает: зарубежные сайты видят IP ${TUNNEL_IP}"
+    SPEEDS=""
+    if [ -n "$TCP_SPEED" ]; then SPEEDS="TCP ≈ ${TCP_SPEED}"; fi
+    if [ -n "$X_SPEED" ]; then SPEEDS="${SPEEDS:+${SPEEDS}, }XHTTP ≈ ${X_SPEED}"; fi
+    if [ -n "$SPEEDS" ]; then grn "    ✓ Скорость через мост: ${SPEEDS} Мбит/с"; fi
+    case "$BRIDGE_LEGS" in
+      both) grn "    ✓ Мост сам выбирает канал (TCP или XHTTP — какой быстрее отвечает); откажет один — работает другой" ;;
+      x)    ylw "    Мост работает через XHTTP: TCP-канал не ответил." ;;
+      tcp)  if [ -s "$WORK/bridge-out-x.json" ]; then
+              if [ -n "$X_IP" ]; then ylw "    Мост работает через TCP: XHTTP заметно медленнее."
+              else ylw "    Мост работает через TCP: XHTTP-канал не ответил."; fi
+            fi ;;
+    esac
+  else
+    ylw "    ✗ Мост: запрос через ${EXIT_HOST} не прошёл"; tail -n 3 "$WORK/tunnel.log" 2>/dev/null || true
+  fi
+elif [ -n "$SERVER_SPEED" ]; then
+  grn "    ✓ Скорость интернета сервера ≈ ${SERVER_SPEED} Мбит/с"
+fi
+# где узкое место, если мост медленный
+SPEED_HINT=""
+if [ "$BRIDGE" = "1" ] && [ -n "$TUNNEL_SPEED" ]; then
+  if [ -n "$EXIT_NET_SPEED" ] && [ "$EXIT_NET_SPEED" -lt 50 ]; then
+    SPEED_HINT="Узкое место — интернет зарубежного сервера (${EXIT_NET_SPEED} Мбит/с): нужен сервер у более быстрого хостера."
+  elif [ -n "$EXIT_NET_SPEED" ] && [ "$TUNNEL_SPEED" -lt 100 ] && [ $((TUNNEL_SPEED * 3)) -lt "$EXIT_NET_SPEED" ]; then
+    SPEED_HINT="Узкое место — канал между серверами: зарубежный сервер быстрый, но из Москвы до него скорость падает."
+  elif [ "$TUNNEL_SPEED" -ge 50 ]; then
+    SPEED_HINT="Оба сервера работают быстро. Если на телефоне медленно — дело в интернете телефона."
+  fi
 fi
 
 # ============================================================================
@@ -1039,7 +1450,10 @@ if [ "$BRIDGE" = "1" ]; then
   echo
   ylw "============================ МОСТ ============================"
   echo "Вход (этот сервер, Россия): ${SERVER_IP}"
-  echo "Выход за рубеж:             ${EXIT_HOST}:${EXIT_PORT}"
+  echo "Выход за рубеж:             ${EXIT_HOST}:${EXIT_PORT}${EXIT_RTT:+ (задержка ${EXIT_RTT} мс)}"
+  if [ -n "$EXIT_NET_SPEED" ]; then echo "Интернет зарубежного сервера: ≈ ${EXIT_NET_SPEED} Мбит/с"; fi
+  if [ -n "$TUNNEL_SPEED" ]; then echo "Скорость через мост:          ≈ ${TUNNEL_SPEED} Мбит/с"; fi
+  if [ -n "$SPEED_HINT" ]; then ylw "$SPEED_HINT"; fi
   echo "Российские сайты открываются напрямую, все остальные — через ${EXIT_HOST}."
   echo "Панель зарубежного сервера закрыта от интернета, доступы — в ${PROFILE} на нём."
 fi
@@ -1052,6 +1466,12 @@ qrencode -t ANSIUTF8 "${SUB_URL}" 2>/dev/null || ylw "(qrencode недоступ
 echo "Как добавить:"
 echo "  • Happ (Android / iPhone / ПК): «+» → вставить ссылку из буфера или отсканировать QR."
 echo "  • v2rayNG (Android): «+» → «Импорт из буфера обмена» → «Обновить подписку»."
+if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ]; then
+  echo "Подключения в подписке:"
+  if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}…» — XHTTP: сайты открываются быстрее, выберите его;"; fi
+  echo "  • «${LABEL}…» — обычное Reality, запасное;"
+  if [ "$WS_OK" = "1" ]; then echo "  • «${WS_LABEL}…» — WebSocket + TLS, как «LTE»-профили; через CDN — для режима белых списков."; fi
+fi
 echo
 echo "Правила для всех устройств (приходят с сервера и обновляются сами):"
 echo "  • российские сайты и российские IP-адреса → напрямую, через интернет пользователя;"
@@ -1077,7 +1497,7 @@ umask 077
 printf '%s\n' "$MODE" > "$ADDR_FILE" 2>/dev/null || true
 if [ "$BRIDGE" = "1" ]; then
   cp "$WORK/bridge.json" "$BRIDGE_FILE" 2>/dev/null || true
-  BRIDGE_TEXT="Мост: вход ${SERVER_IP} (этот сервер) → выход ${EXIT_HOST}:${EXIT_PORT}"
+  BRIDGE_TEXT="Мост: вход ${SERVER_IP} (этот сервер) → выход ${EXIT_HOST}:${EXIT_PORT}${EXIT_RTT:+, задержка ${EXIT_RTT} мс}${TUNNEL_SPEED:+, скорость через мост ≈ ${TUNNEL_SPEED} Мбит/с}"
 else
   rm -f "$BRIDGE_FILE"
   BRIDGE_TEXT="Мост: не используется (один сервер)"
@@ -1101,6 +1521,8 @@ SNI:       ${SNI}
 UUID:      ${UUID}
 PublicKey: ${PUBLIC_KEY}
 ShortID:   ${SHORT_ID}
+XHTTP:     $([ "$XHTTP_OK" = "1" ] && echo "порт ${XHTTP_PORT}, путь ${XHTTP_PATH} (в подписке — первым)" || echo "не настроен")
+WebSocket: $([ "$WS_OK" = "1" ] && echo "порт ${WS_PORT}, путь ${WS_PATH}, TLS на ${ADDR}" || echo "не настроен")
 Одиночная ссылка (БЕЗ правил подписки — весь трафик через VPN):
 ${VLESS_URL}
 TXT

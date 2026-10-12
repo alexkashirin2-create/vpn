@@ -26,11 +26,21 @@
 #     1 секунды или с потерями отключается само. Рядом — каждое подключение отдельно,
 #     а в режиме моста — и каждый зарубежный сервер отдельно, с названием страны по его IP
 #     («🇳🇱 Нидерланды», «🇨🇭 Швейцария»…).
+#   • БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА — отдельный пункт меню «3». Когда мобильный оператор
+#     пускает только на «разрешённые» сайты, свой сервер недоступен. Выручают готовые подключения
+#     из igareck/vpn-configs-for-russia (Vless-Reality-White-Lists-Rus-Mobile.txt): сервер скачивает
+#     этот список каждые 5 часов (с GitHub или его зеркал), каждые 15 минут проверяет КАЖДОЕ
+#     подключение настоящим запросом через Xray и отдаёт в подписке только рабочие — нерабочее
+#     подключение пропадает из подписки сразу после проверки. В приложении они идут после своих
+#     подключений («🏳️ БС 01 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
 # Скрипт спросит, как подключаться (просто Enter — домен создастся автоматически).
 # Без вопросов: DOMAIN=auto | DOMAIN=ip | DOMAIN=vpn.example.ru  bash <(curl -fsSL …)
+# Белые списки без вопросов: WHITE_LISTS=1 — вместе с установкой; WHITE_LISTS=only — только они
+# (VPN уже установлен: ключи, подписка и пароль панели не меняются); WHITE_LISTS=0 — убрать.
+#   WHITE_LISTS=only bash <(curl -fsSL …)
 #
 # МОСТ — если зарубежный сервер не открывается из России. Телефоны подключаются
 # к российскому серверу; российские сайты он открывает сам, а зарубежные — через
@@ -77,7 +87,12 @@ BLOCK_ADS="${BLOCK_ADS:-1}"           # 1 — блокировать рекла�
 BLOCK_QUIC="${BLOCK_QUIC:-1}"         # 1 — QUIC (UDP 443) через VPN гасится: приложения сразу берут TCP, так быстрее
 BALANCE_EXPECTED="${BALANCE_EXPECTED:-2}"  # «Автовыбор» и мост: сколько лучших серверов работают одновременно
 BALANCE_MAX_RTT="${BALANCE_MAX_RTT:-1s}"   # максимальный пинг: сервер или подключение медленнее — отключается
-SUB_FILTER="${SUB_FILTER:-1}"         # 1 — подписку отдаёт фильтр, который дописывает «Автовыбору» эти настройки; 0 — сама панель
+SUB_FILTER="${SUB_FILTER:-1}"         # 1 — подписку отдаёт фильтр, который дописывает «Автовыбору» эти настройки; 0 — сама панель (с белыми списками фильтр нужен всё равно)
+WHITE_LISTS="${WHITE_LISTS:-}"        # белые списки: 1 — включить, only — только они (VPN уже установлен), 0 — убрать; пусто — как в прошлый раз
+WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссылки на txt-списки через пробел; пусто — как в прошлый раз; default — igareck
+WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
+WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
+WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
 EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
@@ -107,6 +122,14 @@ INSTALL_SH_URLS=(
   "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/install.sh"
   "https://cdn.jsdelivr.net/gh/MHSanaei/3x-ui@main/install.sh"
 )
+SUB_FILTER_PY="/usr/local/bin/vpn-sub-filter.py"
+SUB_FILTER_CONF="/etc/x-ui/vpn-sub-filter.json"
+SUB_FILTER_UNIT="/etc/systemd/system/vpn-sub-filter.service"
+WHITE_PY="/usr/local/bin/vpn-white-lists.py"        # белые списки: загрузка и проверка подключений
+WHITE_CONF="/etc/x-ui/vpn-white-lists.json"
+WHITE_DATA="/var/lib/vpn-white-lists"                # скачанный список, рабочие подключения, итог проверки
+WHITE_UNIT="/etc/systemd/system/vpn-white-lists.service"
+WHITE_TIMER="/etc/systemd/system/vpn-white-lists.timer"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 grn() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -133,6 +156,16 @@ if [[ "$BALANCE_MAX_RTT" =~ ^[0-9]+$ ]]; then BALANCE_MAX_RTT="${BALANCE_MAX_RTT
 case "$BALANCE_MAX_RTT" in *ms) RTT_TEXT="${BALANCE_MAX_RTT%ms} мс" ;; *) RTT_TEXT="${BALANCE_MAX_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
 [ "$EXIT_DIRECT" = "0" ] || EXIT_DIRECT=1
+case "$(printf '%s' "$WHITE_LISTS" | tr '[:upper:]' '[:lower:]')" in
+  "") WHITE_LISTS="" ;;
+  1|on|yes|true) WHITE_LISTS=1 ;;
+  only) WHITE_LISTS=only ;;
+  0|off|no|false|none) WHITE_LISTS=0 ;;
+  *) die "WHITE_LISTS: 1 — включить, only — только белые списки, 0 — убрать (сейчас: ${WHITE_LISTS})" ;;
+esac
+[[ "$WHITE_REFRESH_HOURS" =~ ^[1-9][0-9]?$ ]] || die "WHITE_REFRESH_HOURS — часы, от 1 до 99: ${WHITE_REFRESH_HOURS}"
+{ [[ "$WHITE_CHECK_MIN" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$WHITE_CHECK_MIN" -ge 5 ]; } \
+  || die "WHITE_CHECK_MIN — минуты, от 5 до 999: ${WHITE_CHECK_MIN}"
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
 
 WORK="$(mktemp -d)"
@@ -254,6 +287,1110 @@ sys.stdout.buffer.write(("%s %s" % (flag, names.get(cc, cc).replace("_", " "))).
 PY
 }
 
+# ---------- фильтр подписки и белые списки: программы, которые ставит этот скрипт ----------
+# Фильтр подписки стоит перед панелью на порту подписки: дописывает «Автовыбору» тонкие настройки
+# балансировки и добавляет в подписку рабочие подключения белых списков.
+write_sub_filter_program() {
+  mkdir -p "$(dirname "$SUB_FILTER_PY")"
+  cat > "$SUB_FILTER_PY" <<'PY'
+#!/usr/bin/env python3
+# Фильтр подписки VPN (ставит install-vpn-all.sh). Принимает запросы приложений на порту
+# подписки и передаёт их панели 3X-UI, которая отдаёт подписку только внутри сервера.
+# В профили с балансировкой leastLoad («Автовыбор») дописывает тонкие настройки: сколько
+# лучших подключений работают одновременно, максимальный пинг и допустимые потери.
+# Белые списки (если включены): в конец подписки добавляет проверенные рабочие подключения
+# из alive.json (его каждые несколько минут обновляет vpn-white-lists) и отдаёт их же
+# отдельной подпиской по своему адресу.
+import base64, copy, json, os, re, socket, ssl, sys, threading, urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONF = json.load(open(sys.argv[1]))
+UPSTREAM = "http://127.0.0.1:%d" % int(CONF["upstream"])
+CERT, KEY = CONF.get("cert") or "", CONF.get("key") or ""
+TUNE = CONF.get("leastLoad") or {}
+WHITE = CONF.get("white") or {}
+SKIP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
+        "content-length", "content-encoding", "accept-encoding", "host", "date", "server"}
+LINK = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$", re.I)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+
+
+def tune(body):
+    if not TUNE:
+        return body
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return body                       # обычная подписка (ссылки в base64) — как есть
+    changed = False
+    for conf in data if isinstance(data, list) else [data]:
+        routing = conf.get("routing") if isinstance(conf, dict) else None
+        for bal in (routing.get("balancers") if isinstance(routing, dict) else None) or []:
+            strategy = bal.get("strategy") if isinstance(bal, dict) else None
+            if isinstance(strategy, dict) and strategy.get("type") == "leastLoad":
+                settings = strategy.setdefault("settings", {})
+                for key, value in TUNE.items():
+                    settings.setdefault(key, value)
+                changed = True
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") if changed else body
+
+
+# ---------- белые списки ----------
+_white_lock = threading.Lock()
+_white = {"stamp": None, "items": []}
+
+
+def white_items():
+    """рабочие подключения белых списков (файл перечитывается, только когда изменился)"""
+    path = WHITE.get("file")
+    if not path:
+        return []
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    stamp = (st.st_mtime_ns, st.st_size)
+    with _white_lock:
+        if stamp != _white["stamp"]:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    items = json.load(f).get("items") or []
+                items = [x for x in items if isinstance(x, dict) and isinstance(x.get("link"), str)
+                         and isinstance(x.get("outbound"), dict) and x.get("name")]
+                _white.update(stamp=stamp, items=items)
+            except (OSError, ValueError, AttributeError):
+                pass                      # файл как раз переписывается — отдаём прежний список
+        return _white["items"]
+
+
+def with_level(outbound, level):
+    """уровень политики (тайм-ауты соединений) — как у подключений самой панели"""
+    out = copy.deepcopy(outbound)
+    settings = out.get("settings") or {}
+    for server in (settings.get("vnext") or []) + (settings.get("servers") or []):
+        if isinstance(server, dict):
+            if isinstance(server.get("users"), list):
+                for user in server["users"]:
+                    if isinstance(user, dict):
+                        user["level"] = level
+            else:
+                server["level"] = level
+    return out
+
+
+def white_json(data, items):
+    """JSON-подписка (Happ, v2rayNG, v2rayN): каждое подключение — копия конфига панели
+    с теми же правилами (РФ напрямую, реклама — блок), но со своим выходом proxy"""
+    confs = data if isinstance(data, list) else [data]
+    template = None
+    for conf in confs:
+        # шаблон — обычный Xray-конфиг панели (с названием и одним выходом proxy); конфиги других
+        # форматов (sing-box и т. п.) и «Автовыбор» с балансировкой шаблоном не служат
+        if not isinstance(conf, dict) or "remarks" not in conf or (conf.get("routing") or {}).get("balancers"):
+            continue
+        outs = conf.get("outbounds")
+        proxies = [o for o in outs if isinstance(o, dict) and o.get("tag") == "proxy"] if isinstance(outs, list) else []
+        if len(proxies) == 1 and proxies[0].get("protocol"):
+            template = conf
+            break
+    if template is None:
+        return None
+    proxy = next(o for o in template["outbounds"] if isinstance(o, dict) and o.get("tag") == "proxy")
+    settings = proxy.get("settings") or {}
+    level = settings.get("level")
+    for server in settings.get("vnext") or []:     # старый формат: уровень — у пользователя
+        for user in (server.get("users") if isinstance(server, dict) else None) or []:
+            if level is None and isinstance(user, dict):
+                level = user.get("level")
+    result = list(confs)
+    for it in items:
+        conf = copy.deepcopy(template)
+        ob = with_level(it["outbound"], level) if isinstance(level, int) else copy.deepcopy(it["outbound"])
+        ob["tag"] = "proxy"
+        conf["outbounds"] = [ob if isinstance(o, dict) and o.get("tag") == "proxy" else o for o in conf["outbounds"]]
+        conf["remarks"] = it["name"]
+        result.append(conf)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def add_white(body, items):
+    """подписка с белыми списками в конце; None — это не подписка (страница, ошибка) — не трогаем"""
+    try:
+        text = body.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if text[:1] in ("[", "{"):
+        try:
+            return white_json(json.loads(text), items)
+        except ValueError:
+            return None
+    encoded = "://" not in text           # обычно ссылки приходят одним куском base64
+    if encoded:
+        raw = "".join(text.split())
+        try:
+            text = base64.b64decode(raw + "=" * (-len(raw) % 4), validate=True).decode("utf-8")
+        except ValueError:                # сюда же — UnicodeDecodeError и ошибки base64
+            return None
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if not lines or not all(LINK.match(x) for x in lines):
+        return None
+    out = "\n".join(lines + [it["link"] for it in items])
+    if encoded:
+        out = base64.b64encode(out.encode("utf-8")).decode("ascii")
+    return out.encode("utf-8")
+
+
+def update_interval(headers):
+    """приложение обновляет подписку не реже, чем раз в update_hours часов — нерабочие пропадают быстрее"""
+    hours = int(WHITE.get("update_hours") or 0)
+    if hours <= 0:
+        return headers
+    out, found = [], False
+    for key, value in headers:
+        if key.lower() == "profile-update-interval":
+            found = True
+            try:
+                value = str(min(int(value), hours))
+            except ValueError:
+                value = str(hours)
+        out.append((key, value))
+    if not found:
+        out.append(("Profile-Update-Interval", str(hours)))
+    return out
+
+
+class Handler(BaseHTTPRequestHandler):
+    def version_string(self):
+        return "nginx"
+
+    def do_GET(self):
+        self.forward(False)
+
+    def do_HEAD(self):
+        self.forward(True)
+
+    def white_page(self, head):           # отдельная подписка: только белые списки
+        links = [it["link"] for it in white_items()]
+        body = base64.b64encode("\n".join(links).encode("utf-8")) if links else b""
+        title = WHITE.get("title") or "Белые списки"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Profile-Title", "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii"))
+        self.send_header("Profile-Update-Interval", str(int(WHITE.get("update_hours") or 1)))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def forward(self, head):
+        wpath = (WHITE.get("path") or "").rstrip("/")
+        if wpath and self.path.split("?", 1)[0].rstrip("/") == wpath:
+            self.white_page(head)
+            return
+        req = urllib.request.Request(UPSTREAM + self.path, method="HEAD" if head else "GET")
+        for key, value in self.headers.items():
+            if key.lower() not in SKIP:
+                req.add_header(key, value)
+        if self.headers.get("Host"):
+            req.add_header("Host", self.headers["Host"])
+        req.add_header("X-Forwarded-For", self.client_address[0])
+        req.add_header("X-Real-IP", self.client_address[0])
+        req.add_header("X-Forwarded-Proto", "https" if CERT else "http")
+        try:
+            try:
+                resp = OPENER.open(req, timeout=30)
+            except urllib.error.HTTPError as err:
+                resp = err
+            try:
+                status = getattr(resp, "status", None) or resp.getcode()
+                headers = list(resp.headers.items()) if resp.headers else []
+                body = b"" if head else (resp.read() or b"")
+            finally:
+                resp.close()
+        except Exception:                 # панель не ответила
+            self.send_error(502)
+            return
+        if status == 200 and body:
+            body = tune(body)
+            ctype = next((v for k, v in headers if k.lower() == "content-type"), "")
+            items = white_items() if WHITE else []
+            if items and "html" not in ctype.lower():
+                try:
+                    new = add_white(body, items)
+                except Exception:         # что-то пошло не так — подписка уходит как есть
+                    new = None
+                if new is not None:
+                    body = new
+                    headers = update_interval(headers)
+        self.send_response(status)
+        for key, value in headers:
+            if key.lower() not in SKIP:
+                self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+_lock = threading.Lock()
+_tls = {"ctx": None, "stamp": None}
+
+
+def tls_context():                        # сертификат перечитывается сам, когда его продлили
+    with _lock:
+        try:
+            stamp = (os.stat(CERT).st_mtime_ns, os.stat(KEY).st_mtime_ns)
+        except OSError:
+            stamp = None
+        if _tls["ctx"] is None or (stamp is not None and stamp != _tls["stamp"]):
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(CERT, KEY)
+                _tls.update(ctx=ctx, stamp=stamp)
+            except (OSError, ssl.SSLError):
+                if _tls["ctx"] is None:
+                    raise
+        return _tls["ctx"]
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
+    def finish_request(self, request, client_address):
+        request.settimeout(30)
+        conn = request
+        if CERT:
+            try:
+                conn = tls_context().wrap_socket(request, server_side=True)
+            except (OSError, ValueError):
+                return
+        try:
+            self.RequestHandlerClass(conn, client_address, self)
+        finally:
+            if conn is not request:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+
+def main():
+    port = int(CONF["port"])
+    if CERT:
+        tls_context()                     # сертификат должен читаться сразу
+    try:
+        Server.address_family = socket.AF_INET6
+        server = Server(("::", port), Handler)
+    except OSError:
+        Server.address_family = socket.AF_INET
+        server = Server(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+PY
+  chmod 755 "$SUB_FILTER_PY"
+}
+# Белые списки для мобильного интернета: программа скачивает список готовых подключений и
+# проверяет каждое настоящим запросом через Xray; рабочие (alive.json) отдаёт фильтр подписки.
+write_white_program() {
+  mkdir -p "$(dirname "$WHITE_PY")"
+  cat > "$WHITE_PY" <<'PY'
+#!/usr/bin/env python3
+# Белые списки для мобильного интернета (ставит install-vpn-all.sh, запускает таймер vpn-white-lists).
+# Скачивает готовые подключения (по умолчанию — Vless-Reality-White-Lists-Rus-Mobile.txt из
+# igareck/vpn-configs-for-russia, с зеркал) раз в несколько часов и проверяет КАЖДОЕ подключение
+# настоящим запросом через Xray панели. Рабочие записывает в alive.json — их фильтр подписки
+# добавляет в подписку. Подключение, которое не ответило, пропадает из подписки сразу после проверки.
+#   vpn-white-lists.py НАСТРОЙКИ.json auto    — по таймеру: скачать, если пора, и проверить
+#   vpn-white-lists.py НАСТРОЙКИ.json update  — скачать сейчас и проверить
+#   vpn-white-lists.py НАСТРОЙКИ.json check   — только проверить
+#   vpn-white-lists.py НАСТРОЙКИ.json status  — итог последней проверки (JSON)
+import base64, binascii, collections, concurrent.futures, fcntl, glob, json, os, re, socket, ssl, subprocess, sys, tempfile, time
+import urllib.error, urllib.parse, urllib.request
+
+SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2")
+MAX_BYTES = 4 * 1024 * 1024
+FLAG = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
+
+
+class Skip(Exception):
+    """подключение, которое здесь не проверить (неизвестный транспорт, нет ключа и т. п.)"""
+
+
+def log(text):
+    print(text, flush=True)
+
+
+def load_conf(path):
+    conf = json.load(open(path, encoding="utf-8"))
+    conf.setdefault("data", "/var/lib/vpn-white-lists")
+    conf.setdefault("refresh_hours", 5)
+    conf.setdefault("label", "🏳️ БС")
+    conf.setdefault("test_urls", ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"])
+    conf.setdefault("timeout", 10)
+    conf.setdefault("workers", 32)
+    conf.setdefault("max_items", 300)
+    conf.setdefault("xray_dir", "/usr/local/x-ui/bin")
+    return conf
+
+
+def write_atomic(path, text):
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def b64text(s):
+    s = "".join(str(s).split()).replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8")
+
+
+def reason(err):
+    if isinstance(err, urllib.error.HTTPError):
+        return "HTTP %s" % err.code
+    if isinstance(err, urllib.error.URLError):
+        err = err.reason
+    if isinstance(err, socket.timeout) or "timed out" in str(err):
+        return "нет ответа"
+    return " ".join(str(err).split())[:80] or err.__class__.__name__
+
+
+# ---------------------------------------------------------------- скачивание списка
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (vpn-white-lists)",
+                                               "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        raise ValueError("файл больше 4 МБ")
+    return raw
+
+
+def extract_links(raw):
+    text = raw.decode("utf-8", "replace").lstrip("﻿")
+    if "://" not in text:                          # весь список в base64
+        try:
+            text = b64text(text)
+        except (binascii.Error, ValueError):
+            return []
+    links, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.split("://", 1)[0].lower() in SCHEMES and line not in seen:
+            seen.add(line)
+            links.append(line)
+    return links
+
+
+def download(conf, state):
+    links, seen, used, errors = [], set(), [], []
+    for source in conf["sources"]:                 # источник — один файл и его зеркала
+        for url in source:
+            host = urllib.parse.urlsplit(url).hostname or url
+            try:
+                got = extract_links(fetch(url))
+            except (OSError, ValueError) as err:   # сюда же — ошибки HTTP и таймауты
+                errors.append("%s: %s" % (host, reason(err)))
+                continue
+            if not got:
+                errors.append("%s: в файле нет подключений" % host)
+                continue
+            for link in got:
+                if link not in seen:
+                    seen.add(link)
+                    links.append(link)
+            used.append(host)
+            break
+    if not links:
+        raise RuntimeError("; ".join(errors[-3:]) or "источник не указан")
+    links = links[:int(conf["max_items"])]
+    write_atomic(os.path.join(conf["data"], "source.txt"), "\n".join(links) + "\n")
+    state.update(downloaded=int(time.time()), download_from=used, download_error="", total=len(links))
+    log("Список скачан (%s): подключений — %d" % (", ".join(used), len(links)))
+    return links
+
+
+# ---------------------------------------------------------------- ссылка → выход Xray
+def parts(link):
+    u = urllib.parse.urlsplit(link)
+    query = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    try:
+        port = u.port
+    except ValueError:
+        raise Skip("неверный порт")
+    if not u.hostname or not port:
+        raise Skip("нет адреса или порта")
+    user = urllib.parse.unquote(u.netloc.rpartition("@")[0]) if "@" in u.netloc else ""
+    return u.hostname, port, user, query, urllib.parse.unquote(u.fragment)
+
+
+def stream(q, host):
+    net = (q.get("type") or "tcp").lower()
+    sec = (q.get("security") or "none").lower()
+    path, hosts = q.get("path") or "/", q.get("host") or ""
+    s = {"network": net}
+    if net in ("tcp", "raw"):
+        s["network"] = "tcp"
+        if (q.get("headerType") or "").lower() == "http":
+            req = {"path": [path]}
+            if hosts:
+                req["headers"] = {"Host": [h for h in hosts.split(",") if h]}
+            s["tcpSettings"] = {"header": {"type": "http", "request": req}}
+    elif net == "ws":
+        s["wsSettings"] = {"path": path}
+        if hosts:
+            s["wsSettings"]["host"] = hosts
+    elif net == "grpc":
+        g = {"serviceName": q.get("serviceName") or ""}
+        if q.get("authority"):
+            g["authority"] = q["authority"]
+        if (q.get("mode") or "").lower() == "multi":
+            g["multiMode"] = True
+        s["grpcSettings"] = g
+    elif net in ("xhttp", "splithttp"):
+        s["network"] = "xhttp"
+        x = {"path": path, "mode": q.get("mode") or "auto"}
+        if hosts:
+            x["host"] = hosts
+        if q.get("extra"):
+            try:
+                extra = json.loads(q["extra"])
+            except ValueError:
+                extra = None
+            if isinstance(extra, dict):
+                x["extra"] = extra
+        s["xhttpSettings"] = x
+    elif net == "httpupgrade":
+        s["httpupgradeSettings"] = {"path": path}
+        if hosts:
+            s["httpupgradeSettings"]["host"] = hosts
+    else:
+        raise Skip("транспорт %s" % net)
+    if sec == "reality":
+        if not q.get("pbk"):
+            raise Skip("Reality без ключа")
+        r = {"serverName": q.get("sni") or "", "fingerprint": q.get("fp") or "chrome",
+             "publicKey": q["pbk"], "shortId": q.get("sid") or ""}
+        if q.get("spx"):
+            r["spiderX"] = q["spx"]
+        if q.get("pqv"):
+            r["mldsa65Verify"] = q["pqv"]
+        s.update(security="reality", realitySettings=r)
+    elif sec in ("tls", "xtls"):
+        t = {"serverName": q.get("sni") or q.get("peer") or hosts.split(",")[0] or host}
+        if q.get("fp"):
+            t["fingerprint"] = q["fp"]
+        alpn = [a for a in (q.get("alpn") or "").split(",") if a]
+        if alpn:
+            t["alpn"] = alpn
+        if q.get("pcs"):
+            t["pinnedPeerCertSha256"] = q["pcs"]
+        if q.get("vcn"):
+            t["verifyPeerCertByName"] = q["vcn"]
+        s.update(security="tls", tlsSettings=t)
+    elif sec in ("none", ""):
+        s["security"] = "none"
+    else:
+        raise Skip("шифрование %s" % sec)
+    return s
+
+
+def to_outbound(link):
+    scheme = link.split("://", 1)[0].lower()
+    if scheme == "vless":
+        host, port, uid, q, name = parts(link)
+        if not uid:
+            raise Skip("нет ключа")
+        user = {"id": uid, "encryption": q.get("encryption") or "none"}
+        if q.get("flow"):
+            user["flow"] = q["flow"]
+        return {"protocol": "vless", "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+                "streamSettings": stream(q, host)}, name
+    if scheme == "trojan":
+        host, port, password, q, name = parts(link)
+        if not password:
+            raise Skip("нет пароля")
+        q.setdefault("security", "tls")
+        return {"protocol": "trojan", "settings": {"servers": [{"address": host, "port": port, "password": password}]},
+                "streamSettings": stream(q, host)}, name
+    if scheme == "vmess":
+        body = link.split("://", 1)[1].split("#", 1)[0]
+        d = json.loads(b64text(body))
+        host, port = str(d.get("add") or "").strip(), int(d.get("port") or 0)
+        if not host or not port or not d.get("id"):
+            raise Skip("нет адреса или ключа")
+        net = str(d.get("net") or "tcp").lower()
+        q = {"type": net, "security": str(d.get("tls") or "none"), "sni": d.get("sni") or "",
+             "host": d.get("host") or "", "fp": d.get("fp") or "", "alpn": d.get("alpn") or ""}
+        if net == "grpc":
+            q.update(serviceName=d.get("path") or "", mode=d.get("type") or "")
+        else:
+            q.update(path=d.get("path") or "/", headerType=d.get("type") or "")
+        user = {"id": d["id"], "alterId": int(d.get("aid") or 0), "security": d.get("scy") or "auto"}
+        return {"protocol": "vmess", "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+                "streamSettings": stream(q, host)}, str(d.get("ps") or "")
+    if scheme == "ss":
+        rest = link.split("://", 1)[1]
+        rest, _, frag = rest.partition("#")
+        rest = rest.split("?", 1)[0].rstrip("/")
+        if "@" not in rest:                        # старый формат: всё в base64
+            rest = b64text(rest)
+        userinfo, _, hostport = rest.rpartition("@")
+        userinfo = urllib.parse.unquote(userinfo)
+        if ":" not in userinfo:
+            userinfo = b64text(userinfo)
+        method, _, password = userinfo.partition(":")
+        u = urllib.parse.urlsplit("ss://x@" + hostport)
+        if not u.hostname or not u.port or not method:
+            raise Skip("нет адреса или пароля")
+        if "plugin=" in link:
+            raise Skip("плагин Shadowsocks")
+        return {"protocol": "shadowsocks", "settings": {"servers": [{"address": u.hostname, "port": u.port,
+                                                                     "method": method, "password": password}]}}, \
+            urllib.parse.unquote(frag)
+    if scheme in ("hysteria2", "hy2"):
+        host, port, auth, q, name = parts(link)
+        if q.get("obfs") or q.get("mport"):
+            raise Skip("Hysteria2 с маскировкой")
+        tls = {"serverName": q.get("sni") or host, "alpn": ["h3"]}
+        if q.get("pinSHA256"):
+            tls["pinnedPeerCertSha256"] = q["pinSHA256"].replace(":", "").lower()
+        return {"protocol": "hysteria", "settings": {"version": 2, "address": host, "port": port},
+                "streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": tls,
+                                   "hysteriaSettings": {"version": 2, "auth": auth}}}, name
+    raise Skip("протокол %s" % scheme)
+
+
+def nice_name(label, n, original):
+    country = ""
+    m = FLAG.search(original or "")
+    if m:                                          # «🇩🇪 Germany, Frankfurt | [BL]» → «🇩🇪 Germany»
+        tail = re.split(r"[|,(\[]", original[m.end():])[0]
+        tail = " ".join(re.sub(r"[^\w\s.-]", " ", tail).split())
+        if len(tail) > 24:
+            tail = tail[:24].rsplit(" ", 1)[0]
+        country = (m.group(0) + " " + tail).strip()
+    return "%s %02d%s" % (label, n, " · " + country if country else "")
+
+
+def rename(link, name):
+    if link.lower().startswith("vmess://"):
+        d = json.loads(b64text(link.split("://", 1)[1].split("#", 1)[0]))
+        d["ps"] = name
+        return "vmess://" + base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    return link.split("#", 1)[0] + "#" + urllib.parse.quote(name, safe="")
+
+
+# ---------------------------------------------------------------- проверка через Xray
+def find_xray(conf):
+    for path in sorted(glob.glob(os.path.join(conf["xray_dir"], "xray-linux-*"))):
+        if os.access(path, os.X_OK):
+            return path
+    raise RuntimeError("не найден Xray панели в %s" % conf["xray_dir"])
+
+
+def free_ports(count):
+    socks, ports = [], []
+    try:
+        for _ in range(count):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+            ports.append(s.getsockname()[1])
+    finally:
+        for s in socks:
+            s.close()
+    return ports
+
+
+def xray_config(items, ports):
+    inbounds, outbounds, rules = [], [], []
+    for it, port in zip(items, ports):
+        tag = "w%d" % it["n"]
+        inbounds.append({"tag": "in-" + tag, "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                         "settings": {"udp": False}})
+        outbounds.append(dict(it["outbound"], tag=tag))
+        rules.append({"type": "field", "inboundTag": ["in-" + tag], "outboundTag": tag})
+    return {"log": {"loglevel": "none"}, "inbounds": inbounds, "outbounds": outbounds,
+            "routing": {"rules": rules}}
+
+
+def xray_error(text):
+    """главное из ошибки Xray: «Failed to start: … > причина» → «причина»"""
+    text = text.strip()
+    m = re.search(r"Failed to start: (.*)", text)
+    line = m.group(1) if m else (text.splitlines()[-1] if text else "")
+    return " ".join(line.split(" > ")[-1].split())[:200]
+
+
+def xray_test(xray, conf, items, workdir):
+    """(принимает ли Xray эти настройки, причина отказа)"""
+    fd, path = tempfile.mkstemp(dir=workdir, suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(xray_config(items, range(20000, 20000 + len(items))), f)
+    env = dict(os.environ, XRAY_LOCATION_ASSET=conf["xray_dir"])
+    try:
+        r = subprocess.run([xray, "run", "-test", "-c", path], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, env=env, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return False, str(err)
+    finally:
+        os.unlink(path)
+    if r.returncode == 0:
+        return True, ""
+    return False, xray_error(r.stdout.decode("utf-8", "replace")) or "код %d" % r.returncode
+
+
+def server_of(outbound):
+    """адрес и порт сервера подключения"""
+    s = outbound.get("settings") or {}
+    for key in ("vnext", "servers"):
+        for srv in s.get(key) or []:
+            if isinstance(srv, dict):
+                return srv.get("address"), srv.get("port")
+    return s.get("address"), s.get("port")
+
+
+def reachable(item):
+    """открывается ли сервер подключения напрямую с этого сервера (None — UDP, так не проверить)"""
+    if item["outbound"].get("protocol") == "hysteria":
+        return None
+    host, port = server_of(item["outbound"])
+    try:
+        socket.create_connection((host, int(port)), timeout=5).close()
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise OSError("соединение закрыто")
+        data += chunk
+    return data
+
+
+CTX = ssl.create_default_context()
+
+
+def probe(port, url, timeout):
+    """запрос url через SOCKS-вход 127.0.0.1:port; время ответа в мс или None"""
+    u = urllib.parse.urlsplit(url)
+    secure = u.scheme == "https"
+    host, dport = u.hostname, u.port or (443 if secure else 80)
+    path = (u.path or "/") + ("?" + u.query if u.query else "")
+    start = time.monotonic()
+    conn = None
+    try:
+        conn = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        conn.sendall(b"\x05\x01\x00")
+        if recv_exact(conn, 2) != b"\x05\x00":
+            return None
+        name = host.encode("idna")
+        conn.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + dport.to_bytes(2, "big"))
+        head = recv_exact(conn, 4)
+        if head[1] != 0:
+            return None
+        size = {1: 4, 4: 16}.get(head[3])
+        if size is None:
+            size = recv_exact(conn, 1)[0]
+        recv_exact(conn, size + 2)
+        if secure:
+            conn = CTX.wrap_socket(conn, server_hostname=host)
+        conn.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n"
+                      "Connection: close\r\n\r\n" % (path, host)).encode("ascii"))
+        reply = b""
+        while b"\r\n" not in reply and len(reply) < 4096:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            reply += chunk
+        status = reply.split(b"\r\n", 1)[0].split()
+        if len(status) >= 2 and status[0].startswith(b"HTTP/") and status[1].isdigit() \
+                and 200 <= int(status[1]) < 400:
+            return int((time.monotonic() - start) * 1000)
+        return None
+    except (OSError, ValueError, UnicodeError):
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def internet_ok(conf):
+    # есть ли у самого сервера интернет (без него все подключения выглядели бы нерабочими)
+    for url in list(conf["test_urls"]) + ["https://ya.ru/"]:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=conf["timeout"]) as resp:
+                if 200 <= resp.status < 400:
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def check(conf, state, links):
+    xray = find_xray(conf)
+    items, skipped = [], 0
+    for n, link in enumerate(links, 1):
+        try:
+            outbound, original = to_outbound(link)
+        except (Skip, ValueError, KeyError, TypeError, UnicodeError, binascii.Error):
+            skipped += 1
+            continue
+        name = nice_name(conf["label"], n, original)
+        items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound})
+    work = tempfile.mkdtemp(prefix="vpn-white-")
+    try:
+        # настройки, которые этот Xray не принимает (устаревшие и т. п.), отсеиваем сразу
+        why = ""
+        if items:
+            good, why = xray_test(xray, conf, items, work)
+            if not good:
+                with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                    res = list(pool.map(lambda it: xray_test(xray, conf, [it], work), items))
+                bad = [w for ok, w in res if not ok]
+                if bad:
+                    why = collections.Counter(bad).most_common(1)[0][0]
+                    log("Xray этого сервера не принял настройки %d подключений: %s" % (len(bad), why))
+                skipped += len(bad)
+                items = [it for it, (ok, _) in zip(items, res) if ok]
+        state.update(total=len(links), unsupported=skipped, unsupported_reason=why if skipped else "")
+        if not items:
+            raise RuntimeError("Xray не принял ни одно подключение из списка: %s" % (why or "формат не поддерживается"))
+        if not internet_ok(conf):
+            raise RuntimeError("у сервера сейчас нет связи с интернетом — проверку пропускаю")
+        ports = free_ports(len(items))
+        path = os.path.join(work, "check.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(xray_config(items, ports), f)
+        xlog = open(os.path.join(work, "xray.log"), "wb")
+        proc = subprocess.Popen([xray, "run", "-c", path], stdout=xlog, stderr=subprocess.STDOUT,
+                                env=dict(os.environ, XRAY_LOCATION_ASSET=conf["xray_dir"]))
+        xlog.close()
+        try:
+            pending, deadline = set(ports), time.monotonic() + 15
+            while pending and time.monotonic() < deadline and proc.poll() is None:
+                for port in list(pending):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                        pending.discard(port)
+                    except OSError:
+                        pass
+                if pending:
+                    time.sleep(0.3)
+            if pending:
+                try:
+                    with open(os.path.join(work, "xray.log"), encoding="utf-8", errors="replace") as f:
+                        err = xray_error(f.read())
+                except OSError:
+                    err = ""
+                raise RuntimeError("Xray для проверки не запустился%s" % (": " + err if err else ""))
+
+            def one(pair):
+                it, port = pair
+                for url in conf["test_urls"][:2]:   # вторая попытка — по другому адресу
+                    ms = probe(port, url, float(conf["timeout"]))
+                    if ms is not None:
+                        return ms
+                return None
+
+            with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
+                results = list(pool.map(one, zip(items, ports)))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        for name in os.listdir(work):
+            os.unlink(os.path.join(work, name))
+        os.rmdir(work)
+    alive = [dict(it, ms=ms) for it, ms in zip(items, results) if ms is not None]
+    # почему не отвечают: сервер подключения вообще не открывается отсюда — или открывается,
+    # но запрос через подключение не проходит (сервер выключен, ключ сменился, перегружен)
+    failed = [it for it, ms in zip(items, results) if ms is None]
+    reach = []
+    if failed:
+        with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
+            reach = list(pool.map(reachable, failed))
+    closed, opened = reach.count(False), reach.count(True)
+    udp = len(failed) - closed - opened
+    detail = []
+    if closed:
+        detail.append("сервер не открывается отсюда — %d" % closed)
+    if opened:
+        detail.append("открывается, но запрос через него не проходит — %d" % opened)
+    if udp:
+        detail.append("Hysteria2 (UDP) — %d" % udp)
+    detail = " (%s)" % "; ".join(detail) if detail else ""
+    state.update(checked=int(time.time()), tested=len(items), alive=len(alive), check_error="",
+                 fail_closed=closed, fail_open=opened)
+    if failed and not alive and closed == len(failed):
+        log("Этот сервер не может подключиться ни к одному серверу из списка — похоже, исходящие "
+            "соединения ограничивает хостер или сеть сервера.")
+    path = os.path.join(conf["data"], "alive.json")
+    if not alive:
+        # не ответило ни одно — скорее всего, сбой связи у самого сервера, а не у всех подключений
+        # сразу: оставляем прежние рабочие (те, что ещё есть в списке) до следующей проверки
+        keys = {json.dumps(it["outbound"], sort_keys=True) for it in items}
+        prev = read_json(path, {}).get("items") or []
+        kept = [it for it in prev if isinstance(it, dict) and json.dumps(it.get("outbound"), sort_keys=True) in keys]
+        if kept:
+            state["check_error"] = "не ответило ни одно подключение — оставлены прежние рабочие (%d)" % len(kept)
+            log("Проверено %d: не ответило ни одно%s — похоже на сбой связи у сервера; в подписке остаются "
+                "прежние рабочие (%d) до следующей проверки." % (len(items), detail, len(kept)))
+            if len(kept) != len(prev):
+                write_atomic(path, json.dumps({"updated": int(time.time()), "total": len(links), "alive": len(kept),
+                                               "items": kept}, ensure_ascii=False, indent=1))
+            return
+    write_atomic(path, json.dumps({"updated": int(time.time()), "total": len(links), "alive": len(alive),
+                                   "items": alive}, ensure_ascii=False, indent=1))
+    log("Проверено %d: работают %d, не отвечают %d%s — в подписке только рабочие." %
+        (len(items), len(alive), len(failed), detail))
+    if skipped:
+        log("Не проверялись: %d (Xray этого сервера не принимает их настройки)." % skipped)
+
+
+# ---------------------------------------------------------------- запуск
+def main():
+    if len(sys.argv) < 2:
+        print("vpn-white-lists.py НАСТРОЙКИ.json [auto|update|check|status]")
+        return 2
+    conf = load_conf(sys.argv[1])
+    cmd = sys.argv[2] if len(sys.argv) > 2 else "auto"
+    data = conf["data"]
+    state_path = os.path.join(data, "state.json")
+    if cmd == "status":
+        state = read_json(state_path, {})
+        # сколько подключений прямо сейчас в подписке (их отдаёт фильтр подписки)
+        state["in_subscription"] = len(read_json(os.path.join(data, "alive.json"), {}).get("items") or [])
+        print(json.dumps(state, ensure_ascii=False))
+        return 0
+    if cmd not in ("auto", "update", "check"):
+        print("неизвестная команда: %s" % cmd)
+        return 2
+    os.makedirs(data, exist_ok=True)
+    with open(os.path.join(data, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)          # проверка по таймеру и ручной запуск — по очереди
+        state = read_json(state_path, {})
+        try:
+            with open(os.path.join(data, "source.txt"), encoding="utf-8") as f:
+                links = [x.strip() for x in f if x.strip()]
+        except OSError:
+            links = []
+        due = time.time() - float(state.get("downloaded") or 0) >= float(conf["refresh_hours"]) * 3600 - 60
+        rc = 0
+        if cmd == "update" or (cmd == "auto" and (due or not links)):
+            try:
+                links = download(conf, state)
+            except RuntimeError as err:
+                state["download_error"] = str(err)
+                log("Скачать список не удалось (%s)%s" % (err, " — проверяю прежний." if links else "."))
+                rc = 1
+        if links:
+            try:
+                check(conf, state, links)
+            except RuntimeError as err:
+                state["check_error"] = str(err)
+                log("Проверка не прошла: %s" % err)
+                rc = 1
+        write_atomic(state_path, json.dumps(state, ensure_ascii=False, indent=1))
+    return rc if links else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+  chmod 755 "$WHITE_PY"
+}
+white_setup() {   # программа, настройки и таймер белых списков (сам список скачивает white_run_now)
+  local py
+  py="$(command -v python3)"
+  write_white_program
+  mkdir -p "$(dirname "$WHITE_CONF")" "$WHITE_DATA"
+  WHITE_URL="$WHITE_URL" REFRESH="$WHITE_REFRESH_HOURS" LABEL="$WHITE_LABEL" DATA="$WHITE_DATA" \
+  XDIR="${XUI_DIR}/bin" python3 - "$WHITE_CONF" <<'PY' || return 1
+import json, os, secrets, sys
+e = os.environ
+try:
+    old = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    old = {}
+# белые списки для мобильного интернета (ТОП-150) — с GitHub, а если он недоступен, с зеркал
+name = "Vless-Reality-White-Lists-Rus-Mobile.txt"
+repo = "igareck/vpn-configs-for-russia"
+mirrors = ["https://raw.githubusercontent.com/%s/main/%s" % (repo, name),
+           "https://raw.githack.com/%s/main/%s" % (repo, name),
+           "https://gitlab.com/%s/-/raw/main/%s" % (repo, name),
+           "https://codeberg.org/%s/raw/branch/main/%s" % (repo, name),
+           "https://cdn.jsdelivr.net/gh/%s@main/%s" % (repo, name)]
+urls = e["WHITE_URL"].replace(",", " ").split()
+if urls and urls != ["default"]:
+    sources, custom = [[u] for u in urls], True        # свои списки: каждый — отдельный источник
+elif not urls and old.get("custom") and old.get("sources"):
+    sources, custom = old["sources"], True             # свои списки, указанные при прошлом запуске
+else:
+    sources, custom = [mirrors], False
+conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"]), "label": e["LABEL"],
+        "data": e["DATA"], "xray_dir": e["XDIR"],
+        "test_urls": ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"],
+        "timeout": 10, "workers": 32, "max_items": 300,
+        # для фильтра подписки: адрес отдельной подписки (прежний), её название в приложении
+        # и как часто приложению обновлять подписку (часы) — тогда нерабочие пропадают и с телефона
+        "path": old.get("path") or "/" + secrets.token_hex(8) + "/",
+        "title": "🏳️ Белые списки", "update_hours": 1}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(conf, f, indent=1)
+PY
+  chmod 600 "$WHITE_CONF"
+  cat > "$WHITE_UNIT" <<UNIT
+[Unit]
+Description=VPN white lists: new list every ${WHITE_REFRESH_HOURS}h, every connection checked, only working ones in the subscription
+After=network-online.target x-ui.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${py} ${WHITE_PY} ${WHITE_CONF} auto
+Nice=10
+TimeoutStartSec=20min
+UNIT
+  cat > "$WHITE_TIMER" <<UNIT
+[Unit]
+Description=VPN white lists: check every ${WHITE_CHECK_MIN} minutes
+
+[Timer]
+OnActiveSec=${WHITE_CHECK_MIN}min
+OnUnitActiveSec=${WHITE_CHECK_MIN}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+white_timer_on() {   # проверка по таймеру — каждые WHITE_CHECK_MIN минут (и после перезагрузки сервера)
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable vpn-white-lists.timer >/dev/null 2>&1 || true
+  systemctl restart vpn-white-lists.timer >/dev/null 2>&1
+}
+WHITE_TOTAL=0; WHITE_ALIVE=0; WHITE_ERR=""
+white_state() {   # итог последней проверки → WHITE_TOTAL (в списке), WHITE_ALIVE (в подписке), WHITE_ERR
+  local st
+  st="$(python3 "$WHITE_PY" "$WHITE_CONF" status 2>/dev/null | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+err = " ".join(str(d.get("check_error") or d.get("download_error") or "").split())
+print(int(d.get("total") or 0), int(d.get("in_subscription") or 0), err or "-")' 2>/dev/null || echo "0 0 -")"
+  read -r WHITE_TOTAL WHITE_ALIVE WHITE_ERR <<< "$st" || true
+  [[ "$WHITE_TOTAL" =~ ^[0-9]+$ ]] || WHITE_TOTAL=0
+  [[ "$WHITE_ALIVE" =~ ^[0-9]+$ ]] || WHITE_ALIVE=0
+  if [ "${WHITE_ERR:--}" = "-" ]; then WHITE_ERR=""; fi
+}
+white_run_now() {   # скачать список сейчас и проверить каждое подключение (ход — на экран)
+  local line
+  while IFS= read -r line; do printf '    %s\n' "$line"; done < <(python3 "$WHITE_PY" "$WHITE_CONF" update 2>&1 || true)
+  white_state
+}
+white_remove() {   # убрать белые списки: таймер, программу, настройки и скачанные списки
+  systemctl disable --now vpn-white-lists.timer >/dev/null 2>&1 || true
+  systemctl stop vpn-white-lists.service >/dev/null 2>&1 || true
+  rm -f "$WHITE_TIMER" "$WHITE_UNIT" "$WHITE_PY" "$WHITE_CONF"
+  rm -rf "$WHITE_DATA"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+sub_filter_conf_white() {   # sub_filter_conf_white 1|0 — в настройки фильтра подписки: белые списки или без них
+  WHITE="$1" WHITE_CONF="$WHITE_CONF" python3 - "$SUB_FILTER_CONF" <<'PY'
+import json, os, sys
+conf = json.load(open(sys.argv[1]))
+conf.pop("white", None)
+if os.environ["WHITE"] == "1":
+    w = json.load(open(os.environ["WHITE_CONF"], encoding="utf-8"))
+    conf["white"] = {"file": os.path.join(w["data"], "alive.json"), "path": w["path"],
+                     "title": w.get("title") or "Белые списки", "update_hours": int(w.get("update_hours") or 1)}
+with open(sys.argv[1], "w") as f:
+    json.dump(conf, f, indent=1)
+PY
+}
+white_path() {   # адрес отдельной подписки белых списков (путь на порту подписки)
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("path") or "")' "$WHITE_CONF" 2>/dev/null || true
+}
+white_in_sub() {   # white_in_sub https://127.0.0.1:порт/путь — «N M»: белых списков в JSON-подписке (Happ) и в обычной
+  local url="$1" nj nb
+  nj="$(curl -sk --noproxy '*' --max-time 20 -A 'Happ/3.0' "$url" 2>/dev/null | LABEL="$WHITE_LABEL" python3 -c 'import json, os, sys
+d = json.load(sys.stdin)
+print(sum(1 for c in (d if isinstance(d, list) else [d]) if str(c.get("remarks") or "").startswith(os.environ["LABEL"])))' 2>/dev/null || true)"
+  nb="$(curl -sk --noproxy '*' --max-time 20 -A 'Streisand/1.6' "$url" 2>/dev/null | python3 -c 'import base64, json, sys
+raw = "".join(sys.stdin.read().split())
+text = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
+alive = {x["link"] for x in json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []}
+print(sum(1 for line in text.splitlines() if line.strip() in alive))' "${WHITE_DATA}/alive.json" 2>/dev/null || true)"
+  echo "${nj:-0} ${nb:-0}"
+}
+white_summary() {   # итог для экрана и для файла с доступами
+  local src="igareck/vpn-configs-for-russia — Vless-Reality-White-Lists-Rus-Mobile.txt (GitHub и зеркала)"
+  if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("custom") else 1)' "$WHITE_CONF" 2>/dev/null; then
+    src="свои списки (WHITE_URL)"
+  fi
+  echo "Источник: ${src}"
+  echo "Новый список — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется каждые ${WHITE_CHECK_MIN} мин настоящим запросом;"
+  echo "в подписке только рабочие: нерабочее пропадает сразу после проверки (приложение обновляет подписку раз в час)."
+  echo "Сейчас в подписке: ${WHITE_ALIVE} рабочих из ${WHITE_TOTAL}${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  if [ -n "${WHITE_URL_SUB:-}" ]; then echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"; fi
+  echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
+}
+
 # ---------- режим: один сервер или мост (этот сервер в России → зарубежные серверы) ----------
 BRIDGE=0
 BRIDGE_FILE="/etc/x-ui/vpn-bridge.json"   # параметры зарубежных выходов — для повторных запусков
@@ -265,7 +1402,9 @@ else
   case "$(printf '%s' "$EXIT_HOST" | tr '[:upper:]' '[:lower:]')" in
     none|off|no|0) EXIT_HOST="" ;;
     "")
-      if [ "$HAS_TTY" = "1" ]; then
+      if [ "$WHITE_LISTS" = "only" ]; then
+        EXIT_HOST="$SAVED_EXITS"   # только белые списки: мост (если он есть) остаётся как был
+      elif [ "$HAS_TTY" = "1" ]; then
         DEF=1; [ -n "$SAVED_EXITS" ] && DEF=2
         {
           echo
@@ -274,6 +1413,14 @@ else
           echo "  2) Мост — этот сервер в России принимает телефоны, а зарубежные сайты открывает"
           echo "     через зарубежные серверы: один или несколько, сам выбирает лучший по пингу"
           echo "     (настроит их сам по SSH)"
+          echo "  3) Белые списки для мобильного интернета — добавить в подписку готовые подключения,"
+          echo "     которые работают, когда оператор пускает только на «разрешённые» сайты."
+          echo "     Список обновляется каждые ${WHITE_REFRESH_HOURS} ч, каждое подключение проверяется, нерабочие"
+          if [ -x "$XUI_BIN" ] && [ -f "$DB" ]; then
+            echo "     сразу убираются. VPN, ключи и пароль панели не меняются$([ -f "$WHITE_CONF" ] && echo " (сейчас включены — обновятся)")"
+          else
+            echo "     сразу убираются. VPN здесь ещё не установлен — сначала установится, как в пункте 1"
+          fi
         } > /dev/tty
         tty_read CHOICE "Ваш выбор [${DEF}]: "
         CHOICE="${CHOICE// /}"
@@ -282,7 +1429,8 @@ else
           2) tty_read EXIT_HOST "IP зарубежных серверов через пробел${SAVED_EXITS:+ [${SAVED_EXITS}]}: "
              [ -n "${EXIT_HOST// /}" ] || EXIT_HOST="$SAVED_EXITS"
              [ -n "${EXIT_HOST// /}" ] || die "IP зарубежного сервера не указан." ;;
-          *) die "Нужно ввести 1 или 2." ;;
+          3) WHITE_LISTS=only; EXIT_HOST="$SAVED_EXITS" ;;
+          *) die "Нужно ввести 1, 2 или 3." ;;
         esac
       else
         EXIT_HOST="$SAVED_EXITS"   # без клавиатуры — как при прошлой установке
@@ -311,7 +1459,30 @@ fi
 EXIT_TEXT="${EXIT_HOSTS[*]:-}"
 if [ "${#EXIT_HOSTS[@]}" -gt 1 ]; then EXIT_TEXT="зарубежные серверы (${#EXIT_HOSTS[@]} шт.)"; fi
 
+# Белые списки: only — только они (VPN уже установлен), 1 — вместе с установкой, 0 — убрать,
+# пусто — как при прошлом запуске.
+WHITE_ONLY=0
+if [ "$VPN_ROLE" = "exit" ]; then
+  WHITE_LISTS=0                       # выход моста подписку не отдаёт
+elif [ "$WHITE_LISTS" = "only" ]; then
+  if [ -x "$XUI_BIN" ] && [ -f "$DB" ]; then
+    # у выхода моста панель слушает только 127.0.0.1 — телефоны к нему не подключаются
+    if [ "$(DB="$DB" python3 -c 'import os, sqlite3
+row = sqlite3.connect(os.environ["DB"], timeout=30).execute("SELECT value FROM settings WHERE key=?", ("webListen",)).fetchone()
+print((row[0] or "").strip() if row else "")' 2>/dev/null || true)" = "127.0.0.1" ]; then
+      die "Это зарубежный сервер моста (выход). Белые списки ставятся на российский сервер, к которому подключаются телефоны: запустите скрипт там и выберите пункт 3."
+    fi
+    WHITE_ONLY=1
+  else
+    ylw "VPN на этом сервере ещё не установлен — сначала установлю его (как в пункте 1), затем белые списки."
+  fi
+  WHITE_LISTS=1
+fi
+WHITE_ON=0; WHITE_READY=0            # WHITE_READY — программа и настройки белых списков на месте
+if [ "$WHITE_LISTS" = "1" ] || { [ -z "$WHITE_LISTS" ] && [ -f "$WHITE_CONF" ]; }; then WHITE_ON=1; fi
+
 if [ "$VPN_ROLE" = "exit" ]; then TOTAL=7; elif [ "$BRIDGE" = "1" ]; then TOTAL=$((11 + EXIT_DIRECT)); else TOTAL=10; fi
+TOTAL=$((TOTAL + WHITE_ON))
 STEP=0
 step() { STEP=$((STEP + 1)); grn "[${STEP}/${TOTAL}] $*"; }
 
@@ -411,6 +1582,88 @@ github_diag() {  # понятная причина, если GitHub не отд�
     *) echo "github.com ответил кодом $1" ;;
   esac
 }
+
+# ============================================================================
+# ТОЛЬКО БЕЛЫЕ СПИСКИ (пункт 3 меню или WHITE_LISTS=only): VPN уже установлен — ставим загрузку
+# и проверку списка и добавляем рабочие подключения в подписку. Панель, ключи VPN, ссылку-подписку
+# и пароль панели не трогаем.
+if [ "$WHITE_ONLY" = "1" ] && ! { [ -f "$SUB_FILTER_UNIT" ] && [ -s "$SUB_FILTER_CONF" ]; }; then
+  ylw "Подписку на этом сервере отдаёт сама панель, без фильтра подписки — белые списки добавлю"
+  ylw "полной настройкой: ключи VPN и ссылка-подписка сохранятся, у панели будет новый пароль."
+  WHITE_ONLY=0
+fi
+if [ "$WHITE_ONLY" = "1" ]; then
+  TOTAL=3
+  step "Ставлю загрузку и проверку белых списков..."
+  for b in python3 curl; do
+    command -v "$b" >/dev/null 2>&1 || die "Не найден ${b}: запустите скрипт и выберите пункт 1 или 2 (полная настройка)."
+  done
+  compgen -G "${XUI_DIR}/bin/xray-linux-*" >/dev/null || die "Не найден Xray панели в ${XUI_DIR}/bin — проверять подключения нечем."
+  white_setup || die "Не удалось записать настройки белых списков."
+  grn "    Новый список — каждые ${WHITE_REFRESH_HOURS} ч, проверка каждого подключения — каждые ${WHITE_CHECK_MIN} мин."
+  step "Скачиваю список и проверяю каждое подключение (до пары минут)..."
+  white_run_now
+  white_timer_on || ylw "    Таймер проверки не запустился: systemctl status vpn-white-lists.timer"
+  step "Добавляю белые списки в подписку..."
+  write_sub_filter_program
+  sub_filter_conf_white 1 || die "Не удалось записать настройки фильтра подписки."
+  systemctl restart vpn-sub-filter >/dev/null 2>&1 || die "Фильтр подписки не перезапустился. Логи: journalctl -u vpn-sub-filter -e"
+  read -r F_PORT F_SCHEME < <(python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))
+print(int(c["port"]), "https" if c.get("cert") else "http")' "$SUB_FILTER_CONF" 2>/dev/null || echo "$SUB_PORT http")
+  for _ in $(seq 1 20); do
+    code="$(curl -sk --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' "${F_SCHEME}://127.0.0.1:${F_PORT}/" 2>/dev/null || true)"
+    case "$code" in ""|000|502) sleep 1 ;; *) break ;; esac
+  done
+  # ссылка-подписка — из файла с доступами, адрес сервера подписки — из настроек панели
+  SUB_URL="$(sed -n 's/^Ссылка: *//p' "$PROFILE" 2>/dev/null | head -n 1 || true)"
+  SUB_BASE="$(DB="$DB" python3 -c 'import os, re, sqlite3
+row = sqlite3.connect(os.environ["DB"], timeout=30).execute("SELECT value FROM settings WHERE key=?", ("subURI",)).fetchone()
+m = re.match(r"(https?://[^/]+)", (row[0] or "") if row else "")
+print(m.group(1) if m else "")' 2>/dev/null || true)"
+  if [ -z "$SUB_BASE" ]; then SUB_BASE="$(printf '%s' "$SUB_URL" | sed -nE 's#^(https?://[^/]+).*#\1#p')"; fi
+  WHITE_URL_SUB=""; WP="$(white_path)"
+  if [ -n "$SUB_BASE" ] && [ -n "$WP" ]; then WHITE_URL_SUB="${SUB_BASE}${WP}"; fi
+  NJ=0; NB=0
+  if [ -n "$SUB_URL" ]; then
+    read -r NJ NB <<< "$(white_in_sub "${F_SCHEME}://127.0.0.1:${F_PORT}/${SUB_URL#*://*/}")" || true
+  fi
+  if [ "${NJ:-0}" -gt 0 ] || [ "${NB:-0}" -gt 0 ]; then
+    grn "    ✓ В подписке: ${NJ} рабочих подключений для Happ / v2rayNG / v2rayN и ${NB} — для остальных приложений."
+  elif [ "$WHITE_ALIVE" -gt 0 ] && [ -n "$SUB_URL" ]; then
+    ylw "    ✗ Рабочие подключения есть (${WHITE_ALIVE}), но в ответе подписки их не видно. Логи: journalctl -u vpn-sub-filter -e"
+  elif [ "$WHITE_ALIVE" -eq 0 ]; then
+    ylw "    Рабочих подключений пока нет — появятся в подписке после следующей проверки (через ${WHITE_CHECK_MIN} мин)."
+  fi
+  echo
+  ylw "============ БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА ============"
+  white_summary
+  echo
+  echo "Они уже в вашей подписке — в приложении достаточно обновить её${SUB_URL:+:}"
+  if [ -n "$SUB_URL" ]; then grn "${SUB_URL}"; fi
+  echo "В приложении они в конце списка: «${WHITE_LABEL} 01 …». Включайте их, когда мобильный интернет"
+  echo "пускает только на «разрешённые» сайты и свой VPN не подключается."
+  if [ -n "$WHITE_URL_SUB" ]; then
+    echo "Отдельной подпиской (только белые списки — если удобнее держать их отдельной группой):"
+    echo "  ${WHITE_URL_SUB}"
+  fi
+  if [ -f "$PROFILE" ]; then   # в файле с доступами раздел про белые списки — заново
+    python3 - "$PROFILE" <<'PY' || true
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.find("=== Белые списки")
+if start >= 0:
+    end = text.find("\n=== ", start)
+    text = text[:start] + (text[end + 1:] if end >= 0 else "")
+open(sys.argv[1], "w", encoding="utf-8").write(text.rstrip("\n") + "\n")
+PY
+    { echo; echo "=== Белые списки для мобильного интернета ==="; white_summary; } >> "$PROFILE"
+    chmod 600 "$PROFILE"
+    echo
+    ylw "Всё сохранено на сервере: ${PROFILE}"
+  fi
+  exit 0
+fi
 
 # ============================================================================
 step "Устанавливаю зависимости и ускоряю сеть..."
@@ -1778,6 +3031,7 @@ fi
 
 # ============================================================================
 if [ "$VPN_ROLE" = "exit" ]; then   # зарубежный сервер моста готов: отдаём параметры российскому
+  if [ -f "$WHITE_CONF" ] || [ -f "$WHITE_TIMER" ]; then white_remove; fi   # подписку выход не отдаёт — белые списки ему не нужны
   step "Проверяю скорость интернета этого сервера..."
   EXIT_NET_SPEED="$(speed_mbit)"
   if [ -n "$EXIT_NET_SPEED" ]; then grn "    Скорость интернета этого сервера ≈ ${EXIT_NET_SPEED} Мбит/с"
@@ -2006,6 +3260,13 @@ if [ "$BLOCK_ADS" = "1" ]; then
 else
   step "Включаю подписку: РФ — напрямую, остальное — VPN..."
 fi
+# Белые списки: программа, настройки и таймер (сам список скачивается и проверяется после подписки)
+if [ "$WHITE_ON" = "1" ]; then
+  if white_setup; then WHITE_READY=1; else ylw "    Не удалось настроить белые списки — подписка будет без них."; fi
+elif [ -f "$WHITE_CONF" ] || [ -f "$WHITE_TIMER" ]; then
+  white_remove
+  grn "    Белые списки убраны (WHITE_LISTS=0): в подписке их больше не будет."
+fi
 # Профиль в формате Happ. Из него же панель собирает готовые Xray-конфиги
 # для v2rayNG / v2rayN. Все категории есть в стандартных geo-файлах
 # (v2fly, Loyalsoldier, runetfreedom) — проверено.
@@ -2034,191 +3295,29 @@ PY
 # Фильтр подписки: панель 3X-UI не умеет задавать «Автовыбору» максимальный пинг и число
 # одновременно работающих подключений. Фильтр стоит перед панелью на порту подписки и дописывает
 # эти настройки в каждый ответ (остальное отдаёт как есть); панель отдаёт подписку только ему.
-SUB_FILTER_PY="/usr/local/bin/vpn-sub-filter.py"
-SUB_FILTER_CONF="/etc/x-ui/vpn-sub-filter.json"
-SUB_FILTER_UNIT="/etc/systemd/system/vpn-sub-filter.service"
+# Он же добавляет в подписку рабочие подключения белых списков (программа — write_sub_filter_program).
 setup_sub_filter() {   # ставит и запускает фильтр; ждёт, пока через него ответит панель
   local _ code scheme=http certf="" keyf="" py
   py="$(command -v python3)"
-  mkdir -p "$(dirname "$SUB_FILTER_PY")"
-  cat > "$SUB_FILTER_PY" <<'PY'
-#!/usr/bin/env python3
-# Фильтр подписки VPN (ставит install-vpn-all.sh). Принимает запросы приложений на порту
-# подписки и передаёт их панели 3X-UI, которая отдаёт подписку только внутри сервера.
-# В профили с балансировкой leastLoad («Автовыбор») дописывает тонкие настройки: сколько
-# лучших подключений работают одновременно, максимальный пинг и допустимые потери.
-import json, os, socket, ssl, sys, threading, urllib.error, urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-CONF = json.load(open(sys.argv[1]))
-UPSTREAM = "http://127.0.0.1:%d" % int(CONF["upstream"])
-CERT, KEY = CONF.get("cert") or "", CONF.get("key") or ""
-TUNE = CONF.get("leastLoad") or {}
-SKIP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
-        "content-length", "content-encoding", "accept-encoding", "host", "date", "server"}
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
-
-
-def tune(body):
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except ValueError:
-        return body                       # обычная подписка (ссылки в base64) — как есть
-    changed = False
-    for conf in data if isinstance(data, list) else [data]:
-        routing = conf.get("routing") if isinstance(conf, dict) else None
-        for bal in (routing.get("balancers") if isinstance(routing, dict) else None) or []:
-            strategy = bal.get("strategy") if isinstance(bal, dict) else None
-            if isinstance(strategy, dict) and strategy.get("type") == "leastLoad":
-                settings = strategy.setdefault("settings", {})
-                for key, value in TUNE.items():
-                    settings.setdefault(key, value)
-                changed = True
-    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") if changed else body
-
-
-class Handler(BaseHTTPRequestHandler):
-    def version_string(self):
-        return "nginx"
-
-    def do_GET(self):
-        self.forward(False)
-
-    def do_HEAD(self):
-        self.forward(True)
-
-    def forward(self, head):
-        req = urllib.request.Request(UPSTREAM + self.path, method="HEAD" if head else "GET")
-        for key, value in self.headers.items():
-            if key.lower() not in SKIP:
-                req.add_header(key, value)
-        if self.headers.get("Host"):
-            req.add_header("Host", self.headers["Host"])
-        req.add_header("X-Forwarded-For", self.client_address[0])
-        req.add_header("X-Real-IP", self.client_address[0])
-        req.add_header("X-Forwarded-Proto", "https" if CERT else "http")
-        try:
-            try:
-                resp = OPENER.open(req, timeout=30)
-            except urllib.error.HTTPError as err:
-                resp = err
-            try:
-                status = getattr(resp, "status", None) or resp.getcode()
-                headers = list(resp.headers.items()) if resp.headers else []
-                body = b"" if head else (resp.read() or b"")
-            finally:
-                resp.close()
-        except Exception:                 # панель не ответила
-            self.send_error(502)
-            return
-        if status == 200 and body:
-            body = tune(body)
-        self.send_response(status)
-        for key, value in headers:
-            if key.lower() not in SKIP:
-                self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if not head:
-            self.wfile.write(body)
-
-    def log_message(self, fmt, *args):
-        pass
-
-
-_lock = threading.Lock()
-_tls = {"ctx": None, "stamp": None}
-
-
-def tls_context():                        # сертификат перечитывается сам, когда его продлили
-    with _lock:
-        try:
-            stamp = (os.stat(CERT).st_mtime_ns, os.stat(KEY).st_mtime_ns)
-        except OSError:
-            stamp = None
-        if _tls["ctx"] is None or (stamp is not None and stamp != _tls["stamp"]):
-            try:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-                ctx.load_cert_chain(CERT, KEY)
-                _tls.update(ctx=ctx, stamp=stamp)
-            except (OSError, ssl.SSLError):
-                if _tls["ctx"] is None:
-                    raise
-        return _tls["ctx"]
-
-
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 128
-
-    def server_bind(self):
-        if self.address_family == socket.AF_INET6:
-            try:
-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except OSError:
-                pass
-        super().server_bind()
-
-    def finish_request(self, request, client_address):
-        request.settimeout(30)
-        conn = request
-        if CERT:
-            try:
-                conn = tls_context().wrap_socket(request, server_side=True)
-            except (OSError, ValueError):
-                return
-        try:
-            self.RequestHandlerClass(conn, client_address, self)
-        finally:
-            if conn is not request:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-
-
-def main():
-    port = int(CONF["port"])
-    if CERT:
-        tls_context()                     # сертификат должен читаться сразу
-    try:
-        Server.address_family = socket.AF_INET6
-        server = Server(("::", port), Handler)
-    except OSError:
-        Server.address_family = socket.AF_INET
-        server = Server(("0.0.0.0", port), Handler)
-    server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
-PY
-  chmod 755 "$SUB_FILTER_PY"
+  write_sub_filter_program
   if [ "$SSL_OK" = "1" ]; then certf="$CERT"; keyf="$KEY"; scheme=https; fi
   PORT="$SUB_PORT" UP="$SUB_INTERNAL_PORT" CERTF="$certf" KEYF="$keyf" EXPECTED="$BALANCE_EXPECTED" \
-  MAX_RTT="$BALANCE_MAX_RTT" python3 - > "$SUB_FILTER_CONF" <<'PY' || return 1
+  MAX_RTT="$BALANCE_MAX_RTT" TUNE="$SUB_FILTER" python3 - > "$SUB_FILTER_CONF" <<'PY' || return 1
 import json, os
 e = os.environ
 print(json.dumps({"port": int(e["PORT"]), "upstream": int(e["UP"]), "cert": e["CERTF"], "key": e["KEYF"],
                   # expected — сколько лучших подключений работают сразу; maxRTT — предельный пинг;
-                  # tolerance — допустимая доля неудачных проверок (как в профилях коммерческих VPN)
-                  "leastLoad": {"expected": int(e["EXPECTED"]), "maxRTT": e["MAX_RTT"], "tolerance": 0.05}},
+                  # tolerance — допустимая доля неудачных проверок (как в профилях коммерческих VPN).
+                  # SUB_FILTER=0, а фильтр нужен только для белых списков — «Автовыбор» не трогаем
+                  "leastLoad": {"expected": int(e["EXPECTED"]), "maxRTT": e["MAX_RTT"], "tolerance": 0.05}
+                  if e["TUNE"] == "1" else {}},
                  indent=1))
 PY
+  sub_filter_conf_white "$WHITE_READY" || return 1   # белые списки: файл с рабочими и отдельный адрес
   chmod 600 "$SUB_FILTER_CONF"
   cat > "$SUB_FILTER_UNIT" <<UNIT
 [Unit]
-Description=VPN subscription filter: fine balancing settings for the auto-select profile
+Description=VPN subscription filter: auto-select tuning and white lists
 After=network-online.target x-ui.service
 Wants=network-online.target
 
@@ -2240,7 +3339,7 @@ UNIT
   return 1
 }
 FILTER=0
-if [ "$SUB_FILTER" = "1" ] && [ "$AUTO_OK" = "1" ]; then
+if { [ "$SUB_FILTER" = "1" ] && [ "$AUTO_OK" = "1" ]; } || [ "$WHITE_READY" = "1" ]; then
   FILTER=1
   for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80; do
     if [ "$SUB_INTERNAL_PORT" = "$p" ]; then FILTER=0; fi
@@ -2323,11 +3422,16 @@ write_sub_settings "$FILTER" || { systemctl start x-ui || true; die "Не уда
 read -r SUB_PATH JSON_PATH < "$WORK/paths"
 systemctl start x-ui
 wait_api || die "Панель не запустилась после настройки подписки. Логи: journalctl -u x-ui -e"
+FILTER_TUNE=0   # 1 — фильтр дописывает «Автовыбору» тонкие настройки
 if [ "$FILTER" = "1" ]; then
   if setup_sub_filter; then
-    grn "    Фильтр подписки: «${AUTO_LABEL}» ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED}), пинг больше ${RTT_TEXT} или потери — подключение отключается."
+    if [ "$SUB_FILTER" = "1" ] && [ "$AUTO_OK" = "1" ]; then
+      FILTER_TUNE=1
+      grn "    Фильтр подписки: «${AUTO_LABEL}» ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED}), пинг больше ${RTT_TEXT} или потери — подключение отключается."
+    fi
+    if [ "$WHITE_READY" = "1" ]; then grn "    Фильтр подписки добавляет в неё рабочие подключения белых списков."; fi
   else
-    ylw "    Фильтр подписки не запустился — подписку отдаёт сама панель, «${AUTO_LABEL}» без тонких настроек."
+    ylw "    Фильтр подписки не запустился — подписку отдаёт сама панель$([ "$AUTO_OK" = "1" ] && echo ", «${AUTO_LABEL}» без тонких настроек")$([ "$WHITE_READY" = "1" ] && echo ", белых списков в ней не будет")."
     systemctl stop vpn-sub-filter >/dev/null 2>&1 || true
     systemctl disable vpn-sub-filter >/dev/null 2>&1 || true
     rm -f "$SUB_FILTER_UNIT"
@@ -2342,6 +3446,25 @@ elif [ -f "$SUB_FILTER_UNIT" ]; then   # фильтр больше не нуже
   systemctl disable vpn-sub-filter >/dev/null 2>&1 || true
   rm -f "$SUB_FILTER_UNIT"
   systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# ============================================================================
+# Белые списки для мобильного интернета: скачать список и проверить каждое подключение сейчас,
+# дальше — по таймеру (новый список каждые WHITE_REFRESH_HOURS ч, проверка каждые WHITE_CHECK_MIN мин).
+WHITE_URL_SUB=""
+if [ "$WHITE_ON" = "1" ]; then
+  step "Белые списки для мобильного интернета: скачиваю список и проверяю каждое подключение..."
+  if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
+    white_run_now
+    white_timer_on || ylw "    Таймер проверки не запустился: systemctl status vpn-white-lists.timer"
+    WHITE_URL_SUB="${SUB_BASE}$(white_path)"
+    grn "    Новый список — каждые ${WHITE_REFRESH_HOURS} ч, проверка каждого подключения — каждые ${WHITE_CHECK_MIN} мин; в подписке только рабочие."
+  elif [ "$WHITE_READY" = "1" ]; then
+    ylw "    Фильтр подписки не работает (причина — выше) — белые списки в подписку не попадут."
+    systemctl disable --now vpn-white-lists.timer >/dev/null 2>&1 || true
+  else
+    ylw "    Белые списки не настроены (причина — выше)."
+  fi
 fi
 
 # ============================================================================
@@ -2362,7 +3485,7 @@ fetch_local() {   # fetch_local USER-AGENT /путь  ->  $WORK/h (заголо�
 }
 CHECK_HAPP=0
 CHECK_JSON=0
-if fetch_local "Happ/3.0" "${SUB_PATH}${SUB_ID}" && AUTO_OK="$AUTO_OK" FILTER="$FILTER" \
+if fetch_local "Happ/3.0" "${SUB_PATH}${SUB_ID}" && AUTO_OK="$AUTO_OK" FILTER="$FILTER_TUNE" \
    MAX_RTT="$BALANCE_MAX_RTT" python3 - "$WORK/b" <<'PY' 2>/dev/null
 import json, os, sys
 data = json.load(open(sys.argv[1]))
@@ -2381,17 +3504,25 @@ then
   CHECK_HAPP=1
 fi
 JSON_COUNT=0
-if fetch_local "v2rayNG/1.10.0" "${SUB_PATH}${SUB_ID}" && BLOCK_ADS="$BLOCK_ADS" python3 - "$WORK/b" "$WORK/client" > "$WORK/client-count" <<'PY'
+if fetch_local "v2rayNG/1.10.0" "${SUB_PATH}${SUB_ID}" && BLOCK_ADS="$BLOCK_ADS" \
+   WLABEL="$([ "$WHITE_READY" = "1" ] && printf '%s' "$WHITE_LABEL")" python3 - "$WORK/b" "$WORK/client" > "$WORK/client-count" <<'PY'
 import json, os, sys
 data = json.load(open(sys.argv[1]))
 confs = data if isinstance(data, list) else [data]
+own = white = 0
 for i, conf in enumerate(confs):
     rules = json.dumps(conf.get("routing", {}))
     assert "geosite:category-ru" in rules and "geoip:ru" in rules
     if os.environ["BLOCK_ADS"] == "1":
         assert "geosite:category-ads-all" in rules
+    if os.environ["WLABEL"] and str(conf.get("remarks") or "").startswith(os.environ["WLABEL"]):
+        white += 1
+        if white > 2:        # белые списки собраны из того же шаблона — Xray проверяет пару из них
+            continue
+    else:
+        own += 1
     json.dump(conf, open("%s-%d.json" % (sys.argv[2], i), "w"))
-print(len(confs))
+print(own)
 PY
 then
   # те же конфиги, что получит телефон (обычный и XHTTP), проверяем самим Xray
@@ -2419,13 +3550,24 @@ else
   SERVER_SPEED="$(speed_mbit)"   # один сервер: сколько даёт его интернет
 fi
 if [ "$CHECK_HAPP" = "1" ]; then
-  if [ "$AUTO_OK" = "1" ] && [ "$FILTER" = "1" ]; then
+  if [ "$FILTER_TUNE" = "1" ]; then
     grn "    ✓ Happ: в подписке «${AUTO_LABEL}» (лучших сразу — ${BALANCE_EXPECTED}, пинг до ${RTT_TEXT}) и каждое подключение отдельно, правила внутри каждого"
   elif [ "$AUTO_OK" = "1" ]; then grn "    ✓ Happ: в подписке «${AUTO_LABEL}» и каждое подключение отдельно, правила внутри каждого"
   else grn "    ✓ Happ: правила приходят вместе с подпиской"; fi
 else ylw "    ✗ Happ: правила в ответе подписки не найдены"; fi
 if [ "$CHECK_JSON" = "1" ]; then grn "    ✓ v2rayNG / v2rayN: конфиги с правилами (${JSON_COUNT} шт.) прошли проверку Xray"
 else ylw "    ✗ v2rayNG / v2rayN: конфиг не прошёл проверку"; tail -n 3 "$WORK/xtest.log" 2>/dev/null || true; fi
+if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
+  if [ "$SSL_OK" = "1" ]; then LOCAL_SUB="https://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; else LOCAL_SUB="http://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; fi
+  read -r WJ WB <<< "$(white_in_sub "$LOCAL_SUB")" || true
+  if [ "${WJ:-0}" -gt 0 ] || [ "${WB:-0}" -gt 0 ]; then
+    grn "    ✓ Белые списки: в подписке ${WJ} рабочих подключений для Happ / v2rayNG / v2rayN и ${WB} — для остальных приложений"
+  elif [ "$WHITE_ALIVE" -eq 0 ]; then
+    ylw "    ✗ Белые списки: рабочих подключений пока нет — появятся после следующей проверки (через ${WHITE_CHECK_MIN} мин)"
+  else
+    ylw "    ✗ Белые списки: рабочие подключения есть (${WHITE_ALIVE}), но в подписке их не видно (journalctl -u vpn-sub-filter -e)"
+  fi
+fi
 case "$CHECK_SERVER" in
   ok)   grn "    ✓ Сервер: рекламный домен уходит в блок" ;;
   fail) ylw "    ✗ Сервер: проверка фильтра рекламы не прошла" ;;
@@ -2540,9 +3682,9 @@ qrencode -t ANSIUTF8 "${SUB_URL}" 2>/dev/null || ylw "(qrencode недоступ
 echo "Как добавить:"
 echo "  • Happ (Android / iPhone / ПК): «+» → вставить ссылку из буфера или отсканировать QR."
 echo "  • v2rayNG (Android): «+» → «Импорт из буфера обмена» → «Обновить подписку»."
-if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUTO_OK" = "1" ]; then
+if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUTO_OK" = "1" ] || [ -n "$WHITE_URL_SUB" ]; then
   echo "Подключения в подписке:"
-  if [ "$AUTO_OK" = "1" ] && [ "$FILTER" = "1" ]; then
+  if [ "$FILTER_TUNE" = "1" ]; then
     echo "  • «${AUTO_LABEL}» — приложение само ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED});"
     echo "    пинг больше ${RTT_TEXT} или потери — подключение отключается (выберите этот профиль);"
   elif [ "$AUTO_OK" = "1" ]; then echo "  • «${AUTO_LABEL}» — приложение само выбирает лучший путь (выберите его);"; fi
@@ -2552,6 +3694,10 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   if [ "$HY2_OK" = "1" ]; then echo "  • «${HY2_LABEL}» — Hysteria2 (QUIC по UDP): быстрее на мобильном интернете с потерями; если оператор режет UDP, не подключится — тогда берите другие;"; fi
   if [ -n "$PEXIT_LIST" ]; then echo "  • через РФ к одному зарубежному серверу, каждый отдельно: ${PEXIT_LIST};"; fi
   if [ -n "$DIRECT_LIST" ]; then echo "  • напрямую к зарубежному серверу (телефон → сервер, без России): ${DIRECT_LIST}."; fi
+  if [ -n "$WHITE_URL_SUB" ]; then
+    echo "  • «${WHITE_LABEL} 01…» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} рабочих);"
+    echo "    включайте их, когда оператор пускает только на «разрешённые» сайты и свой VPN не подключается."
+  fi
 fi
 echo
 echo "Правила для всех устройств (приходят с сервера и обновляются сами):"
@@ -2565,6 +3711,17 @@ fi
 echo
 echo "JSON-вариант той же подписки (для приложений, которым нужен Xray JSON):"
 echo "  ${JSON_URL}"
+WHITE_PROFILE=""
+if [ "$WHITE_ON" = "1" ]; then
+  echo
+  ylw "============ БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА ============"
+  if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
+    white_summary
+    WHITE_PROFILE="$(printf '\n=== Белые списки для мобильного интернета ===\n'; white_summary)"
+  else
+    ylw "Не настроены (причина — выше). Запустите скрипт ещё раз и выберите пункт 3."
+  fi
+fi
 if [ "$SSL_OK" != "1" ]; then
   echo
   ylw "SSL не настроился (причина — выше, на шаге 5), поэтому подписка пока работает по http."
@@ -2613,9 +3770,10 @@ ShortID:   ${SHORT_ID}
 XHTTP:     $([ "$XHTTP_OK" = "1" ] && echo "порт ${XHTTP_PORT}, путь ${XHTTP_PATH} (в подписке — первым)" || echo "не настроен")
 WebSocket: $([ "$WS_OK" = "1" ] && echo "порт ${WS_PORT}, путь ${WS_PATH}, TLS на ${ADDR}" || echo "не настроен")
 Hysteria2: $([ "$HY2_OK" = "1" ] && echo "UDP-порт ${HY2_PORT}, TLS на ${ADDR} (пароль у каждого клиента свой — в подписке)" || echo "не настроен")
-Автовыбор: $(if [ "$AUTO_OK" = "1" ] && [ "$FILTER" = "1" ]; then echo "лучших подключений одновременно — ${BALANCE_EXPECTED}, пинг до ${RTT_TEXT} (настройки дописывает фильтр подписки vpn-sub-filter)"; elif [ "$AUTO_OK" = "1" ]; then echo "есть, без тонких настроек"; else echo "нет"; fi)
+Автовыбор: $(if [ "$FILTER_TUNE" = "1" ]; then echo "лучших подключений одновременно — ${BALANCE_EXPECTED}, пинг до ${RTT_TEXT} (настройки дописывает фильтр подписки vpn-sub-filter)"; elif [ "$AUTO_OK" = "1" ]; then echo "есть, без тонких настроек"; else echo "нет"; fi)
 Одиночная ссылка (БЕЗ правил подписки — весь трафик через VPN):
 ${VLESS_URL}
+${WHITE_PROFILE}
 TXT
 chmod 600 "$PROFILE"
 echo

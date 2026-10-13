@@ -33,13 +33,12 @@
 #     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
 #     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
 #     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
-#     после проверки. В подписку идут 50 рабочих из разных сетей — сначала помеченные CIDR (их IP
-#     из разрешённых сетей), самые быстрые, — после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…);
-#     есть и отдельная ссылка — только на них (до 150).
-#     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN),
-#     устроен так же, как «🚀 Автовыбор» панели: в нём 12 серверов из разных сетей, телефон сам раз
-#     в минуту проверяет каждый из СВОЕЙ сети (у каждого оператора и региона пропускают разные)
-#     и ведёт трафик через два самых надёжных из работающих у него; не отвечает — отключается сам.
+#     после проверки. В подписку идут 50 самых быстрых рабочих по пингу (самые быстрые — первыми),
+#     после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 150).
+#     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN):
+#     в нём 8 самых быстрых по пингу; при включении телефон сразу пингует их все из СВОЕЙ сети
+#     (у каждого оператора и региона пропускают разные) и ведёт трафик через самый быстрый по пингу
+#     из работающих у него; каждые 2 минуты пинг повторяется, не отвечает — телефон переходит на другой.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -100,8 +99,8 @@ WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссы
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
 WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
-WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-12}"            # белые списки: сколько серверов (из разных сетей) телефон сам проверяет в профиле автоподбора (0 — без профиля)
-WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько лучших рабочих — в подписке (отдельная ссылка — до 150)
+WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-8}"             # белые списки: сколько самых быстрых серверов телефон сам пингует в профиле автоподбора (0 — без профиля)
+WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько самых быстрых по пингу рабочих — в подписке (отдельная ссылка — до 150)
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
 EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
@@ -313,9 +312,9 @@ write_sub_filter_program() {
 # В профили с балансировкой leastLoad («Автовыбор») дописывает тонкие настройки: сколько
 # лучших подключений работают одновременно, максимальный пинг и допустимые потери.
 # Белые списки (если включены): из рабочих подключений (alive.json — его каждые несколько минут
-# обновляет vpn-white-lists) добавляет в конец подписки самые быстрые с разных серверов
-# (sub_max), отдельной подпиской по своему адресу — до list_max. Для Happ, v2rayNG и v2rayN перед
-# ними — профиль автоподбора: приложение само проверяет лучшие белые списки из сети этого
+# обновляет vpn-white-lists) добавляет в конец подписки самые быстрые по пингу (sub_max, самые
+# быстрые — первыми), отдельной подпиской по своему адресу — до list_max. Для Happ, v2rayNG и v2rayN перед
+# ними — профиль автоподбора по пингу: приложение само пингует лучшие белые списки из сети этого
 # телефона и ведёт трафик через самый быстрый из тех, что работают именно у него.
 import base64, copy, json, os, re, socket, ssl, sys, threading, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -381,10 +380,9 @@ def white_items(kind="sub"):
                     items = json.load(f).get("items") or []
                 items = [x for x in items if isinstance(x, dict) and isinstance(x.get("link"), str)
                          and isinstance(x.get("outbound"), dict) and x.get("name")]
-                by_n = lambda x: x.get("n") if isinstance(x.get("n"), int) else 10 ** 9
-                _white.update(stamp=stamp,
-                              sub=sorted(pick_best(items, int(WHITE.get("sub_max") or 50)), key=by_n),
-                              list=sorted(pick_best(items, int(WHITE.get("list_max") or 150)), key=by_n),
+                _white.update(stamp=stamp,               # везде — самые быстрые по пингу
+                              sub=pick_best(items, int(WHITE.get("sub_max") or 50)),
+                              list=pick_best(items, int(WHITE.get("list_max") or 150)),
                               auto=pick_best(items, int((WHITE.get("auto") or {}).get("max") or 0)))
             except (OSError, ValueError, AttributeError, TypeError):
                 pass                      # файл как раз переписывается — отдаём прежний список
@@ -416,41 +414,26 @@ def server_host(outbound):
     return str(s.get("address") or "")
 
 
-def network_of(item):
-    """сеть сервера: первые две части IP (у одного хостинга — обычно одна сеть), иначе — домен"""
-    ip = str(item.get("ip") or "")
-    if ip.count(".") == 3:
-        return ".".join(ip.split(".")[:2])
-    if ":" in ip:
-        return ":".join(ip.split(":")[:2])
-    host = server_host(item["outbound"])
-    return ".".join(host.split(".")[-2:]) if host else ""
+def ping_of(item):
+    """пинг подключения — время ответа через него при последней проверке на сервере, мс"""
+    return item["ms"] if isinstance(item.get("ms"), (int, float)) else 10 ** 9
 
 
 def pick_best(items, limit):
-    """лучшие подключения для телефона. Какие серверы пропускает оператор, знает только сам
-    телефон, поэтому берём как можно более разные: по очереди из разных сетей (закроет оператор
-    одну сеть — останутся другие), сначала помеченные CIDR (их IP — из разрешённых сетей),
-    внутри — самые быстрые по проверке сервера"""
-    groups = {}
-    for it in sorted(items, key=lambda x: (not x.get("cidr"),
-                                           x["ms"] if isinstance(x.get("ms"), (int, float)) else 10 ** 9)):
-        groups.setdefault(network_of(it), []).append(it)
-    chosen, depth = [], 0
-    while len(chosen) < limit:
-        layer = [group[depth] for group in groups.values() if depth < len(group)]
-        if not layer:
-            break
-        chosen.extend(layer[:limit - len(chosen)])
-        depth += 1
-    return chosen
+    """самые быстрые по пингу, самые быстрые — первыми. Один и тот же сервер (с другим ключом или
+    портом) — только после всех остальных серверов, чтобы в списке не было одинаковых"""
+    seen, first, rest = set(), [], []
+    for it in sorted(items, key=ping_of):
+        host = server_host(it["outbound"])
+        (rest if host in seen else first).append(it)
+        seen.add(host)
+    return sorted((first + rest)[:limit], key=ping_of)
 
 
 def white_auto(template, chosen, level):
-    """профиль автоподбора: лучшие белые списки в одном конфиге — так же, как «Автовыбор» самой
-    панели (burstObservatory + leastLoad): приложение проверяет каждый сервер из сети телефона раз
-    в interval и ведёт трафик через самые надёжные из живых; не отвечает — отключается само.
-    Правила — как у остальных конфигов."""
+    """профиль автоподбора по пингу: лучшие белые списки в одном конфиге; приложение при включении
+    пингует их все сразу из сети телефона, потом раз в interval, и ведёт трафик через самый быстрый
+    из живых (не отвечает — отключается сам). Правила — как у остальных конфигов."""
     auto = WHITE.get("auto") or {}
     if len(chosen) < 2:
         return None
@@ -466,20 +449,14 @@ def white_auto(template, chosen, level):
         if isinstance(rule, dict) and rule.get("outboundTag") == "proxy":
             del rule["outboundTag"]
             rule["balancerTag"] = "wl-auto"
-    # leastLoad: из живых с пингом до maxRTT — expected самых стабильных; пока проверок нет —
-    # лучший по проверке сервера (fallbackTag)
+    # leastPing — самый быстрый по пингу из живых; пока пинг не прошёл — лучший по проверке сервера
     routing["balancers"] = [{"tag": "wl-auto", "selector": ["wl-"], "fallbackTag": "wl-1",
-                             "strategy": {"type": "leastLoad",
-                                          "settings": {"expected": int(auto.get("expected") or 2),
-                                                       "maxRTT": auto.get("maxRTT") or "3s",
-                                                       "tolerance": float(auto.get("tolerance") or 0.5)}}}]
-    conf.pop("observatory", None)
-    conf["burstObservatory"] = {"subjectSelector": ["wl-"],
-                                "pingConfig": {"destination": auto.get("url") or "http://www.gstatic.com/generate_204",
-                                               "connectivity": "", "httpMethod": "HEAD",
-                                               "interval": auto.get("interval") or "1m",
-                                               "sampling": int(auto.get("sampling") or 1),
-                                               "timeout": auto.get("timeout") or "5s"}}
+                             "strategy": {"type": "leastPing"}}]
+    conf.pop("burstObservatory", None)
+    # пинг всех сразу при включении (enableConcurrency), дальше — раз в interval
+    conf["observatory"] = {"subjectSelector": ["wl-"],
+                           "probeUrl": auto.get("url") or "http://www.gstatic.com/generate_204",
+                           "probeInterval": auto.get("interval") or "2m", "enableConcurrency": True}
     conf["remarks"] = auto.get("name") or "Автовыбор"
     return conf
 
@@ -1219,7 +1196,7 @@ def server_of(outbound):
 
 def reachable(item, timeout):
     """открывается ли сервер подключения напрямую с этого сервера (None — UDP, так не проверить)
-    и его IP-адрес: по нему фильтр подписки берёт серверы из разных сетей"""
+    и его IP-адрес (для итога проверки)"""
     host, port = server_of(item["outbound"])
     if item["outbound"].get("protocol") == "hysteria":
         try:
@@ -1580,18 +1557,16 @@ conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"])
         # все — раз в час (full_check_minutes), между ними — только рабочие
         "timeout": 8, "tcp_timeout": 3, "workers": 64, "tcp_workers": 128, "batch": 300,
         "max_items": 3000, "full_check_minutes": 60,
-        # в подписке — sub_max лучших рабочих с разных серверов, в отдельной подписке — до list_max
+        # в подписке — sub_max самых быстрых по пингу рабочих, в отдельной подписке — до list_max
         "sub_max": int(e["SUB_MAX"]), "list_max": max(150, int(e["SUB_MAX"])),
         # для фильтра подписки: адрес отдельной подписки (прежний), её название в приложении
         # и как часто приложению обновлять подписку (часы) — тогда нерабочие пропадают и с телефона
         "path": old.get("path") or "/" + secrets.token_hex(8) + "/",
         "title": "🏳️ Белые списки", "update_hours": 1,
-        # автоподбор на устройстве (как «Автовыбор» панели: burstObservatory + leastLoad): до max
-        # серверов из разных сетей в одном профиле; телефон сам проверяет каждый из своей сети раз
-        # в interval (запрос HEAD, ждёт ответа до timeout) и ведёт трафик через expected самых
-        # надёжных из живых с пингом до maxRTT; при доле неудачных проверок больше tolerance — отключает
-        "auto": {"max": int(e["AUTO_MAX"]), "name": e["AUTO_NAME"], "interval": "1m", "sampling": 1,
-                 "timeout": "5s", "expected": 2, "maxRTT": "3s", "tolerance": 0.5,
+        # автоподбор на устройстве по пингу: max самых быстрых серверов в одном профиле —
+        # телефон пингует их все сразу при включении и каждые interval и ведёт трафик через самый
+        # быстрый из живых (observatory + leastPing)
+        "auto": {"max": int(e["AUTO_MAX"]), "name": e["AUTO_NAME"], "interval": "2m",
                  "url": "http://www.gstatic.com/generate_204"}}
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(conf, f, indent=1)
@@ -1700,11 +1675,11 @@ white_summary() {   # итог для экрана и для файла с до�
   echo "Источники: ${src}."
   echo "Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется настоящим запросом: все — раз в час,"
   echo "рабочие — каждые ${WHITE_CHECK_MIN} мин. Нерабочее пропадает из подписки сразу после проверки (приложение обновляет её раз в час)."
-  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} из разных сетей${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} самых быстрых по пингу${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
   if [ "$WHITE_AUTO_MAX" -gt 1 ]; then
-    echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN), как «${AUTO_LABEL}»:"
-    echo "в нём до ${WHITE_AUTO_MAX} серверов из разных сетей; телефон сам раз в минуту проверяет каждый из своей сети и ведёт"
-    echo "трафик через два самых надёжных из работающих у него; перестал отвечать — отключается сам."
+    echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): в нём ${WHITE_AUTO_MAX} самых"
+    echo "быстрых по пингу; при включении телефон сразу пингует их все из своей сети, потом каждые 2 минуты, и ведёт"
+    echo "трафик через самый быстрый из работающих у него; перестал отвечать — переходит на другой."
   fi
   if [ -n "${WHITE_URL_SUB:-}" ]; then echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"; fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
@@ -1964,8 +1939,8 @@ print(m.group(1) if m else "")' 2>/dev/null || true)"
   echo "В приложении они в конце списка: «${WHITE_LABEL} …». Включайте их, когда мобильный интернет"
   echo "пускает только на «разрешённые» сайты и свой VPN не подключается."
   if [ "${NA:-0}" -gt 0 ]; then
-    echo "Проще всего выбрать «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): телефон сам раз в минуту проверяет"
-    echo "серверы из разных сетей (в профиле: ${NA}) и ведёт трафик через самые надёжные из работающих именно у него."
+    echo "Проще всего выбрать «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): телефон сам пингует самые быстрые"
+    echo "серверы (в профиле: ${NA}) и ведёт трафик через самый быстрый из тех, что работают именно у него."
   fi
   if [ -n "$WHITE_URL_SUB" ]; then
     echo "Отдельной подпиской (только белые списки — если удобнее держать их отдельной группой):"
@@ -4022,10 +3997,10 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   if [ -n "$DIRECT_LIST" ]; then echo "  • напрямую к зарубежному серверу (телефон → сервер, без России): ${DIRECT_LIST}."; fi
   if [ -n "$WHITE_URL_SUB" ]; then
     if [ "${WA:-0}" -gt 0 ]; then
-      echo "  • «${WHITE_AUTO_NAME}» — белые списки с автоподбором: телефон сам раз в минуту проверяет серверы"
-      echo "    из разных сетей (в профиле: ${WA}) и ведёт трафик через два самых надёжных из работающих у него (Happ, v2rayNG, v2rayN);"
+      echo "  • «${WHITE_AUTO_NAME}» — белые списки с автоподбором по пингу: телефон сам пингует самые быстрые"
+      echo "    (в профиле: ${WA}) и ведёт трафик через самый быстрый из работающих у него (Happ, v2rayNG, v2rayN);"
     fi
-    echo "  • «${WHITE_LABEL} …» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} из ${WHITE_WORKING} рабочих, из разных сетей);"
+    echo "  • «${WHITE_LABEL} …» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} самых быстрых по пингу из ${WHITE_WORKING} рабочих);"
     echo "    включайте их, когда оператор пускает только на «разрешённые» сайты и свой VPN не подключается."
   fi
 fi

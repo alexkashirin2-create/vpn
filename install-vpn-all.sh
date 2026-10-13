@@ -33,12 +33,13 @@
 #     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
 #     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
 #     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
-#     после проверки. В подписку идут 50 самых быстрых рабочих с разных серверов, после своих
-#     подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 150).
-#     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN):
-#     при включении телефон сам проверяет лучшие белые списки из СВОЕЙ сети (у каждого оператора
-#     и региона пропускают разные) и ведёт трафик через самый быстрый из работающих у него;
-#     каждые 2 минуты проверка повторяется, и если сервер перестал отвечать — телефон переходит на другой.
+#     после проверки. В подписку идут 50 рабочих из разных сетей — сначала помеченные CIDR (их IP
+#     из разрешённых сетей), самые быстрые, — после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…);
+#     есть и отдельная ссылка — только на них (до 150).
+#     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN),
+#     устроен так же, как «🚀 Автовыбор» панели: в нём 12 серверов из разных сетей, телефон сам раз
+#     в минуту проверяет каждый из СВОЕЙ сети (у каждого оператора и региона пропускают разные)
+#     и ведёт трафик через два самых надёжных из работающих у него; не отвечает — отключается сам.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -99,7 +100,7 @@ WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссы
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
 WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
-WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-8}"             # белые списки: сколько серверов телефон сам проверяет в профиле автоподбора (0 — без профиля)
+WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-12}"            # белые списки: сколько серверов (из разных сетей) телефон сам проверяет в профиле автоподбора (0 — без профиля)
 WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько лучших рабочих — в подписке (отдельная ссылка — до 150)
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
@@ -415,12 +416,26 @@ def server_host(outbound):
     return str(s.get("address") or "")
 
 
+def network_of(item):
+    """сеть сервера: первые две части IP (у одного хостинга — обычно одна сеть), иначе — домен"""
+    ip = str(item.get("ip") or "")
+    if ip.count(".") == 3:
+        return ".".join(ip.split(".")[:2])
+    if ":" in ip:
+        return ":".join(ip.split(":")[:2])
+    host = server_host(item["outbound"])
+    return ".".join(host.split(".")[-2:]) if host else ""
+
+
 def pick_best(items, limit):
-    """лучшие подключения: самые быстрые по проверке сервера, но по очереди с разных серверов —
-    если оператор телефона закроет один сервер, останутся другие"""
+    """лучшие подключения для телефона. Какие серверы пропускает оператор, знает только сам
+    телефон, поэтому берём как можно более разные: по очереди из разных сетей (закроет оператор
+    одну сеть — останутся другие), сначала помеченные CIDR (их IP — из разрешённых сетей),
+    внутри — самые быстрые по проверке сервера"""
     groups = {}
-    for it in sorted(items, key=lambda x: x["ms"] if isinstance(x.get("ms"), (int, float)) else 10 ** 9):
-        groups.setdefault(server_host(it["outbound"]), []).append(it)
+    for it in sorted(items, key=lambda x: (not x.get("cidr"),
+                                           x["ms"] if isinstance(x.get("ms"), (int, float)) else 10 ** 9)):
+        groups.setdefault(network_of(it), []).append(it)
     chosen, depth = [], 0
     while len(chosen) < limit:
         layer = [group[depth] for group in groups.values() if depth < len(group)]
@@ -432,9 +447,10 @@ def pick_best(items, limit):
 
 
 def white_auto(template, chosen, level):
-    """профиль автоподбора: лучшие белые списки в одном конфиге; приложение при включении
-    проверяет их все сразу из сети телефона, потом раз в interval, и ведёт трафик через самый
-    быстрый из живых (не отвечает — отключается сам). Правила — как у остальных конфигов."""
+    """профиль автоподбора: лучшие белые списки в одном конфиге — так же, как «Автовыбор» самой
+    панели (burstObservatory + leastLoad): приложение проверяет каждый сервер из сети телефона раз
+    в interval и ведёт трафик через самые надёжные из живых; не отвечает — отключается само.
+    Правила — как у остальных конфигов."""
     auto = WHITE.get("auto") or {}
     if len(chosen) < 2:
         return None
@@ -450,14 +466,20 @@ def white_auto(template, chosen, level):
         if isinstance(rule, dict) and rule.get("outboundTag") == "proxy":
             del rule["outboundTag"]
             rule["balancerTag"] = "wl-auto"
-    # leastPing — самый быстрый из живых; пока проверка не закончилась — лучший по проверке сервера
+    # leastLoad: из живых с пингом до maxRTT — expected самых стабильных; пока проверок нет —
+    # лучший по проверке сервера (fallbackTag)
     routing["balancers"] = [{"tag": "wl-auto", "selector": ["wl-"], "fallbackTag": "wl-1",
-                             "strategy": {"type": "leastPing"}}]
-    conf.pop("burstObservatory", None)
-    # все проверяются сразу при включении (enableConcurrency), дальше — раз в interval
-    conf["observatory"] = {"subjectSelector": ["wl-"],
-                           "probeUrl": auto.get("url") or "http://www.gstatic.com/generate_204",
-                           "probeInterval": auto.get("interval") or "2m", "enableConcurrency": True}
+                             "strategy": {"type": "leastLoad",
+                                          "settings": {"expected": int(auto.get("expected") or 2),
+                                                       "maxRTT": auto.get("maxRTT") or "3s",
+                                                       "tolerance": float(auto.get("tolerance") or 0.5)}}}]
+    conf.pop("observatory", None)
+    conf["burstObservatory"] = {"subjectSelector": ["wl-"],
+                                "pingConfig": {"destination": auto.get("url") or "http://www.gstatic.com/generate_204",
+                                               "connectivity": "", "httpMethod": "HEAD",
+                                               "interval": auto.get("interval") or "1m",
+                                               "sampling": int(auto.get("sampling") or 1),
+                                               "timeout": auto.get("timeout") or "5s"}}
     conf["remarks"] = auto.get("name") or "Автовыбор"
     return conf
 
@@ -1093,7 +1115,8 @@ def build_items(conf, links):
             continue
         seen.add(key)
         name = nice_name(conf["label"], n, original)
-        items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound})
+        items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound,
+                      "cidr": "cidr" in (original or "").lower()})
         if len(items) >= int(conf["max_items"]):
             break
     return items, skipped
@@ -1195,15 +1218,23 @@ def server_of(outbound):
 
 
 def reachable(item, timeout):
-    """открывается ли сервер подключения напрямую с этого сервера (None — UDP, так не проверить)"""
-    if item["outbound"].get("protocol") == "hysteria":
-        return None
+    """открывается ли сервер подключения напрямую с этого сервера (None — UDP, так не проверить)
+    и его IP-адрес: по нему фильтр подписки берёт серверы из разных сетей"""
     host, port = server_of(item["outbound"])
+    if item["outbound"].get("protocol") == "hysteria":
+        try:
+            return None, socket.getaddrinfo(host, int(port), proto=socket.IPPROTO_UDP)[0][4][0]
+        except (OSError, TypeError, ValueError, UnicodeError, IndexError):
+            return None, ""
     try:
-        socket.create_connection((host, int(port)), timeout=timeout).close()
-        return True
+        conn = socket.create_connection((host, int(port)), timeout=timeout)
+        try:
+            ip = conn.getpeername()[0]
+        finally:
+            conn.close()
+        return True, ip
     except (OSError, TypeError, ValueError, UnicodeError):
-        return False
+        return False, ""
 
 
 def recv_exact(sock, size):
@@ -1347,7 +1378,11 @@ def check(conf, state, items, quick=False):
             raise RuntimeError("у сервера сейчас нет связи с интернетом — проверку пропускаю")
         # 1) открывается ли сервер подключения вообще — быстро, без Xray
         with concurrent.futures.ThreadPoolExecutor(int(conf["tcp_workers"])) as pool:
-            reach = list(pool.map(lambda it: reachable(it, float(conf["tcp_timeout"])), items))
+            checked = list(pool.map(lambda it: reachable(it, float(conf["tcp_timeout"])), items))
+        reach = [r for r, _ in checked]
+        for it, (_, ip) in zip(items, checked):
+            if ip:
+                it["ip"] = ip
         # 2) настоящий запрос через каждое подключение, сервер которого открылся (и через UDP)
         todo = [it for it, r in zip(items, reach) if r is not False]
         results = {}
@@ -1551,9 +1586,12 @@ conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"])
         # и как часто приложению обновлять подписку (часы) — тогда нерабочие пропадают и с телефона
         "path": old.get("path") or "/" + secrets.token_hex(8) + "/",
         "title": "🏳️ Белые списки", "update_hours": 1,
-        # автоподбор на устройстве: до max лучших серверов в одном профиле — телефон сам проверяет
-        # их из своей сети при включении и каждые interval и ведёт трафик через самый быстрый
-        "auto": {"max": int(e["AUTO_MAX"]), "name": e["AUTO_NAME"], "interval": "2m",
+        # автоподбор на устройстве (как «Автовыбор» панели: burstObservatory + leastLoad): до max
+        # серверов из разных сетей в одном профиле; телефон сам проверяет каждый из своей сети раз
+        # в interval (запрос HEAD, ждёт ответа до timeout) и ведёт трафик через expected самых
+        # надёжных из живых с пингом до maxRTT; при доле неудачных проверок больше tolerance — отключает
+        "auto": {"max": int(e["AUTO_MAX"]), "name": e["AUTO_NAME"], "interval": "1m", "sampling": 1,
+                 "timeout": "5s", "expected": 2, "maxRTT": "3s", "tolerance": 0.5,
                  "url": "http://www.gstatic.com/generate_204"}}
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(conf, f, indent=1)
@@ -1662,11 +1700,11 @@ white_summary() {   # итог для экрана и для файла с до�
   echo "Источники: ${src}."
   echo "Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется настоящим запросом: все — раз в час,"
   echo "рабочие — каждые ${WHITE_CHECK_MIN} мин. Нерабочее пропадает из подписки сразу после проверки (приложение обновляет её раз в час)."
-  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} самых быстрых с разных серверов${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} из разных сетей${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
   if [ "$WHITE_AUTO_MAX" -gt 1 ]; then
-    echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): при включении"
-    echo "телефон сам проверяет до ${WHITE_AUTO_MAX} лучших серверов из своей сети, потом каждые 2 минуты, и ведёт трафик"
-    echo "через самый быстрый из работающих у него; перестал отвечать — переходит на другой."
+    echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN), как «${AUTO_LABEL}»:"
+    echo "в нём до ${WHITE_AUTO_MAX} серверов из разных сетей; телефон сам раз в минуту проверяет каждый из своей сети и ведёт"
+    echo "трафик через два самых надёжных из работающих у него; перестал отвечать — отключается сам."
   fi
   if [ -n "${WHITE_URL_SUB:-}" ]; then echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"; fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
@@ -1926,8 +1964,8 @@ print(m.group(1) if m else "")' 2>/dev/null || true)"
   echo "В приложении они в конце списка: «${WHITE_LABEL} …». Включайте их, когда мобильный интернет"
   echo "пускает только на «разрешённые» сайты и свой VPN не подключается."
   if [ "${NA:-0}" -gt 0 ]; then
-    echo "Проще всего выбрать «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): телефон сам проверит лучшие белые"
-    echo "списки (${NA} шт.) из своей сети и поведёт трафик через самый быстрый из тех, что работают именно у него."
+    echo "Проще всего выбрать «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): телефон сам раз в минуту проверяет"
+    echo "серверы из разных сетей (в профиле: ${NA}) и ведёт трафик через самые надёжные из работающих именно у него."
   fi
   if [ -n "$WHITE_URL_SUB" ]; then
     echo "Отдельной подпиской (только белые списки — если удобнее держать их отдельной группой):"
@@ -3984,10 +4022,10 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   if [ -n "$DIRECT_LIST" ]; then echo "  • напрямую к зарубежному серверу (телефон → сервер, без России): ${DIRECT_LIST}."; fi
   if [ -n "$WHITE_URL_SUB" ]; then
     if [ "${WA:-0}" -gt 0 ]; then
-      echo "  • «${WHITE_AUTO_NAME}» — белые списки с автоподбором: телефон сам проверяет лучшие (${WA} шт.) из своей сети"
-      echo "    и ведёт трафик через самый быстрый из работающих у него (Happ, v2rayNG, v2rayN);"
+      echo "  • «${WHITE_AUTO_NAME}» — белые списки с автоподбором: телефон сам раз в минуту проверяет серверы"
+      echo "    из разных сетей (в профиле: ${WA}) и ведёт трафик через два самых надёжных из работающих у него (Happ, v2rayNG, v2rayN);"
     fi
-    echo "  • «${WHITE_LABEL} …» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} самых быстрых из ${WHITE_WORKING} рабочих);"
+    echo "  • «${WHITE_LABEL} …» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} из ${WHITE_WORKING} рабочих, из разных сетей);"
     echo "    включайте их, когда оператор пускает только на «разрешённые» сайты и свой VPN не подключается."
   fi
 fi

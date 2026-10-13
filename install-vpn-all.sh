@@ -28,11 +28,17 @@
 #     («🇳🇱 Нидерланды», «🇨🇭 Швейцария»…).
 #   • БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА — отдельный пункт меню «3». Когда мобильный оператор
 #     пускает только на «разрешённые» сайты, свой сервер недоступен. Выручают готовые подключения
-#     из igareck/vpn-configs-for-russia (Vless-Reality-White-Lists-Rus-Mobile.txt): сервер скачивает
-#     этот список каждые 5 часов (с GitHub или его зеркал), каждые 15 минут проверяет КАЖДОЕ
-#     подключение настоящим запросом через Xray и отдаёт в подписке только рабочие — нерабочее
-#     подключение пропадает из подписки сразу после проверки. В приложении они идут после своих
-#     подключений («🏳️ БС 01 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них.
+#     из публичных списков для обхода белых списков — 24 источника: igareck/vpn-configs-for-russia
+#     (мобильный, CIDR и SNI), zieng2/wl, whoahaow/rjsxrd, V.O.I.D, FLAT447, сборка all_subs и другие
+#     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
+#     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
+#     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
+#     после проверки. В подписку идут 50 самых быстрых рабочих с разных серверов, после своих
+#     подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 150).
+#     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN):
+#     при включении телефон сам проверяет лучшие белые списки из СВОЕЙ сети (у каждого оператора
+#     и региона пропускают разные) и ведёт трафик через самый быстрый из работающих у него;
+#     каждые 2 минуты проверка повторяется, и если сервер перестал отвечать — телефон переходит на другой.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -93,6 +99,8 @@ WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссы
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
 WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
+WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-8}"             # белые списки: сколько серверов телефон сам проверяет в профиле автоподбора (0 — без профиля)
+WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько лучших рабочих — в подписке (отдельная ссылка — до 150)
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
 EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
@@ -166,6 +174,11 @@ esac
 [[ "$WHITE_REFRESH_HOURS" =~ ^[1-9][0-9]?$ ]] || die "WHITE_REFRESH_HOURS — часы, от 1 до 99: ${WHITE_REFRESH_HOURS}"
 { [[ "$WHITE_CHECK_MIN" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$WHITE_CHECK_MIN" -ge 5 ]; } \
   || die "WHITE_CHECK_MIN — минуты, от 5 до 999: ${WHITE_CHECK_MIN}"
+{ [[ "$WHITE_AUTO_MAX" =~ ^[0-9]{1,2}$ ]] && [ "$WHITE_AUTO_MAX" -le 30 ]; } \
+  || die "WHITE_AUTO_MAX — сколько серверов в автоподборе, от 0 (без него) до 30: ${WHITE_AUTO_MAX}"
+{ [[ "$WHITE_SUB_MAX" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$WHITE_SUB_MAX" -ge 5 ] && [ "$WHITE_SUB_MAX" -le 300 ]; } \
+  || die "WHITE_SUB_MAX — сколько белых списков в подписке, от 5 до 300: ${WHITE_SUB_MAX}"
+WHITE_AUTO_NAME="${WHITE_LABEL} 🚀 Автовыбор"     # профиль автоподбора белых списков в приложении
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
 
 WORK="$(mktemp -d)"
@@ -298,9 +311,11 @@ write_sub_filter_program() {
 # подписки и передаёт их панели 3X-UI, которая отдаёт подписку только внутри сервера.
 # В профили с балансировкой leastLoad («Автовыбор») дописывает тонкие настройки: сколько
 # лучших подключений работают одновременно, максимальный пинг и допустимые потери.
-# Белые списки (если включены): в конец подписки добавляет проверенные рабочие подключения
-# из alive.json (его каждые несколько минут обновляет vpn-white-lists) и отдаёт их же
-# отдельной подпиской по своему адресу.
+# Белые списки (если включены): из рабочих подключений (alive.json — его каждые несколько минут
+# обновляет vpn-white-lists) добавляет в конец подписки самые быстрые с разных серверов
+# (sub_max), отдельной подпиской по своему адресу — до list_max. Для Happ, v2rayNG и v2rayN перед
+# ними — профиль автоподбора: приложение само проверяет лучшие белые списки из сети этого
+# телефона и ведёт трафик через самый быстрый из тех, что работают именно у него.
 import base64, copy, json, os, re, socket, ssl, sys, threading, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -344,11 +359,12 @@ def tune(body):
 
 # ---------- белые списки ----------
 _white_lock = threading.Lock()
-_white = {"stamp": None, "items": []}
+_white = {"stamp": None, "sub": [], "list": [], "auto": []}
 
 
-def white_items():
-    """рабочие подключения белых списков (файл перечитывается, только когда изменился)"""
+def white_items(kind="sub"):
+    """белые списки из рабочих подключений (файл перечитывается, только когда изменился):
+    sub — для подписки, list — для отдельной подписки, auto — для профиля автоподбора"""
     path = WHITE.get("file")
     if not path:
         return []
@@ -364,10 +380,14 @@ def white_items():
                     items = json.load(f).get("items") or []
                 items = [x for x in items if isinstance(x, dict) and isinstance(x.get("link"), str)
                          and isinstance(x.get("outbound"), dict) and x.get("name")]
-                _white.update(stamp=stamp, items=items)
-            except (OSError, ValueError, AttributeError):
+                by_n = lambda x: x.get("n") if isinstance(x.get("n"), int) else 10 ** 9
+                _white.update(stamp=stamp,
+                              sub=sorted(pick_best(items, int(WHITE.get("sub_max") or 50)), key=by_n),
+                              list=sorted(pick_best(items, int(WHITE.get("list_max") or 150)), key=by_n),
+                              auto=pick_best(items, int((WHITE.get("auto") or {}).get("max") or 0)))
+            except (OSError, ValueError, AttributeError, TypeError):
                 pass                      # файл как раз переписывается — отдаём прежний список
-        return _white["items"]
+        return _white[kind]
 
 
 def with_level(outbound, level):
@@ -385,7 +405,64 @@ def with_level(outbound, level):
     return out
 
 
-def white_json(data, items):
+def server_host(outbound):
+    """адрес сервера подключения"""
+    s = outbound.get("settings") or {}
+    for key in ("vnext", "servers"):
+        for srv in s.get(key) or []:
+            if isinstance(srv, dict):
+                return str(srv.get("address") or "")
+    return str(s.get("address") or "")
+
+
+def pick_best(items, limit):
+    """лучшие подключения: самые быстрые по проверке сервера, но по очереди с разных серверов —
+    если оператор телефона закроет один сервер, останутся другие"""
+    groups = {}
+    for it in sorted(items, key=lambda x: x["ms"] if isinstance(x.get("ms"), (int, float)) else 10 ** 9):
+        groups.setdefault(server_host(it["outbound"]), []).append(it)
+    chosen, depth = [], 0
+    while len(chosen) < limit:
+        layer = [group[depth] for group in groups.values() if depth < len(group)]
+        if not layer:
+            break
+        chosen.extend(layer[:limit - len(chosen)])
+        depth += 1
+    return chosen
+
+
+def white_auto(template, chosen, level):
+    """профиль автоподбора: лучшие белые списки в одном конфиге; приложение при включении
+    проверяет их все сразу из сети телефона, потом раз в interval, и ведёт трафик через самый
+    быстрый из живых (не отвечает — отключается сам). Правила — как у остальных конфигов."""
+    auto = WHITE.get("auto") or {}
+    if len(chosen) < 2:
+        return None
+    conf = copy.deepcopy(template)
+    outs = []
+    for i, it in enumerate(chosen, 1):
+        ob = with_level(it["outbound"], level) if isinstance(level, int) else copy.deepcopy(it["outbound"])
+        ob["tag"] = "wl-%d" % i
+        outs.append(ob)
+    conf["outbounds"] = outs + [o for o in conf["outbounds"] if not (isinstance(o, dict) and o.get("tag") == "proxy")]
+    routing = conf.setdefault("routing", {})
+    for rule in routing.get("rules") or []:
+        if isinstance(rule, dict) and rule.get("outboundTag") == "proxy":
+            del rule["outboundTag"]
+            rule["balancerTag"] = "wl-auto"
+    # leastPing — самый быстрый из живых; пока проверка не закончилась — лучший по проверке сервера
+    routing["balancers"] = [{"tag": "wl-auto", "selector": ["wl-"], "fallbackTag": "wl-1",
+                             "strategy": {"type": "leastPing"}}]
+    conf.pop("burstObservatory", None)
+    # все проверяются сразу при включении (enableConcurrency), дальше — раз в interval
+    conf["observatory"] = {"subjectSelector": ["wl-"],
+                           "probeUrl": auto.get("url") or "http://www.gstatic.com/generate_204",
+                           "probeInterval": auto.get("interval") or "2m", "enableConcurrency": True}
+    conf["remarks"] = auto.get("name") or "Автовыбор"
+    return conf
+
+
+def white_json(data, items, chosen):
     """JSON-подписка (Happ, v2rayNG, v2rayN): каждое подключение — копия конфига панели
     с теми же правилами (РФ напрямую, реклама — блок), но со своим выходом proxy"""
     confs = data if isinstance(data, list) else [data]
@@ -410,6 +487,9 @@ def white_json(data, items):
             if level is None and isinstance(user, dict):
                 level = user.get("level")
     result = list(confs)
+    auto = white_auto(template, chosen, level)
+    if auto is not None:
+        result.append(auto)
     for it in items:
         conf = copy.deepcopy(template)
         ob = with_level(it["outbound"], level) if isinstance(level, int) else copy.deepcopy(it["outbound"])
@@ -420,7 +500,7 @@ def white_json(data, items):
     return json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def add_white(body, items):
+def add_white(body, items, chosen=()):
     """подписка с белыми списками в конце; None — это не подписка (страница, ошибка) — не трогаем"""
     try:
         text = body.decode("utf-8").strip()
@@ -428,7 +508,7 @@ def add_white(body, items):
         return None
     if text[:1] in ("[", "{"):
         try:
-            return white_json(json.loads(text), items)
+            return white_json(json.loads(text), items, list(chosen))
         except ValueError:
             return None
     encoded = "://" not in text           # обычно ссылки приходят одним куском base64
@@ -477,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
         self.forward(True)
 
     def white_page(self, head):           # отдельная подписка: только белые списки
-        links = [it["link"] for it in white_items()]
+        links = [it["link"] for it in white_items("list")]
         body = base64.b64encode("\n".join(links).encode("utf-8")) if links else b""
         title = WHITE.get("title") or "Белые списки"
         self.send_response(200)
@@ -524,7 +604,7 @@ class Handler(BaseHTTPRequestHandler):
             items = white_items() if WHITE else []
             if items and "html" not in ctype.lower():
                 try:
-                    new = add_white(body, items)
+                    new = add_white(body, items, white_items("auto"))
                 except Exception:         # что-то пошло не так — подписка уходит как есть
                     new = None
                 if new is not None:
@@ -622,19 +702,22 @@ write_white_program() {
   cat > "$WHITE_PY" <<'PY'
 #!/usr/bin/env python3
 # Белые списки для мобильного интернета (ставит install-vpn-all.sh, запускает таймер vpn-white-lists).
-# Скачивает готовые подключения (по умолчанию — Vless-Reality-White-Lists-Rus-Mobile.txt из
-# igareck/vpn-configs-for-russia, с зеркал) раз в несколько часов и проверяет КАЖДОЕ подключение
-# настоящим запросом через Xray панели. Рабочие записывает в alive.json — их фильтр подписки
-# добавляет в подписку. Подключение, которое не ответило, пропадает из подписки сразу после проверки.
-#   vpn-white-lists.py НАСТРОЙКИ.json auto    — по таймеру: скачать, если пора, и проверить
-#   vpn-white-lists.py НАСТРОЙКИ.json update  — скачать сейчас и проверить
-#   vpn-white-lists.py НАСТРОЙКИ.json check   — только проверить
+# Скачивает готовые подключения из многих публичных источников (igareck, zieng2, all_subs и других —
+# список в настройках, у каждого источника свои зеркала), объединяет их без повторов и проверяет
+# КАЖДОЕ подключение настоящим запросом через Xray панели. Все рабочие записывает в alive.json —
+# из них фильтр подписки берёт в подписку самые быстрые с разных серверов. Подключение, которое
+# не ответило, пропадает из подписки сразу после проверки.
+#   vpn-white-lists.py НАСТРОЙКИ.json auto    — по таймеру: скачать, если пора; полная проверка раз
+#                                               в час, между ними — быстрая (только рабочие)
+#   vpn-white-lists.py НАСТРОЙКИ.json update  — скачать сейчас и проверить всё
+#   vpn-white-lists.py НАСТРОЙКИ.json check   — проверить всё
+#   vpn-white-lists.py НАСТРОЙКИ.json quick   — перепроверить только рабочие
 #   vpn-white-lists.py НАСТРОЙКИ.json status  — итог последней проверки (JSON)
-import base64, binascii, collections, concurrent.futures, fcntl, glob, json, os, re, socket, ssl, subprocess, sys, tempfile, time
-import urllib.error, urllib.parse, urllib.request
+import base64, binascii, collections, concurrent.futures, fcntl, glob, ipaddress, json, os, re, socket, ssl
+import subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
 SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2")
-MAX_BYTES = 4 * 1024 * 1024
+MAX_BYTES = 8 * 1024 * 1024
 FLAG = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 
 
@@ -648,14 +731,16 @@ def log(text):
 
 def load_conf(path):
     conf = json.load(open(path, encoding="utf-8"))
-    conf.setdefault("data", "/var/lib/vpn-white-lists")
-    conf.setdefault("refresh_hours", 5)
-    conf.setdefault("label", "🏳️ БС")
-    conf.setdefault("test_urls", ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"])
-    conf.setdefault("timeout", 10)
-    conf.setdefault("workers", 32)
-    conf.setdefault("max_items", 300)
-    conf.setdefault("xray_dir", "/usr/local/x-ui/bin")
+    for key, value in (("data", "/var/lib/vpn-white-lists"), ("refresh_hours", 5), ("label", "🏳️ БС"),
+                       ("test_urls", ["https://www.gstatic.com/generate_204",
+                                      "https://cp.cloudflare.com/generate_204"]),
+                       ("timeout", 8),             # ответ через подключение, секунд
+                       ("tcp_timeout", 3),         # открывается ли сервер вообще, секунд
+                       ("workers", 64), ("tcp_workers", 128), ("batch", 300),
+                       ("max_items", 4000),        # сколько разных подключений из всех источников проверять
+                       ("full_check_minutes", 60),  # полная проверка; между ними — только рабочие
+                       ("sub_max", 50), ("list_max", 150), ("xray_dir", "/usr/local/x-ui/bin")):
+        conf.setdefault(key, value)
     return conf
 
 
@@ -696,14 +781,14 @@ def reason(err):
     return " ".join(str(err).split())[:80] or err.__class__.__name__
 
 
-# ---------------------------------------------------------------- скачивание списка
+# ---------------------------------------------------------------- скачивание списков
 def fetch(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (vpn-white-lists)",
                                                "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:
-        raise ValueError("файл больше 4 МБ")
+        raise ValueError("файл больше 8 МБ")
     return raw
 
 
@@ -725,44 +810,95 @@ def extract_links(raw):
     return links
 
 
+def link_key(link):
+    """ссылка без названия: одно и то же подключение в разных списках называется по-разному"""
+    return link if link.lower().startswith("vmess://") else link.split("#", 1)[0]
+
+
+def source_name(mirrors):
+    path = urllib.parse.urlsplit(mirrors[0]).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] or urllib.parse.urlsplit(mirrors[0]).hostname or mirrors[0]
+
+
+def fetch_source(mirrors):
+    """источник — один файл и его зеркала: берём первое зеркало, которое отдало подключения"""
+    errors = []
+    for url in mirrors:
+        host = urllib.parse.urlsplit(url).hostname or url
+        try:
+            got = extract_links(fetch(url))
+        except (OSError, ValueError) as err:       # сюда же — ошибки HTTP и таймауты
+            errors.append("%s: %s" % (host, reason(err)))
+            continue
+        if got:
+            return got, host, ""
+        errors.append("%s: в файле нет подключений" % host)
+    return [], "", "; ".join(errors[-2:])
+
+
 def download(conf, state):
-    links, seen, used, errors = [], set(), [], []
-    for source in conf["sources"]:                 # источник — один файл и его зеркала
-        for url in source:
-            host = urllib.parse.urlsplit(url).hostname or url
-            try:
-                got = extract_links(fetch(url))
-            except (OSError, ValueError) as err:   # сюда же — ошибки HTTP и таймауты
-                errors.append("%s: %s" % (host, reason(err)))
-                continue
-            if not got:
-                errors.append("%s: в файле нет подключений" % host)
-                continue
-            for link in got:
-                if link not in seen:
-                    seen.add(link)
-                    links.append(link)
+    sources = [s if isinstance(s, list) else [s] for s in conf["sources"] if s]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(fetch_source, sources))
+    links, seen, used, errors, failed, ok = [], set(), [], [], [], 0
+    for mirrors, (got, host, err) in zip(sources, results):   # по порядку источников — номера стабильны
+        if not got:
+            failed.append(source_name(mirrors))
+            if err:
+                errors.append(err)
+            continue
+        ok += 1
+        if host not in used:
             used.append(host)
-            break
+        for link in got:
+            key = link_key(link)
+            if key not in seen:
+                seen.add(key)
+                links.append(link)
     if not links:
         raise RuntimeError("; ".join(errors[-3:]) or "источник не указан")
-    links = links[:int(conf["max_items"])]
+    links = links[:20000]                          # защита от переполнения; разные подключения — max_items
     write_atomic(os.path.join(conf["data"], "source.txt"), "\n".join(links) + "\n")
-    state.update(downloaded=int(time.time()), download_from=used, download_error="", total=len(links))
-    log("Список скачан (%s): подключений — %d" % (", ".join(used), len(links)))
+    state.update(downloaded=int(time.time()), download_from=used, download_error="", total=len(links),
+                 sources_ok=ok, sources_total=len(sources), sources_failed=failed)
+    log("Списки скачаны: источников %d из %d, подключений — %d" % (ok, len(sources), len(links)))
+    if failed:
+        log("Не скачались (или пустые): %s" % ", ".join(failed))
     return links
 
 
 # ---------------------------------------------------------------- ссылка → выход Xray
+def public_host(host):
+    """служебные адреса (0.0.0.0, 127.0.0.1, локальные сети) — не серверы: так в списках бывают заглушки"""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return True                                # доменное имя
+    return not (ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved)
+
+
+def parse_query(query):
+    """параметры ссылки; «+» остаётся «+» (в ключах base64 это не пробел)"""
+    out = {}
+    for pair in query.split("&"):
+        if pair:
+            key, _, value = pair.partition("=")
+            out.setdefault(urllib.parse.unquote(key), urllib.parse.unquote(value))
+    return out
+
+
 def parts(link):
     u = urllib.parse.urlsplit(link)
-    query = dict(urllib.parse.parse_qsl(u.query, keep_blank_values=True))
+    query = parse_query(u.query)
     try:
         port = u.port
     except ValueError:
         raise Skip("неверный порт")
     if not u.hostname or not port:
         raise Skip("нет адреса или порта")
+    if not public_host(u.hostname):
+        raise Skip("служебный адрес")
     user = urllib.parse.unquote(u.netloc.rpartition("@")[0]) if "@" in u.netloc else ""
     return u.hostname, port, user, query, urllib.parse.unquote(u.fragment)
 
@@ -812,10 +948,16 @@ def stream(q, host):
     if sec == "reality":
         if not q.get("pbk"):
             raise Skip("Reality без ключа")
+        pbk = q["pbk"].strip().replace("+", "-").replace("/", "_").rstrip("=")   # Xray ждёт base64url
         r = {"serverName": q.get("sni") or "", "fingerprint": q.get("fp") or "chrome",
-             "publicKey": q["pbk"], "shortId": q.get("sid") or ""}
-        if q.get("spx"):
-            r["spiderX"] = q["spx"]
+             "publicKey": pbk, "shortId": q.get("sid") or ""}
+        spx = q.get("spx") or ""
+        for _ in range(10):                        # бывает закодировано по нескольку раз: %25252F → /
+            if "%" not in spx:
+                break
+            spx = urllib.parse.unquote(spx)
+        if spx.startswith("/"):
+            r["spiderX"] = spx
         if q.get("pqv"):
             r["mldsa65Verify"] = q["pqv"]
         s.update(security="reality", realitySettings=r)
@@ -844,11 +986,17 @@ def to_outbound(link):
         host, port, uid, q, name = parts(link)
         if not uid:
             raise Skip("нет ключа")
-        user = {"id": uid, "encryption": q.get("encryption") or "none"}
+        enc = (q.get("encryption") or "none").strip()
+        if enc.lower().startswith("none"):         # в некоторых списках к «none» приклеена реклама
+            enc = "none"
+        user = {"id": uid, "encryption": enc}
         if q.get("flow"):
             user["flow"] = q["flow"]
+        st = stream(q, host)
+        if st["security"] == "none" and user["encryption"] == "none":
+            raise Skip("VLESS без шифрования")    # такие Xray не принимает, а трафик в них открыт
         return {"protocol": "vless", "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
-                "streamSettings": stream(q, host)}, name
+                "streamSettings": st}, name
     if scheme == "trojan":
         host, port, password, q, name = parts(link)
         if not password:
@@ -862,6 +1010,8 @@ def to_outbound(link):
         host, port = str(d.get("add") or "").strip(), int(d.get("port") or 0)
         if not host or not port or not d.get("id"):
             raise Skip("нет адреса или ключа")
+        if not public_host(host):
+            raise Skip("служебный адрес")
         net = str(d.get("net") or "tcp").lower()
         q = {"type": net, "security": str(d.get("tls") or "none"), "sni": d.get("sni") or "",
              "host": d.get("host") or "", "fp": d.get("fp") or "", "alpn": d.get("alpn") or ""}
@@ -886,6 +1036,8 @@ def to_outbound(link):
         u = urllib.parse.urlsplit("ss://x@" + hostport)
         if not u.hostname or not u.port or not method:
             raise Skip("нет адреса или пароля")
+        if not public_host(u.hostname):
+            raise Skip("служебный адрес")
         if "plugin=" in link:
             raise Skip("плагин Shadowsocks")
         return {"protocol": "shadowsocks", "settings": {"servers": [{"address": u.hostname, "port": u.port,
@@ -922,6 +1074,29 @@ def rename(link, name):
         d["ps"] = name
         return "vmess://" + base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")
     return link.split("#", 1)[0] + "#" + urllib.parse.quote(name, safe="")
+
+
+def build_items(conf, links):
+    """ссылки → подключения для проверки; одинаковые (тот же сервер и ключ из разных источников) — один раз"""
+    items, seen, skipped = [], set(), collections.Counter()
+    for n, link in enumerate(links, 1):
+        try:
+            outbound, original = to_outbound(link)
+        except Skip as err:
+            skipped[str(err)] += 1
+            continue
+        except (ValueError, KeyError, TypeError, UnicodeError, binascii.Error):
+            skipped["ошибка в ссылке"] += 1
+            continue
+        key = json.dumps(outbound, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = nice_name(conf["label"], n, original)
+        items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound})
+        if len(items) >= int(conf["max_items"]):
+            break
+    return items, skipped
 
 
 # ---------------------------------------------------------------- проверка через Xray
@@ -974,7 +1149,7 @@ def xray_test(xray, conf, items, workdir):
     env = dict(os.environ, XRAY_LOCATION_ASSET=conf["xray_dir"])
     try:
         r = subprocess.run([xray, "run", "-test", "-c", path], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, env=env, timeout=60)
+                           stderr=subprocess.STDOUT, env=env, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as err:
         return False, str(err)
     finally:
@@ -982,6 +1157,31 @@ def xray_test(xray, conf, items, workdir):
     if r.returncode == 0:
         return True, ""
     return False, xray_error(r.stdout.decode("utf-8", "replace")) or "код %d" % r.returncode
+
+
+def xray_valid(xray, conf, items, workdir):
+    """подключения, настройки которых принимает Xray этого сервера: проверяем пачками,
+    пачку с ошибкой делим пополам, пока не найдём неподходящие"""
+    good, bad = [], []
+
+    def split(group):
+        ok, why = xray_test(xray, conf, group, workdir)
+        if ok:
+            return list(group), []
+        if len(group) == 1:
+            return [], [why]
+        mid = len(group) // 2
+        g1, b1 = split(group[:mid])
+        g2, b2 = split(group[mid:])
+        return g1 + g2, b1 + b2
+
+    chunks = [items[i:i + 100] for i in range(0, len(items), 100)]
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        for g, b in pool.map(split, chunks):
+            good.extend(g)
+            bad.extend(b)
+    good.sort(key=lambda it: it["n"])
+    return good, bad
 
 
 def server_of(outbound):
@@ -994,15 +1194,15 @@ def server_of(outbound):
     return s.get("address"), s.get("port")
 
 
-def reachable(item):
+def reachable(item, timeout):
     """открывается ли сервер подключения напрямую с этого сервера (None — UDP, так не проверить)"""
     if item["outbound"].get("protocol") == "hysteria":
         return None
     host, port = server_of(item["outbound"])
     try:
-        socket.create_connection((host, int(port)), timeout=5).close()
+        socket.create_connection((host, int(port)), timeout=timeout).close()
         return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, UnicodeError):
         return False
 
 
@@ -1079,94 +1279,94 @@ def internet_ok(conf):
     return False
 
 
-def check(conf, state, links):
-    xray = find_xray(conf)
-    items, skipped = [], 0
-    for n, link in enumerate(links, 1):
+def probe_batch(xray, conf, items, work):
+    """одна пачка: временный Xray со входом на каждое подключение, запрос через каждое"""
+    ports = free_ports(len(items))
+    path = os.path.join(work, "check.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(xray_config(items, ports), f)
+    xlog = open(os.path.join(work, "xray.log"), "wb")
+    proc = subprocess.Popen([xray, "run", "-c", path], stdout=xlog, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, XRAY_LOCATION_ASSET=conf["xray_dir"]))
+    xlog.close()
+    timeout = float(conf["timeout"])
+    try:
+        pending, deadline = set(ports), time.monotonic() + 20
+        while pending and time.monotonic() < deadline and proc.poll() is None:
+            for port in list(pending):
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    pending.discard(port)
+                except OSError:
+                    pass
+            if pending:
+                time.sleep(0.3)
+        if pending:
+            try:
+                with open(os.path.join(work, "xray.log"), encoding="utf-8", errors="replace") as f:
+                    err = xray_error(f.read())
+            except OSError:
+                err = ""
+            raise RuntimeError("Xray для проверки не запустился%s" % (": " + err if err else ""))
+
+        def one(port):
+            for url in conf["test_urls"][:2]:
+                t0 = time.monotonic()
+                ms = probe(port, url, timeout)
+                if ms is not None:
+                    return ms
+                if time.monotonic() - t0 >= timeout * 0.8:   # не ответил вовсе — второй раз не ждём
+                    return None
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
+            return list(pool.map(one, ports))
+    finally:
+        proc.terminate()
         try:
-            outbound, original = to_outbound(link)
-        except (Skip, ValueError, KeyError, TypeError, UnicodeError, binascii.Error):
-            skipped += 1
-            continue
-        name = nice_name(conf["label"], n, original)
-        items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound})
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def check(conf, state, items, quick=False):
+    """проверить подключения; все рабочие — в alive.json (с временем ответа)"""
+    xray = find_xray(conf)
+    total = len(items)
     work = tempfile.mkdtemp(prefix="vpn-white-")
     try:
         # настройки, которые этот Xray не принимает (устаревшие и т. п.), отсеиваем сразу
-        why = ""
-        if items:
-            good, why = xray_test(xray, conf, items, work)
-            if not good:
-                with concurrent.futures.ThreadPoolExecutor(8) as pool:
-                    res = list(pool.map(lambda it: xray_test(xray, conf, [it], work), items))
-                bad = [w for ok, w in res if not ok]
-                if bad:
-                    why = collections.Counter(bad).most_common(1)[0][0]
-                    log("Xray этого сервера не принял настройки %d подключений: %s" % (len(bad), why))
-                skipped += len(bad)
-                items = [it for it, (ok, _) in zip(items, res) if ok]
-        state.update(total=len(links), unsupported=skipped, unsupported_reason=why if skipped else "")
+        items, bad = xray_valid(xray, conf, items, work)
+        why = collections.Counter(bad).most_common(1)[0][0] if bad else ""
+        if bad:
+            log("Xray этого сервера не принял настройки %d подключений: %s" % (len(bad), why))
+        state.update(unsupported=len(bad), unsupported_reason=why)
         if not items:
             raise RuntimeError("Xray не принял ни одно подключение из списка: %s" % (why or "формат не поддерживается"))
         if not internet_ok(conf):
             raise RuntimeError("у сервера сейчас нет связи с интернетом — проверку пропускаю")
-        ports = free_ports(len(items))
-        path = os.path.join(work, "check.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(xray_config(items, ports), f)
-        xlog = open(os.path.join(work, "xray.log"), "wb")
-        proc = subprocess.Popen([xray, "run", "-c", path], stdout=xlog, stderr=subprocess.STDOUT,
-                                env=dict(os.environ, XRAY_LOCATION_ASSET=conf["xray_dir"]))
-        xlog.close()
-        try:
-            pending, deadline = set(ports), time.monotonic() + 15
-            while pending and time.monotonic() < deadline and proc.poll() is None:
-                for port in list(pending):
-                    try:
-                        socket.create_connection(("127.0.0.1", port), timeout=1).close()
-                        pending.discard(port)
-                    except OSError:
-                        pass
-                if pending:
-                    time.sleep(0.3)
-            if pending:
-                try:
-                    with open(os.path.join(work, "xray.log"), encoding="utf-8", errors="replace") as f:
-                        err = xray_error(f.read())
-                except OSError:
-                    err = ""
-                raise RuntimeError("Xray для проверки не запустился%s" % (": " + err if err else ""))
-
-            def one(pair):
-                it, port = pair
-                for url in conf["test_urls"][:2]:   # вторая попытка — по другому адресу
-                    ms = probe(port, url, float(conf["timeout"]))
-                    if ms is not None:
-                        return ms
-                return None
-
-            with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
-                results = list(pool.map(one, zip(items, ports)))
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        # 1) открывается ли сервер подключения вообще — быстро, без Xray
+        with concurrent.futures.ThreadPoolExecutor(int(conf["tcp_workers"])) as pool:
+            reach = list(pool.map(lambda it: reachable(it, float(conf["tcp_timeout"])), items))
+        # 2) настоящий запрос через каждое подключение, сервер которого открылся (и через UDP)
+        todo = [it for it, r in zip(items, reach) if r is not False]
+        results = {}
+        size = max(1, int(conf["batch"]))
+        for i in range(0, len(todo), size):
+            batch = todo[i:i + size]
+            for it, ms in zip(batch, probe_batch(xray, conf, batch, work)):
+                results[it["n"]] = ms
+            if len(todo) > size:
+                log("  проверено %d из %d…" % (min(i + size, len(todo)), len(todo)))
     finally:
         for name in os.listdir(work):
             os.unlink(os.path.join(work, name))
         os.rmdir(work)
-    alive = [dict(it, ms=ms) for it, ms in zip(items, results) if ms is not None]
-    # почему не отвечают: сервер подключения вообще не открывается отсюда — или открывается,
-    # но запрос через подключение не проходит (сервер выключен, ключ сменился, перегружен)
-    failed = [it for it, ms in zip(items, results) if ms is None]
-    reach = []
-    if failed:
-        with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
-            reach = list(pool.map(reachable, failed))
-    closed, opened = reach.count(False), reach.count(True)
-    udp = len(failed) - closed - opened
+    alive = [dict(it, ms=results[it["n"]]) for it in items if results.get(it["n"]) is not None]
+    closed = sum(1 for r in reach if r is False)
+    opened = sum(1 for it, r in zip(items, reach) if r is True and results.get(it["n"]) is None)
+    udp = sum(1 for it, r in zip(items, reach) if r is None and results.get(it["n"]) is None)
+    failed = closed + opened + udp
     detail = []
     if closed:
         detail.append("сервер не открывается отсюда — %d" % closed)
@@ -1175,12 +1375,16 @@ def check(conf, state, links):
     if udp:
         detail.append("Hysteria2 (UDP) — %d" % udp)
     detail = " (%s)" % "; ".join(detail) if detail else ""
-    state.update(checked=int(time.time()), tested=len(items), alive=len(alive), check_error="",
-                 fail_closed=closed, fail_open=opened)
-    if failed and not alive and closed == len(failed):
+    now = int(time.time())
+    state.update(checked=now, tested=len(items), alive=len(alive), check_error="", fail_closed=closed,
+                 fail_open=opened)
+    if not quick:
+        state["full_checked"] = now
+    path = os.path.join(conf["data"], "alive.json")
+    kind = "Перепроверено рабочих" if quick else "Проверено"
+    if failed and not alive and closed == failed:
         log("Этот сервер не может подключиться ни к одному серверу из списка — похоже, исходящие "
             "соединения ограничивает хостер или сеть сервера.")
-    path = os.path.join(conf["data"], "alive.json")
     if not alive:
         # не ответило ни одно — скорее всего, сбой связи у самого сервера, а не у всех подключений
         # сразу: оставляем прежние рабочие (те, что ещё есть в списке) до следующей проверки
@@ -1189,36 +1393,37 @@ def check(conf, state, links):
         kept = [it for it in prev if isinstance(it, dict) and json.dumps(it.get("outbound"), sort_keys=True) in keys]
         if kept:
             state["check_error"] = "не ответило ни одно подключение — оставлены прежние рабочие (%d)" % len(kept)
-            log("Проверено %d: не ответило ни одно%s — похоже на сбой связи у сервера; в подписке остаются "
-                "прежние рабочие (%d) до следующей проверки." % (len(items), detail, len(kept)))
+            log("%s %d: не ответило ни одно%s — похоже на сбой связи у сервера; в подписке остаются "
+                "прежние рабочие (%d) до следующей проверки." % (kind, len(items), detail, len(kept)))
             if len(kept) != len(prev):
-                write_atomic(path, json.dumps({"updated": int(time.time()), "total": len(links), "alive": len(kept),
-                                               "items": kept}, ensure_ascii=False, indent=1))
+                write_atomic(path, json.dumps({"updated": now, "total": total, "alive": len(kept),
+                                               "items": kept}, ensure_ascii=False))
             return
-    write_atomic(path, json.dumps({"updated": int(time.time()), "total": len(links), "alive": len(alive),
-                                   "items": alive}, ensure_ascii=False, indent=1))
-    log("Проверено %d: работают %d, не отвечают %d%s — в подписке только рабочие." %
-        (len(items), len(alive), len(failed), detail))
-    if skipped:
-        log("Не проверялись: %d (Xray этого сервера не принимает их настройки)." % skipped)
+    write_atomic(path, json.dumps({"updated": now, "total": total, "alive": len(alive), "items": alive},
+                                  ensure_ascii=False))
+    log("%s %d: работают %d, не отвечают %d%s." % (kind, len(items), len(alive), failed, detail))
+    if not quick and bad:
+        log("Не проверялись: %d (Xray этого сервера не принимает их настройки)." % len(bad))
 
 
 # ---------------------------------------------------------------- запуск
 def main():
     if len(sys.argv) < 2:
-        print("vpn-white-lists.py НАСТРОЙКИ.json [auto|update|check|status]")
+        print("vpn-white-lists.py НАСТРОЙКИ.json [auto|update|check|quick|status]")
         return 2
     conf = load_conf(sys.argv[1])
     cmd = sys.argv[2] if len(sys.argv) > 2 else "auto"
     data = conf["data"]
     state_path = os.path.join(data, "state.json")
+    alive_path = os.path.join(data, "alive.json")
     if cmd == "status":
         state = read_json(state_path, {})
-        # сколько подключений прямо сейчас в подписке (их отдаёт фильтр подписки)
-        state["in_subscription"] = len(read_json(os.path.join(data, "alive.json"), {}).get("items") or [])
+        alive = len(read_json(alive_path, {}).get("items") or [])
+        state["alive_now"] = alive                   # рабочих сейчас (из всех источников)
+        state["in_subscription"] = min(alive, int(conf["sub_max"]))   # из них в подписке — лучшие
         print(json.dumps(state, ensure_ascii=False))
         return 0
-    if cmd not in ("auto", "update", "check"):
+    if cmd not in ("auto", "update", "check", "quick"):
         print("неизвестная команда: %s" % cmd)
         return 2
     os.makedirs(data, exist_ok=True)
@@ -1230,24 +1435,42 @@ def main():
                 links = [x.strip() for x in f if x.strip()]
         except OSError:
             links = []
-        due = time.time() - float(state.get("downloaded") or 0) >= float(conf["refresh_hours"]) * 3600 - 60
-        rc = 0
+        now = time.time()
+        due = now - float(state.get("downloaded") or 0) >= float(conf["refresh_hours"]) * 3600 - 60
+        rc, fresh = 0, False
         if cmd == "update" or (cmd == "auto" and (due or not links)):
             try:
                 links = download(conf, state)
+                fresh = True
             except RuntimeError as err:
                 state["download_error"] = str(err)
-                log("Скачать список не удалось (%s)%s" % (err, " — проверяю прежний." if links else "."))
+                log("Скачать списки не удалось (%s)%s" % (err, " — проверяю прежние." if links else "."))
                 rc = 1
-        if links:
-            try:
-                check(conf, state, links)
-            except RuntimeError as err:
-                state["check_error"] = str(err)
-                log("Проверка не прошла: %s" % err)
-                rc = 1
+        prev = read_json(alive_path, {}).get("items") or []
+        full_due = now - float(state.get("full_checked") or 0) >= float(conf["full_check_minutes"]) * 60 - 60
+        quick = cmd == "quick" or (cmd == "auto" and not fresh and not full_due)
+        try:
+            if quick and not prev:
+                pass                               # рабочих нет — ждём полной проверки (раз в час)
+            elif quick:
+                items = [it for it in prev if isinstance(it, dict) and isinstance(it.get("outbound"), dict)]
+                if items:
+                    check(conf, state, items, quick=True)
+            elif links:
+                items, skipped = build_items(conf, links)
+                if skipped:
+                    log("Пропущены: %d (%s)." % (sum(skipped.values()),
+                                                 ", ".join("%s — %d" % kv for kv in skipped.most_common(3))))
+                if items:
+                    check(conf, state, items)
+                else:
+                    raise RuntimeError("в списках нет подключений, которые можно проверить")
+        except RuntimeError as err:
+            state["check_error"] = str(err)
+            log("Проверка не прошла: %s" % err)
+            rc = 1
         write_atomic(state_path, json.dumps(state, ensure_ascii=False, indent=1))
-    return rc if links else 1
+    return rc if (links or prev) else 1
 
 
 if __name__ == "__main__":
@@ -1261,43 +1484,84 @@ white_setup() {   # программа, настройки и таймер бе�
   write_white_program
   mkdir -p "$(dirname "$WHITE_CONF")" "$WHITE_DATA"
   WHITE_URL="$WHITE_URL" REFRESH="$WHITE_REFRESH_HOURS" LABEL="$WHITE_LABEL" DATA="$WHITE_DATA" \
-  XDIR="${XUI_DIR}/bin" python3 - "$WHITE_CONF" <<'PY' || return 1
+  AUTO_MAX="$WHITE_AUTO_MAX" AUTO_NAME="$WHITE_AUTO_NAME" SUB_MAX="$WHITE_SUB_MAX" XDIR="${XUI_DIR}/bin" \
+  python3 - "$WHITE_CONF" <<'PY' || return 1
 import json, os, secrets, sys
 e = os.environ
 try:
     old = json.load(open(sys.argv[1], encoding="utf-8"))
 except (OSError, ValueError):
     old = {}
-# белые списки для мобильного интернета (ТОП-150) — с GitHub, а если он недоступен, с зеркал
-name = "Vless-Reality-White-Lists-Rus-Mobile.txt"
-repo = "igareck/vpn-configs-for-russia"
-mirrors = ["https://raw.githubusercontent.com/%s/main/%s" % (repo, name),
-           "https://raw.githack.com/%s/main/%s" % (repo, name),
-           "https://gitlab.com/%s/-/raw/main/%s" % (repo, name),
-           "https://codeberg.org/%s/raw/branch/main/%s" % (repo, name),
-           "https://cdn.jsdelivr.net/gh/%s@main/%s" % (repo, name)]
+# Публичные списки подключений для обхода белых списков (проверены в октябре 2026: все обновляются
+# каждый день или чаще). Источник — файл и его зеркала: берётся первое, которое ответило.
+def gh(owner, repo, path, extra=()):             # GitHub, свои зеркала автора, затем jsDelivr
+    return (["https://raw.githubusercontent.com/%s/%s/main/%s" % (owner, repo, path)] + list(extra)
+            + ["https://cdn.jsdelivr.net/gh/%s/%s@main/%s" % (owner, repo, path)])
+def igareck(name):
+    repo = "igareck/vpn-configs-for-russia"
+    return gh("igareck", "vpn-configs-for-russia", name, ["https://raw.githack.com/%s/main/%s" % (repo, name),
+                                                         "https://gitlab.com/%s/-/raw/main/%s" % (repo, name),
+                                                         "https://codeberg.org/%s/raw/branch/main/%s" % (repo, name)])
+def zieng2(name):
+    return gh("zieng2", "wl", name, ["https://codeberg.org/zieng2/wl/raw/branch/main/%s" % name,
+                                     "https://gitlab.com/zieng2/wl/raw/main/%s" % name])
+default = [
+    igareck("Vless-Reality-White-Lists-Rus-Mobile.txt"),     # мобильные белые списки, ТОП-150
+    igareck("WHITE-CIDR-RU-checked.txt"),                    # белые IP-сети, проверенные
+    igareck("WHITE-CIDR-RU-all.txt"),                        # белые IP-сети, все
+    igareck("WHITE-SNI-RU-all.txt"),                         # маскировка под разрешённые сайты (SNI)
+    zieng2("vless_universal.txt"), zieng2("vless_lite.txt"), # zieng2: обновляется каждый час
+    gh("whoahaow", "rjsxrd", "githubmirror/bypass/bypass-all.txt"),   # обход SNI/CIDR, только безопасные
+    gh("VOID-Anonymity", "V.O.I.D-VPN_Bypass", "url_work.txt"),     # проверенные по IP и SNI
+    gh("FLAT447", "v2ray-lists", "WHITE_FULL.txt"),
+    gh("AirLinkVPN1", "AirLinkVPN", "rkn_white_list"),
+    gh("Diversan313", "apex-parser", "subs/main/alive_bs.txt"),
+    gh("LimeHi", "LimeVPN", "whitelist.txt"),
+    gh("Maskkost93", "kizyak-vpn-4.0", "kizyakbeta6.txt"),
+    gh("OceaniaVPN", "StekloVPN", "configs/whitelist.txt"),
+    gh("VansFenix", "vpnparser", "white.txt"),
+    gh("VansFenix", "vpnparser", "configs.txt"),
+    gh("dequar", "deqwl", "deray.txt"),
+    gh("flaafix", "AetrisVPN-white-list-lite", "AetrisVPN.txt"),
+    gh("flaafix", "AetrisVPN", "AetrisVPN.txt"),
+    gh("gooseteam-hackers", "GooseVPN", "configs/balanced.txt"),
+    gh("gooseteam-hackers", "GooseVPN", "configs/plus.txt"),
+    gh("vladvarp", "Prometheus", "WhiteList/vless.txt"),
+    gh("MrEndi777709", "Endi-VPN", "mrendi-vpn-white-list.txt"),
+    # сборка all_subs: всё вышеперечисленное и ещё ~10 источников вне GitHub, обновляется каждую минуту
+    gh("solovyov-jenya2004", "all_subs", "final_sorted", ["https://final-sorted.solovyov-jenya2004.workers.dev/"]),
+]
 urls = e["WHITE_URL"].replace(",", " ").split()
 if urls and urls != ["default"]:
     sources, custom = [[u] for u in urls], True        # свои списки: каждый — отдельный источник
 elif not urls and old.get("custom") and old.get("sources"):
     sources, custom = old["sources"], True             # свои списки, указанные при прошлом запуске
 else:
-    sources, custom = [mirrors], False
+    sources, custom = default, False
 conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"]), "label": e["LABEL"],
         "data": e["DATA"], "xray_dir": e["XDIR"],
         "test_urls": ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"],
-        "timeout": 10, "workers": 32, "max_items": 300,
+        # проверка: сначала открывается ли сервер (3 с), затем настоящий запрос через подключение (8 с);
+        # все — раз в час (full_check_minutes), между ними — только рабочие
+        "timeout": 8, "tcp_timeout": 3, "workers": 64, "tcp_workers": 128, "batch": 300,
+        "max_items": 3000, "full_check_minutes": 60,
+        # в подписке — sub_max лучших рабочих с разных серверов, в отдельной подписке — до list_max
+        "sub_max": int(e["SUB_MAX"]), "list_max": max(150, int(e["SUB_MAX"])),
         # для фильтра подписки: адрес отдельной подписки (прежний), её название в приложении
         # и как часто приложению обновлять подписку (часы) — тогда нерабочие пропадают и с телефона
         "path": old.get("path") or "/" + secrets.token_hex(8) + "/",
-        "title": "🏳️ Белые списки", "update_hours": 1}
+        "title": "🏳️ Белые списки", "update_hours": 1,
+        # автоподбор на устройстве: до max лучших серверов в одном профиле — телефон сам проверяет
+        # их из своей сети при включении и каждые interval и ведёт трафик через самый быстрый
+        "auto": {"max": int(e["AUTO_MAX"]), "name": e["AUTO_NAME"], "interval": "2m",
+                 "url": "http://www.gstatic.com/generate_204"}}
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(conf, f, indent=1)
 PY
   chmod 600 "$WHITE_CONF"
   cat > "$WHITE_UNIT" <<UNIT
 [Unit]
-Description=VPN white lists: new list every ${WHITE_REFRESH_HOURS}h, every connection checked, only working ones in the subscription
+Description=VPN white lists: new lists every ${WHITE_REFRESH_HOURS}h, every connection checked, only working ones in the subscription
 After=network-online.target x-ui.service
 Wants=network-online.target
 
@@ -1305,7 +1569,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${py} ${WHITE_PY} ${WHITE_CONF} auto
 Nice=10
-TimeoutStartSec=20min
+TimeoutStartSec=40min
 UNIT
   cat > "$WHITE_TIMER" <<UNIT
 [Unit]
@@ -1327,15 +1591,20 @@ white_timer_on() {   # проверка по таймеру — каждые WHI
   systemctl restart vpn-white-lists.timer >/dev/null 2>&1
 }
 WHITE_TOTAL=0; WHITE_ALIVE=0; WHITE_ERR=""
-white_state() {   # итог последней проверки → WHITE_TOTAL (в списке), WHITE_ALIVE (в подписке), WHITE_ERR
+WHITE_WORKING=0; WHITE_SRC_OK=0; WHITE_SRC_ALL=0
+white_state() {   # итог последней проверки → WHITE_TOTAL (подключений во всех списках), WHITE_WORKING (рабочих),
+                  # WHITE_ALIVE (из них в подписке), WHITE_SRC_OK/WHITE_SRC_ALL (источников скачано/всего), WHITE_ERR
   local st
   st="$(python3 "$WHITE_PY" "$WHITE_CONF" status 2>/dev/null | python3 -c 'import json, sys
 d = json.load(sys.stdin)
 err = " ".join(str(d.get("check_error") or d.get("download_error") or "").split())
-print(int(d.get("total") or 0), int(d.get("in_subscription") or 0), err or "-")' 2>/dev/null || echo "0 0 -")"
-  read -r WHITE_TOTAL WHITE_ALIVE WHITE_ERR <<< "$st" || true
-  [[ "$WHITE_TOTAL" =~ ^[0-9]+$ ]] || WHITE_TOTAL=0
-  [[ "$WHITE_ALIVE" =~ ^[0-9]+$ ]] || WHITE_ALIVE=0
+print(int(d.get("total") or 0), int(d.get("alive_now") or 0), int(d.get("in_subscription") or 0),
+      int(d.get("sources_ok") or 0), int(d.get("sources_total") or 0), err or "-")' 2>/dev/null || echo "0 0 0 0 0 -")"
+  read -r WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL WHITE_ERR <<< "$st" || true
+  local v
+  for v in WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" '%s' 0
+  done
   if [ "${WHITE_ERR:--}" = "-" ]; then WHITE_ERR=""; fi
 }
 white_run_now() {   # скачать список сейчас и проверить каждое подключение (ход — на экран)
@@ -1358,7 +1627,9 @@ conf.pop("white", None)
 if os.environ["WHITE"] == "1":
     w = json.load(open(os.environ["WHITE_CONF"], encoding="utf-8"))
     conf["white"] = {"file": os.path.join(w["data"], "alive.json"), "path": w["path"],
-                     "title": w.get("title") or "Белые списки", "update_hours": int(w.get("update_hours") or 1)}
+                     "title": w.get("title") or "Белые списки", "update_hours": int(w.get("update_hours") or 1),
+                     "sub_max": int(w.get("sub_max") or 50), "list_max": int(w.get("list_max") or 150),
+                     "auto": w.get("auto") or {}}
 with open(sys.argv[1], "w") as f:
     json.dump(conf, f, indent=1)
 PY
@@ -1366,27 +1637,37 @@ PY
 white_path() {   # адрес отдельной подписки белых списков (путь на порту подписки)
   python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("path") or "")' "$WHITE_CONF" 2>/dev/null || true
 }
-white_in_sub() {   # white_in_sub https://127.0.0.1:порт/путь — «N M»: белых списков в JSON-подписке (Happ) и в обычной
+white_in_sub() {   # white_in_sub https://127.0.0.1:порт/путь — «N M A»: белых списков в JSON-подписке (Happ), в обычной и серверов в автоподборе
   local url="$1" nj nb
-  nj="$(curl -sk --noproxy '*' --max-time 20 -A 'Happ/3.0' "$url" 2>/dev/null | LABEL="$WHITE_LABEL" python3 -c 'import json, os, sys
+  nj="$(curl -sk --noproxy '*' --max-time 20 -A 'Happ/3.0' "$url" 2>/dev/null | LABEL="$WHITE_LABEL" AUTO="$WHITE_AUTO_NAME" python3 -c 'import json, os, sys
 d = json.load(sys.stdin)
-print(sum(1 for c in (d if isinstance(d, list) else [d]) if str(c.get("remarks") or "").startswith(os.environ["LABEL"])))' 2>/dev/null || true)"
+confs = d if isinstance(d, list) else [d]
+one = sum(1 for c in confs if str(c.get("remarks") or "").startswith(os.environ["LABEL"]) and c.get("remarks") != os.environ["AUTO"])
+auto = next((c for c in confs if c.get("remarks") == os.environ["AUTO"]), {})
+print(one, sum(1 for o in auto.get("outbounds") or [] if str(o.get("tag") or "").startswith("wl-")))' 2>/dev/null || true)"
   nb="$(curl -sk --noproxy '*' --max-time 20 -A 'Streisand/1.6' "$url" 2>/dev/null | python3 -c 'import base64, json, sys
 raw = "".join(sys.stdin.read().split())
 text = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
 alive = {x["link"] for x in json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []}
 print(sum(1 for line in text.splitlines() if line.strip() in alive))' "${WHITE_DATA}/alive.json" 2>/dev/null || true)"
-  echo "${nj:-0} ${nb:-0}"
+  read -r nj na <<< "${nj:-0 0}" || true
+  echo "${nj:-0} ${nb:-0} ${na:-0}"
 }
 white_summary() {   # итог для экрана и для файла с доступами
-  local src="igareck/vpn-configs-for-russia — Vless-Reality-White-Lists-Rus-Mobile.txt (GitHub и зеркала)"
+  local src="публичные списки для обхода белых списков: igareck (мобильный, CIDR, SNI), zieng2, rjsxrd, V.O.I.D, FLAT447, all_subs и другие"
   if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("custom") else 1)' "$WHITE_CONF" 2>/dev/null; then
     src="свои списки (WHITE_URL)"
   fi
-  echo "Источник: ${src}"
-  echo "Новый список — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется каждые ${WHITE_CHECK_MIN} мин настоящим запросом;"
-  echo "в подписке только рабочие: нерабочее пропадает сразу после проверки (приложение обновляет подписку раз в час)."
-  echo "Сейчас в подписке: ${WHITE_ALIVE} рабочих из ${WHITE_TOTAL}${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  if [ "$WHITE_SRC_ALL" -gt 0 ]; then src="${src} — скачано ${WHITE_SRC_OK} из ${WHITE_SRC_ALL}"; fi
+  echo "Источники: ${src}."
+  echo "Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется настоящим запросом: все — раз в час,"
+  echo "рабочие — каждые ${WHITE_CHECK_MIN} мин. Нерабочее пропадает из подписки сразу после проверки (приложение обновляет её раз в час)."
+  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} самых быстрых с разных серверов${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  if [ "$WHITE_AUTO_MAX" -gt 1 ]; then
+    echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): при включении"
+    echo "телефон сам проверяет до ${WHITE_AUTO_MAX} лучших серверов из своей сети, потом каждые 2 минуты, и ведёт трафик"
+    echo "через самый быстрый из работающих у него; перестал отвечать — переходит на другой."
+  fi
   if [ -n "${WHITE_URL_SUB:-}" ]; then echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"; fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
 }
@@ -1600,8 +1881,8 @@ if [ "$WHITE_ONLY" = "1" ]; then
   done
   compgen -G "${XUI_DIR}/bin/xray-linux-*" >/dev/null || die "Не найден Xray панели в ${XUI_DIR}/bin — проверять подключения нечем."
   white_setup || die "Не удалось записать настройки белых списков."
-  grn "    Новый список — каждые ${WHITE_REFRESH_HOURS} ч, проверка каждого подключения — каждые ${WHITE_CHECK_MIN} мин."
-  step "Скачиваю список и проверяю каждое подключение (до пары минут)..."
+  grn "    Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; проверка: все подключения — раз в час, рабочие — каждые ${WHITE_CHECK_MIN} мин."
+  step "Скачиваю списки и проверяю каждое подключение (несколько минут)..."
   white_run_now
   white_timer_on || ylw "    Таймер проверки не запустился: systemctl status vpn-white-lists.timer"
   step "Добавляю белые списки в подписку..."
@@ -1624,16 +1905,17 @@ print(m.group(1) if m else "")' 2>/dev/null || true)"
   if [ -z "$SUB_BASE" ]; then SUB_BASE="$(printf '%s' "$SUB_URL" | sed -nE 's#^(https?://[^/]+).*#\1#p')"; fi
   WHITE_URL_SUB=""; WP="$(white_path)"
   if [ -n "$SUB_BASE" ] && [ -n "$WP" ]; then WHITE_URL_SUB="${SUB_BASE}${WP}"; fi
-  NJ=0; NB=0
+  NJ=0; NB=0; NA=0
   if [ -n "$SUB_URL" ]; then
-    read -r NJ NB <<< "$(white_in_sub "${F_SCHEME}://127.0.0.1:${F_PORT}/${SUB_URL#*://*/}")" || true
+    read -r NJ NB NA <<< "$(white_in_sub "${F_SCHEME}://127.0.0.1:${F_PORT}/${SUB_URL#*://*/}")" || true
   fi
   if [ "${NJ:-0}" -gt 0 ] || [ "${NB:-0}" -gt 0 ]; then
-    grn "    ✓ В подписке: ${NJ} рабочих подключений для Happ / v2rayNG / v2rayN и ${NB} — для остальных приложений."
+    grn "    ✓ В подписке рабочих подключений: ${NJ} — для Happ / v2rayNG / v2rayN, ${NB} — для остальных приложений."
+    if [ "${NA:-0}" -gt 0 ]; then grn "    ✓ Автоподбор: профиль «${WHITE_AUTO_NAME}» — телефон сам выбирает лучший (серверов в профиле: ${NA})."; fi
   elif [ "$WHITE_ALIVE" -gt 0 ] && [ -n "$SUB_URL" ]; then
     ylw "    ✗ Рабочие подключения есть (${WHITE_ALIVE}), но в ответе подписки их не видно. Логи: journalctl -u vpn-sub-filter -e"
   elif [ "$WHITE_ALIVE" -eq 0 ]; then
-    ylw "    Рабочих подключений пока нет — появятся в подписке после следующей проверки (через ${WHITE_CHECK_MIN} мин)."
+    ylw "    Рабочих подключений пока нет — появятся в подписке после следующей полной проверки (раз в час)."
   fi
   echo
   ylw "============ БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА ============"
@@ -1641,8 +1923,12 @@ print(m.group(1) if m else "")' 2>/dev/null || true)"
   echo
   echo "Они уже в вашей подписке — в приложении достаточно обновить её${SUB_URL:+:}"
   if [ -n "$SUB_URL" ]; then grn "${SUB_URL}"; fi
-  echo "В приложении они в конце списка: «${WHITE_LABEL} 01 …». Включайте их, когда мобильный интернет"
+  echo "В приложении они в конце списка: «${WHITE_LABEL} …». Включайте их, когда мобильный интернет"
   echo "пускает только на «разрешённые» сайты и свой VPN не подключается."
+  if [ "${NA:-0}" -gt 0 ]; then
+    echo "Проще всего выбрать «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): телефон сам проверит лучшие белые"
+    echo "списки (${NA} шт.) из своей сети и поведёт трафик через самый быстрый из тех, что работают именно у него."
+  fi
   if [ -n "$WHITE_URL_SUB" ]; then
     echo "Отдельной подпиской (только белые списки — если удобнее держать их отдельной группой):"
     echo "  ${WHITE_URL_SUB}"
@@ -3453,12 +3739,12 @@ fi
 # дальше — по таймеру (новый список каждые WHITE_REFRESH_HOURS ч, проверка каждые WHITE_CHECK_MIN мин).
 WHITE_URL_SUB=""
 if [ "$WHITE_ON" = "1" ]; then
-  step "Белые списки для мобильного интернета: скачиваю список и проверяю каждое подключение..."
+  step "Белые списки для мобильного интернета: скачиваю списки и проверяю каждое подключение (несколько минут)..."
   if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
     white_run_now
     white_timer_on || ylw "    Таймер проверки не запустился: systemctl status vpn-white-lists.timer"
     WHITE_URL_SUB="${SUB_BASE}$(white_path)"
-    grn "    Новый список — каждые ${WHITE_REFRESH_HOURS} ч, проверка каждого подключения — каждые ${WHITE_CHECK_MIN} мин; в подписке только рабочие."
+    grn "    Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; проверка: все — раз в час, рабочие — каждые ${WHITE_CHECK_MIN} мин; в подписке только рабочие."
   elif [ "$WHITE_READY" = "1" ]; then
     ylw "    Фильтр подписки не работает (причина — выше) — белые списки в подписку не попадут."
     systemctl disable --now vpn-white-lists.timer >/dev/null 2>&1 || true
@@ -3559,11 +3845,13 @@ if [ "$CHECK_JSON" = "1" ]; then grn "    ✓ v2rayNG / v2rayN: конфиги �
 else ylw "    ✗ v2rayNG / v2rayN: конфиг не прошёл проверку"; tail -n 3 "$WORK/xtest.log" 2>/dev/null || true; fi
 if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
   if [ "$SSL_OK" = "1" ]; then LOCAL_SUB="https://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; else LOCAL_SUB="http://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; fi
-  read -r WJ WB <<< "$(white_in_sub "$LOCAL_SUB")" || true
+  WA=0
+  read -r WJ WB WA <<< "$(white_in_sub "$LOCAL_SUB")" || true
   if [ "${WJ:-0}" -gt 0 ] || [ "${WB:-0}" -gt 0 ]; then
-    grn "    ✓ Белые списки: в подписке ${WJ} рабочих подключений для Happ / v2rayNG / v2rayN и ${WB} — для остальных приложений"
+    grn "    ✓ Белые списки: в подписке рабочих подключений: ${WJ} — для Happ / v2rayNG / v2rayN, ${WB} — для остальных приложений"
+    if [ "${WA:-0}" -gt 0 ]; then grn "    ✓ Автоподбор: «${WHITE_AUTO_NAME}» — телефон сам выбирает лучший из своей сети (серверов в профиле: ${WA})"; fi
   elif [ "$WHITE_ALIVE" -eq 0 ]; then
-    ylw "    ✗ Белые списки: рабочих подключений пока нет — появятся после следующей проверки (через ${WHITE_CHECK_MIN} мин)"
+    ylw "    ✗ Белые списки: рабочих подключений пока нет — появятся после следующей полной проверки (раз в час)"
   else
     ylw "    ✗ Белые списки: рабочие подключения есть (${WHITE_ALIVE}), но в подписке их не видно (journalctl -u vpn-sub-filter -e)"
   fi
@@ -3695,7 +3983,11 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   if [ -n "$PEXIT_LIST" ]; then echo "  • через РФ к одному зарубежному серверу, каждый отдельно: ${PEXIT_LIST};"; fi
   if [ -n "$DIRECT_LIST" ]; then echo "  • напрямую к зарубежному серверу (телефон → сервер, без России): ${DIRECT_LIST}."; fi
   if [ -n "$WHITE_URL_SUB" ]; then
-    echo "  • «${WHITE_LABEL} 01…» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} рабочих);"
+    if [ "${WA:-0}" -gt 0 ]; then
+      echo "  • «${WHITE_AUTO_NAME}» — белые списки с автоподбором: телефон сам проверяет лучшие (${WA} шт.) из своей сети"
+      echo "    и ведёт трафик через самый быстрый из работающих у него (Happ, v2rayNG, v2rayN);"
+    fi
+    echo "  • «${WHITE_LABEL} …» — в конце списка: белые списки для мобильного интернета (${WHITE_ALIVE} самых быстрых из ${WHITE_WORKING} рабочих);"
     echo "    включайте их, когда оператор пускает только на «разрешённые» сайты и свой VPN не подключается."
   fi
 fi

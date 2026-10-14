@@ -28,8 +28,9 @@
 #     («🇳🇱 Нидерланды», «🇨🇭 Швейцария»…).
 #   • БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА — отдельный пункт меню «3». Когда мобильный оператор
 #     пускает только на «разрешённые» сайты, свой сервер недоступен. Выручают готовые подключения
-#     из публичных списков для обхода белых списков — 24 источника: igareck/vpn-configs-for-russia
-#     (мобильный, CIDR и SNI), zieng2/wl, whoahaow/rjsxrd, V.O.I.D, FLAT447, сборка all_subs и другие
+#     из публичных списков для обхода белых списков — 25 источников: igareck/vpn-configs-for-russia
+#     (мобильный, CIDR и SNI), zieng2/wl, whoahaow/rjsxrd, V.O.I.D, FLAT447, РосКомПозор (#РКП, с hub.mos.ru —
+#     открывается и при белых списках), сборка all_subs и другие
 #     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
 #     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
 #     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
@@ -44,6 +45,17 @@
 #     мобильной сети телефона и отправляет результат на сервер. Серверы, которые работают у телефона,
 #     встают в подписке первыми («🏳️ БС ✅ 01 · …») и попадают в автоподбор (результат действует
 #     48 часов); те, что у телефона не заработали, уходят в конец списка.
+#   • TUNNEL (Android, github.com/hussaroff/tunnel) И ДРУГИЕ ПРИЛОЖЕНИЯ НА MIHOMO (FlClash, Clash Meta,
+#     Clash Verge) получают полный профиль Mihomo: свои подключения и «🚀 Автовыбор», белые списки
+#     с автовыбором и «🔀 Автопереключение» — свой VPN, а когда он не отвечает (белые списки), сразу
+#     белые списки; российские сайты — напрямую. В итоге установки — ссылка «Открыть в Tunnel».
+#     Торренты в Tunnel по умолчанию идут мимо VPN (TUNNEL_TORRENT=0; 1 — через разрешённые серверы,
+#     2 — через любой). MIHOMO=0 — без профиля Mihomo.
+#   • FREETURN (Android, github.com/hackdiaz-dev/turn-proxy-android) — VPN через звонки VK: трафик идёт
+#     через серверы звонков VK, а их не блокируют и при белых списках. Скрипт ставит сервер FreeTurn
+#     (официальный установщик free-turn-proxy) с WireGuard и выдаёт ссылку freeturn:// для приложения.
+#     В режиме моста FreeTurn ставится на зарубежные серверы — выход в интернет там. FREETURN=0 — убрать;
+#     FREETURN_CALL=https://vk.ru/call/join/… — ссылку на звонок VK сразу вписать в ссылку для приложения.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -106,6 +118,11 @@ WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: к�
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
 WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-8}"             # белые списки: сколько самых быстрых серверов телефон сам пингует в профиле автоподбора (0 — без профиля)
 WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько самых быстрых по пингу рабочих — в подписке (отдельная ссылка — до 150)
+MIHOMO="${MIHOMO:-1}"                 # профиль Mihomo (Clash Meta) для Tunnel, FlClash, Clash Meta и Verge: 1 — включить, 0 — выключить
+TUNNEL_TORRENT="${TUNNEL_TORRENT:-0}" # Tunnel: торренты 0 — мимо VPN (на сервер не придут жалобы), 1 — только через разрешённые серверы, 2 — через любой
+FREETURN="${FREETURN:-1}"             # FreeTurn — VPN через звонки VK (работает и при белых списках): 1 — поставить, 0 — убрать
+FREETURN_PORT="${FREETURN_PORT:-56000}"   # FreeTurn: внешний UDP-порт сервера
+FREETURN_CALL="${FREETURN_CALL:-}"    # FreeTurn: ссылка на звонок VK (https://vk.ru/call/join/…) — сразу в ссылку для приложения
 XUI_VERSION="${XUI_VERSION:-}"        # версия 3X-UI (пусто = последняя доступная)
 EXIT_HOST="${EXIT_HOST:-}"            # мост: IP зарубежного сервера (пусто — спросить; none — без моста)
 EXIT_USER="${EXIT_USER:-}"            # мост: логин на зарубежном сервере (пусто — спросить, по умолчанию root)
@@ -184,6 +201,13 @@ esac
 { [[ "$WHITE_SUB_MAX" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$WHITE_SUB_MAX" -ge 5 ] && [ "$WHITE_SUB_MAX" -le 300 ]; } \
   || die "WHITE_SUB_MAX — сколько белых списков в подписке, от 5 до 300: ${WHITE_SUB_MAX}"
 WHITE_AUTO_NAME="${WHITE_LABEL} 🚀 Автовыбор"     # профиль автоподбора белых списков в приложении
+[ "$MIHOMO" = "0" ] || MIHOMO=1
+[[ "$TUNNEL_TORRENT" =~ ^[012]$ ]] || die "TUNNEL_TORRENT — 0 (торренты мимо VPN), 1 или 2: ${TUNNEL_TORRENT}"
+[ "$FREETURN" = "0" ] || FREETURN=1
+{ [[ "$FREETURN_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$FREETURN_PORT" -le 65535 ]; } || die "FREETURN_PORT указан неверно: ${FREETURN_PORT}"
+if [ -n "$FREETURN_CALL" ] && ! [[ "$FREETURN_CALL" =~ ^https://(m\.)?vk\.(ru|com)/call/join/[A-Za-z0-9_-]+$ ]]; then
+  die "FREETURN_CALL — ссылка на звонок VK вида https://vk.ru/call/join/…: ${FREETURN_CALL}"
+fi
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
 
 WORK="$(mktemp -d)"
@@ -321,6 +345,8 @@ write_sub_filter_program() {
 # быстрые — первыми), отдельной подпиской по своему адресу — до list_max. Для Happ, v2rayNG и v2rayN перед
 # ними — профиль автоподбора по пингу: приложение само пингует лучшие белые списки из сети этого
 # телефона и ведёт трафик через самый быстрый из тех, что работают именно у него.
+# Профиль Mihomo (Clash Meta — Tunnel, FlClash и др.): к профилю панели дописывает автовыбор своих
+# подключений, белые списки и «автопереключение» (свой VPN, а при белых списках — белые списки).
 # Проверка с телефона (страница …/test/): телефон в Termux скачивает отсюда Xray и список серверов,
 # проверяет их из мобильной сети и присылает отчёт; серверы, которые работают у телефона, идут
 # в подписке первыми (с ✅) и попадают в автоподбор.
@@ -649,6 +675,267 @@ def update_interval(headers):
     if not found:
         out.append(("Profile-Update-Interval", str(hours)))
     return out
+
+
+# ---------- профиль Mihomo (Clash Meta): Tunnel, FlClash, Clash Meta for Android и др. ----------
+# Панель отдаёт профиль Mihomo со своими подключениями и группой PROXY. Фильтр дописывает в него:
+# автовыбор своих подключений по пингу, белые списки (их автовыбор и полный список) и группу
+# «автопереключение»: работает свой VPN — через него, перестал (белые списки) — через белые списки.
+try:
+    import yaml
+    _YAML_LOAD = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    _YAML_DUMP = yaml.SafeDumper          # не C-версия: та пишет эмодзи как \U0001F3F3
+except ImportError:                       # нет python3-yaml — профиль Mihomo уходит как есть
+    yaml = None
+if yaml is not None:
+    class _MihomoDumper(_YAML_DUMP):
+        """строки, похожие на числа («08», «1e5»), — в кавычках: Mihomo читает YAML 1.2, и без
+        кавычек short-id «08» стал бы числом 8"""
+
+    def _str(dumper, value):
+        style = "'" if re.match(r"^[-+]?\.?[0-9]|^(true|false|yes|no|on|off|null|y|n|~)$", value, re.I) else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+    _MihomoDumper.add_representer(str, _str)
+    _YAML_DUMP = _MihomoDumper
+CLASH = CONF.get("clash") or {}
+MH_TEST = "http://www.gstatic.com/generate_204"
+MH_FP = {"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random"}
+MH_SS = {"aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+         "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"}
+MH_VMESS = {"auto", "none", "zero", "aes-128-gcm", "chacha20-poly1305"}
+# настройки XHTTP: Xray → Mihomo (те, что у Mihomo называются так же); серверные — пропускаем
+MH_XHTTP = {"path": "path", "host": "host", "mode": "mode", "headers": "headers", "noGRPCHeader": "no-grpc-header",
+            "xPaddingBytes": "x-padding-bytes", "xPaddingHeader": "x-padding-header", "xPaddingKey": "x-padding-key",
+            "xPaddingMethod": "x-padding-method", "xPaddingObfsMode": "x-padding-obfs-mode",
+            "xPaddingPlacement": "x-padding-placement", "scMaxEachPostBytes": "sc-max-each-post-bytes",
+            "scMinPostsIntervalMs": "sc-min-posts-interval-ms", "uplinkHTTPMethod": "uplink-http-method",
+            "uplinkDataPlacement": "uplink-data-placement", "uplinkDataKey": "uplink-data-key",
+            "uplinkChunkSize": "uplink-chunk-size", "seqPlacement": "seq-placement", "seqKey": "seq-key",
+            "sessionPlacement": "session-placement", "sessionKey": "session-key",
+            "sessionIDPlacement": "session-placement", "sessionIDKey": "session-key",
+            "sessionIDLength": "session-length", "sessionIDTable": "session-table"}
+MH_XHTTP_SERVER = {"noSSEHeader", "scMaxBufferedPosts", "scStreamUpServerSecs", "serverMaxHeaderBytes"}
+MH_XMUX = {"maxConcurrency": "max-concurrency", "maxConnections": "max-connections",
+           "cMaxReuseTimes": "c-max-reuse-times", "hMaxRequestTimes": "h-max-request-times",
+           "hMaxReusableSecs": "h-max-reusable-secs", "hKeepAlivePeriod": "h-keep-alive-period"}
+
+
+class NoMihomo(Exception):
+    """подключение нельзя (или небезопасно) перевести в профиль Mihomo — его там не будет"""
+
+
+def _host_header(d):
+    host = d.get("host") or (d.get("headers") or {}).get("Host") or ""
+    if isinstance(host, list):
+        host = host[0] if host else ""
+    return str(host)
+
+
+def mihomo_proxy(ob, name):
+    """выход Xray (как в alive.json) → прокси Mihomo; NoMihomo — такого Mihomo не умеет"""
+    proto = ob.get("protocol")
+    st = ob.get("streamSettings") or {}
+    s = ob.get("settings") or {}
+    net = str(st.get("network") or "tcp").lower()
+    sec = str(st.get("security") or "none").lower()
+    p = {"name": name}
+    if proto in ("vless", "vmess"):
+        v = (s.get("vnext") or [{}])[0]
+        u = (v.get("users") or [{}])[0]
+        p.update(type=proto, server=str(v["address"]), port=int(v["port"]), uuid=str(u["id"]), udp=True)
+        if proto == "vless":
+            if u.get("flow"):
+                if u["flow"] != "xtls-rprx-vision":
+                    raise NoMihomo("flow")
+                p["flow"] = u["flow"]
+            if (u.get("encryption") or "none") != "none":
+                raise NoMihomo("vless encryption")   # ключ Mihomo проверяет строже Xray — не рискуем профилем
+        else:
+            cipher = str(u.get("security") or "auto")
+            if cipher not in MH_VMESS:
+                raise NoMihomo("vmess cipher")
+            p.update(alterId=int(u.get("alterId") or 0), cipher=cipher)
+    elif proto == "trojan":
+        srv = (s.get("servers") or [{}])[0]
+        p.update(type="trojan", server=str(srv["address"]), port=int(srv["port"]), password=str(srv["password"]),
+                 udp=True)
+    elif proto == "shadowsocks":
+        srv = (s.get("servers") or [{}])[0]
+        if srv.get("method") not in MH_SS:
+            raise NoMihomo("ss cipher")
+        p.update(type="ss", server=str(srv["address"]), port=int(srv["port"]), cipher=srv["method"],
+                 password=str(srv["password"]), udp=True)
+        return p
+    elif proto == "hysteria":
+        tls = st.get("tlsSettings") or {}
+        if tls.get("pinnedPeerCertSha256"):
+            raise NoMihomo("pinned")
+        p.update(type="hysteria2", server=str(s["address"]), port=int(s["port"]),
+                 password=str((st.get("hysteriaSettings") or {}).get("auth") or ""))
+        if tls.get("serverName"):
+            p["sni"] = str(tls["serverName"])
+        if tls.get("alpn"):
+            p["alpn"] = [str(a) for a in tls["alpn"]]
+        if tls.get("allowInsecure"):
+            p["skip-cert-verify"] = True
+        return p
+    else:
+        raise NoMihomo("protocol")
+    # шифрование
+    if sec == "reality":
+        r = st.get("realitySettings") or {}
+        if proto != "vless" or not r.get("serverName") \
+                or not re.match(r"^[A-Za-z0-9_-]{43}$", str(r.get("publicKey") or "")) \
+                or not re.match(r"^[0-9a-fA-F]{0,16}$", str(r.get("shortId") or "")) or len(str(r.get("shortId") or "")) % 2:
+            raise NoMihomo("reality")
+        fp = str(r.get("fingerprint") or "chrome")
+        p.update(tls=True, servername=str(r["serverName"]), **{"client-fingerprint": fp if fp in MH_FP else "chrome"})
+        # ML-KEM, как у панели для своих подключений: без этого Mihomo не договорится с новыми серверами Reality
+        p["reality-opts"] = {"public-key": str(r["publicKey"]), "short-id": str(r.get("shortId") or ""),
+                             "support-x25519mlkem768": True}
+    elif sec == "tls":
+        t = st.get("tlsSettings") or {}
+        if t.get("pinnedPeerCertSha256") or t.get("verifyPeerCertByName"):
+            raise NoMihomo("pinned")
+        if proto == "trojan":
+            if t.get("serverName"):
+                p["sni"] = str(t["serverName"])
+        else:
+            p["tls"] = True
+            if t.get("serverName"):
+                p["servername"] = str(t["serverName"])
+        if t.get("alpn"):
+            p["alpn"] = [str(a) for a in t["alpn"]]
+        if t.get("fingerprint"):
+            fp = str(t["fingerprint"])
+            p["client-fingerprint"] = fp if fp in MH_FP else "chrome"
+        if t.get("allowInsecure"):
+            p["skip-cert-verify"] = True
+    elif sec == "none":
+        if proto in ("trojan", "vless"):
+            raise NoMihomo("plain")
+    else:
+        raise NoMihomo("security")
+    # транспорт
+    if net in ("tcp", "raw"):
+        if ((st.get("tcpSettings") or st.get("rawSettings") or {}).get("header") or {}).get("type") not in (None, "none"):
+            raise NoMihomo("tcp header")
+        p["network"] = "tcp"
+    elif net in ("ws", "httpupgrade"):
+        w = st.get("wsSettings" if net == "ws" else "httpupgradeSettings") or {}
+        path = str(w.get("path") or "/")
+        opts = {}
+        m = re.search(r"[?&]ed=(\d+)", path)
+        if m and net == "ws":             # ранние данные: ?ed=2048 в пути (как в Xray)
+            path = re.sub(r"[?&]ed=\d+", "", path) or "/"
+            opts.update({"max-early-data": int(m.group(1)), "early-data-header-name": "Sec-WebSocket-Protocol"})
+        opts["path"] = path
+        host = _host_header(w)
+        if host:
+            opts["headers"] = {"Host": host}
+        if net == "httpupgrade":
+            opts["v2ray-http-upgrade"] = True
+        p.update(network="ws", **{"ws-opts": opts})
+    elif net == "grpc":
+        g = st.get("grpcSettings") or {}
+        p.update(network="grpc", **{"grpc-opts": {"grpc-service-name": str(g.get("serviceName") or "")}})
+    elif net in ("xhttp", "splithttp"):
+        x = st.get("xhttpSettings") or st.get("splithttpSettings") or {}
+        extra = x.get("extra") if isinstance(x.get("extra"), dict) else {}
+        merged = dict(x, **extra)
+        merged.pop("extra", None)
+        opts = {}
+        for key, value in merged.items():
+            # 0 у Xray — «по умолчанию», а Mihomo такое значение отвергает
+            if key in MH_XHTTP_SERVER or value in (None, "", {}, [], 0, "0"):
+                continue
+            if key == "xmux" and isinstance(value, dict):
+                reuse = {MH_XMUX[k]: v for k, v in value.items() if k in MH_XMUX and v not in (None, "", 0, "0")}
+                if len(reuse) != len([k for k, v in value.items() if v not in (None, "", 0, "0")]):
+                    raise NoMihomo("xmux")
+                if reuse:
+                    opts["reuse-settings"] = reuse
+            elif key in MH_XHTTP:
+                opts[MH_XHTTP[key]] = value
+            else:                          # downloadSettings и прочее, чего Mihomo не знает
+                raise NoMihomo("xhttp " + key)
+        if opts.get("mode") == "auto":
+            del opts["mode"]
+        opts.setdefault("path", "/")
+        p.update(network="xhttp", **{"xhttp-opts": opts})
+    else:
+        raise NoMihomo("network")
+    return p
+
+
+def add_white_yaml(body, items, chosen=()):
+    """профиль Mihomo: свои подключения + автовыбор, белые списки, автопереключение; None — не профиль"""
+    if yaml is None:
+        return None
+    try:
+        data = yaml.load(body.decode("utf-8"), Loader=_YAML_LOAD)
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("proxies"), list):
+        return None
+    proxies = [p for p in data["proxies"] if isinstance(p, dict)]
+    groups = [g for g in data.get("proxy-groups") or [] if isinstance(g, dict)]
+    taken = {str(x.get("name")) for x in proxies + groups} | {"DIRECT", "REJECT", "PASS", "GLOBAL"}
+    own = [str(p.get("name")) for p in proxies if p.get("name")]
+    wl, names = [], {}
+    for it in items:
+        name = str(it["name"])
+        if name in taken:
+            continue
+        try:
+            wl.append(mihomo_proxy(it["outbound"], name))
+        except (NoMihomo, KeyError, TypeError, ValueError, IndexError, AttributeError):
+            continue
+        taken.add(name)
+        names[it.get("_key")] = name
+    auto = [names[it.get("_key")] for it in chosen if it.get("_key") in names]
+    own_auto = str(CLASH.get("auto_name") or "")
+    wl_auto = str((WHITE.get("auto") or {}).get("name") or "")
+    wl_list = str(WHITE.get("title") or "")
+    switch = str(CLASH.get("fallback_name") or "")
+    test = {"url": MH_TEST, "interval": 120, "tolerance": 50, "lazy": False}
+    new = []
+    if own_auto and own_auto not in taken and len(own) >= 2:
+        new.append(dict({"name": own_auto, "type": "url-test", "proxies": own}, **test))
+        taken.add(own_auto)
+    else:
+        own_auto = own[0] if own else ""
+    if wl_auto and wl_auto not in taken and len(auto) >= 2:
+        new.append(dict({"name": wl_auto, "type": "url-test", "proxies": auto}, **test))
+        taken.add(wl_auto)
+    else:
+        wl_auto = auto[0] if auto else ""
+    if wl and wl_list and wl_list not in taken:
+        new.append({"name": wl_list, "type": "select", "proxies": [p["name"] for p in wl]})
+        taken.add(wl_list)
+    else:
+        wl_list = ""
+    if switch and switch not in taken and own_auto and wl_auto:
+        # свой VPN, пока отвечает; перестал (белые списки) — белые списки; заработал снова — опять свой
+        new.insert(0, {"name": switch, "type": "fallback", "proxies": [own_auto, wl_auto], "url": MH_TEST,
+                       "interval": 60, "lazy": False})
+    else:
+        switch = ""
+    if not new and not wl:
+        return None
+    main = next((g for g in groups if g.get("type") == "select"), None)
+    if main is not None:
+        cur = [str(x) for x in main.get("proxies") or []]
+        tail = [x for x in cur if x in ("DIRECT", "REJECT")]
+        main["proxies"] = ([x for x in (switch, own_auto if own_auto in [g["name"] for g in new] else "") if x]
+                           + [x for x in cur if x not in tail]
+                           + [x for x in (wl_auto if wl_auto in [g["name"] for g in new] else "", wl_list) if x]
+                           + tail)
+    data["proxies"] = proxies + wl
+    data["proxy-groups"] = ([main] if main is not None else []) + new + [g for g in groups if g is not main]
+    return yaml.dump(data, Dumper=_YAML_DUMP, allow_unicode=True, sort_keys=False, default_flow_style=False,
+                     width=4096).encode("utf-8")
 
 
 # ---------- проверка с телефона ----------
@@ -1576,7 +1863,18 @@ class Handler(BaseHTTPRequestHandler):
             body = tune(body)
             ctype = next((v for k, v in headers if k.lower() == "content-type"), "")
             items = white_items() if WHITE else []
-            if items and "html" not in ctype.lower():
+            if "yaml" in ctype.lower() or body.lstrip()[:8] == b"proxies:":
+                new = None                # профиль Mihomo (Clash Meta): Tunnel, FlClash и др.
+                if items or CLASH:
+                    try:
+                        new = add_white_yaml(body, items, white_items("auto") if items else [])
+                    except Exception:     # что-то пошло не так — профиль уходит как есть
+                        new = None
+                if new is not None:
+                    body = new
+                    if items:
+                        headers = update_interval(headers)
+            elif items and "html" not in ctype.lower():
                 try:
                     new = add_white(body, items, white_items("auto"))
                 except Exception:         # что-то пошло не так — подписка уходит как есть
@@ -1791,7 +2089,11 @@ def link_key(link):
 
 def source_name(mirrors):
     path = urllib.parse.urlsplit(mirrors[0]).path.rstrip("/")
-    return path.rsplit("/", 1)[-1] or urllib.parse.urlsplit(mirrors[0]).hostname or mirrors[0]
+    name = path.rsplit("/", 1)[-1]
+    parts = path.strip("/").split("/")
+    if 0 < len(name) < 6 and len(parts) > 2:      # «wl» мало о чём говорит — с названием проекта: «roskompozor/wl»
+        name = parts[1] + "/" + name
+    return name or urllib.parse.urlsplit(mirrors[0]).hostname or mirrors[0]
 
 
 def fetch_source(mirrors):
@@ -2515,6 +2817,10 @@ default = [
     gh("gooseteam-hackers", "GooseVPN", "configs/plus.txt"),
     gh("vladvarp", "Prometheus", "WhiteList/vless.txt"),
     gh("MrEndi777709", "Endi-VPN", "mrendi-vpn-white-list.txt"),
+    # РосКомПозор (#РКП, t.me/RKP_channel): живой список — на hub.mos.ru (сайт открывается и при белых
+    # списках); точное имя группы там не проверено — пробуем оба, последней — копия с GitHub
+    ["https://hub.mos.ru/rkpchannel/roskompozor/raw/main/wl", "https://hub.mos.ru/rkp_channel/roskompozor/raw/main/wl"]
+    + gh("RKPchannel", "RKP_bypass_configs", "whitelist.txt"),
     # сборка all_subs: всё вышеперечисленное и ещё ~10 источников вне GitHub, обновляется каждую минуту
     gh("solovyov-jenya2004", "all_subs", "final_sorted", ["https://final-sorted.solovyov-jenya2004.workers.dev/"]),
 ]
@@ -2694,7 +3000,7 @@ print(sum(1 for line in text.splitlines() if line.strip() and key(line.strip()) 
   echo "${nj:-0} ${nb:-0} ${na:-0}"
 }
 white_summary() {   # итог для экрана и для файла с доступами
-  local src="публичные списки для обхода белых списков: igareck (мобильный, CIDR, SNI), zieng2, rjsxrd, V.O.I.D, FLAT447, all_subs и другие"
+  local src="публичные списки для обхода белых списков: igareck (мобильный, CIDR, SNI), zieng2, rjsxrd, V.O.I.D, FLAT447, РосКомПозор, all_subs и другие"
   if python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("custom") else 1)' "$WHITE_CONF" 2>/dev/null; then
     src="свои списки (WHITE_URL)"
   fi
@@ -2716,6 +3022,200 @@ white_summary() {   # итог для экрана и для файла с до�
     echo "  в подписке первыми (с ✅) и попадут в автоподбор."
   fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
+}
+
+# ---------- профиль Mihomo (Clash Meta): Tunnel, FlClash, Clash Meta и Verge ----------
+# Профиль отдаёт сама панель (подписка Clash/Mihomo), фильтр подписки дописывает в него автовыбор,
+# белые списки и автопереключение. Правила — без geo-баз: телефон при белых списках не скачал бы их,
+# и Mihomo отверг бы весь профиль. Российские сайты узнаются по домену.
+CLASH_DIRECT_DOMAINS="ru su xn--p1ai xn--p1acf xn--80adxhks xn--d1acj3b yandex.net yandex.com yastatic.net
+yandexcloud.net yandex.cloud vk.com vk.me vk.cc userapi.com vkuser.net vkuseraudio.net vkuservideo.net vk-cdn.net
+vk-portal.net mycdn.me mradx.net wbstatic.net ozonusercontent.com avito.st 2gis.com sberbank.com"
+clash_rules_yaml() {   # правила профиля Mihomo: локальные сети и российские сайты — напрямую, остальное — VPN
+  local c
+  echo "rules:"
+  for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 100.64.0.0/10 169.254.0.0/16; do
+    echo "  - IP-CIDR,${c},DIRECT,no-resolve"
+  done
+  echo "  - IP-CIDR6,fc00::/7,DIRECT,no-resolve"
+  echo "  - IP-CIDR6,fe80::/10,DIRECT,no-resolve"
+  for c in $CLASH_DIRECT_DOMAINS; do echo "  - DOMAIN-SUFFIX,${c},DIRECT"; done
+  echo "  - MATCH,PROXY"
+}
+clash_db_update() {   # clash_db_update 1|0 (фильтр подписки) — профиль Mihomo в настройках панели → «изменилось(0|1) путь»
+  DB="$DB" MIHOMO="$MIHOMO" FILTER="$1" SUB_BASE="${SUB_BASE:-}" RULES="$(clash_rules_yaml)" python3 - <<'PY'
+import os, secrets, sqlite3
+e = os.environ
+con = sqlite3.connect(e["DB"], timeout=30)
+cur = con.cursor()
+def get(key):
+    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return (row[0] or "").strip() if row else ""
+def norm(path):
+    path = path.strip().strip("/")
+    return "/" + path + "/" if path else ""
+path = norm(get("subClashPath"))
+if not path or path in (norm(get("subPath")), norm(get("subJsonPath"))):
+    path = "/" + secrets.token_hex(6) + "/"
+want = {"subClashEnable": "true" if e["MIHOMO"] == "1" else "false"}
+if e["MIHOMO"] == "1":
+    want.update({"subClashPath": path,
+                 # приложения на Mihomo получают профиль и по обычной ссылке подписки
+                 "subClashAutoDetect": "true", "subClashUserAgentRegex": r"(?i)(clash|mihomo|tunnel)",
+                 "subClashEnableRouting": "true", "subClashRules": e["RULES"].strip()})
+    if e["FILTER"] == "1" and e["SUB_BASE"]:
+        want["subClashURI"] = e["SUB_BASE"] + path      # ссылки в панели — на внешний адрес фильтра
+    elif get("subClashURI").rstrip("/").endswith(path.rstrip("/")):
+        want["subClashURI"] = ""
+changed = 0
+for key, value in want.items():
+    if get(key) == value.strip():
+        continue
+    changed = 1
+    cur.execute("UPDATE settings SET value=? WHERE key=?", (value, key))
+    if cur.rowcount == 0:
+        cur.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
+con.commit()
+con.close()
+print(changed, path)
+PY
+}
+sub_filter_conf_clash() {   # sub_filter_conf_clash 1|0 — фильтр дописывает в профиль Mihomo автовыбор, белые списки и автопереключение
+  CLASH="$1" AUTO_NAME="$AUTO_LABEL" python3 - "$SUB_FILTER_CONF" <<'PY'
+import json, os, sys
+conf = json.load(open(sys.argv[1], encoding="utf-8"))
+conf.pop("clash", None)
+if os.environ["CLASH"] == "1":
+    conf["clash"] = {"auto_name": os.environ["AUTO_NAME"], "fallback_name": "🔀 Автопереключение"}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(conf, f, indent=1)
+PY
+}
+mihomo_check() {   # mihomo_check URL — «подключений белых-списков автопереключение(1|0)» в профиле Mihomo; «- - -» — профиля нет
+  curl -sk --noproxy '*' --max-time 20 -A 'clash.meta' "$1" 2>/dev/null | LABEL="$WHITE_LABEL" python3 -c 'import os, sys
+try:
+    import yaml
+    d = yaml.safe_load(sys.stdin.read())
+    names = [str(p.get("name") or "") for p in d.get("proxies") or []]
+    fb = any(g.get("type") == "fallback" for g in d.get("proxy-groups") or [])
+    print(len(names), sum(1 for n in names if n.startswith(os.environ["LABEL"])), int(fb))
+except Exception:
+    print("- - -")' 2>/dev/null || echo "- - -"
+}
+urlencode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+tunnel_link() {   # tunnel_link URL-профиля — «Открыть в Tunnel» (Tunnel убирает x-tunnel-torrent, на сервер он не уходит)
+  printf 'tunnel://install-config?url=%s' "$(urlencode "${1}?x-tunnel-torrent=${TUNNEL_TORRENT}")"
+}
+ensure_yaml() {   # python3-yaml — фильтру для профиля Mihomo (без него профиль уходит без белых списков)
+  python3 -c 'import yaml' >/dev/null 2>&1 && return 0
+  DEBIAN_FRONTEND=noninteractive apt_retry install -y python3-yaml >/dev/null 2>&1 || true
+  python3 -c 'import yaml' >/dev/null 2>&1
+}
+mihomo_text() {   # для экрана и файла с доступами
+  echo "Tunnel (Android) — одна ссылка, откройте её на телефоне («Открыть в Tunnel»):"
+  echo "  ${TUNNEL_URL}"
+  echo "  Придёт полный профиль Mihomo: «🔀 Автопереключение» (свой VPN, а когда он не отвечает — белые"
+  echo "  списки), «${AUTO_LABEL}», каждое подключение и белые списки; российские сайты — напрямую."
+  case "$TUNNEL_TORRENT" in
+    0) echo "  Торренты идут мимо VPN (TUNNEL_TORRENT=1 — через разрешённые серверы, 2 — через любой)." ;;
+    1) echo "  Торренты — только через серверы с пометкой torrent/p2p в названии (TUNNEL_TORRENT=1)." ;;
+    2) echo "  Торренты разрешены через любой сервер (TUNNEL_TORRENT=2)." ;;
+  esac
+  echo "Профиль Mihomo (Clash Meta) — для Tunnel, FlClash, Clash Meta и Clash Verge:"
+  echo "  ${CLASH_URL}"
+}
+
+# ---------- FreeTurn: VPN через звонки VK (github.com/hackdiaz-dev/turn-proxy-android) ----------
+# Сервер ставит официальный установщик free-turn-proxy в режиме без вопросов (тот же, которым
+# пользуется приложение): FreeTurn (systemd) + WireGuard ft-wg0, клиент owner и ссылка freeturn://.
+FT_SCRIPT_URL="${FT_SCRIPT_URL:-https://raw.githubusercontent.com/hackdiaz-dev/free-turn-proxy/master/scripts/install.sh}"
+FT_DIR="/opt/free-turn-proxy"
+FT_APK="https://github.com/hackdiaz-dev/turn-proxy-android/releases/latest"
+FT_LINK=""; FT_ERR=""
+freeturn_fetch() {   # установщик FreeTurn → $WORK/ft-install.sh
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o "$WORK/ft-install.sh" "$FT_SCRIPT_URL" 2>/dev/null \
+    && grep -q 'PROTO_VERSION' "$WORK/ft-install.sh"
+}
+freeturn_rpc() {   # freeturn_rpc команда [--ключ=значение…] — ответ установщика FreeTurn (JSON, последняя строка)
+  bash "$WORK/ft-install.sh" "$@" 2>>"$WORK/ft.log" </dev/null | grep '^{' | tail -n 1 || true
+}
+freeturn_setup() {   # freeturn_setup [IP] — поставить или обновить FreeTurn с WireGuard → FT_LINK (не вышло — FT_ERR)
+  local js host=()
+  FT_LINK=""; FT_ERR=""
+  if [ -n "${1:-}" ]; then host=(--host="$1"); fi   # без IP установщик узнает его сам
+  if ! freeturn_fetch; then FT_ERR="не удалось скачать установщик FreeTurn (${FT_SCRIPT_URL})"; return 1; fi
+  js="$(freeturn_rpc apply --method=systemd --backend=new --listen-port="$FREETURN_PORT" --mode=udp \
+        --obf-profile=rtpopus3 "${host[@]}")"
+  read -r FT_LINK FT_ERR < <(CALL="$FREETURN_CALL" python3 -c 'import base64, json, os, sys
+try:
+    d = json.loads(sys.argv[1] or "{}")
+except ValueError:
+    print("- установщик FreeTurn ответил непонятно"); raise SystemExit
+if d.get("result") != "ok":
+    print("-", " ".join(str(d.get("msg") or d.get("code") or "ошибка установки").split())[:200]); raise SystemExit
+link = str(((d.get("data") or {}).get("owner") or {}).get("link") or "")
+if not link.startswith("freeturn://"):
+    print("- в ответе установщика нет ссылки"); raise SystemExit
+call = os.environ.get("CALL") or ""
+if call:   # ссылка на звонок — прямо в ссылку для приложения (поле vk, как у самого приложения)
+    raw = link[len("freeturn://"):]
+    j = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    j["vk"] = call
+    link = "freeturn://" + base64.urlsafe_b64encode(json.dumps(j, ensure_ascii=False, separators=(",", ":"))
+                                                    .encode("utf-8")).decode("ascii").rstrip("=")
+print(link, "-")' "$js" 2>/dev/null || echo "- не удалось разобрать ответ установщика FreeTurn")
+  if [ "${FT_LINK:--}" = "-" ]; then FT_LINK=""; fi
+  if [ "${FT_ERR:--}" = "-" ]; then FT_ERR=""; fi
+  [ -n "$FT_LINK" ]
+}
+freeturn_remove() {   # FREETURN=0: снести FreeTurn и его WireGuard (чужой WireGuard установщик не трогает)
+  [ -f "$FT_DIR/install.conf" ] || return 1
+  freeturn_fetch || return 1
+  freeturn_rpc uninstall --target=all --purge >/dev/null
+  return 0
+}
+freeturn_exit_links() {   # freeturn_exit_links файл — «название|ссылка» FreeTurn выходов моста; «!название|причина» — где не встал
+  python3 -c 'import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+try:
+    d = json.loads(text)
+    rows = d.get("exits", []) if isinstance(d, dict) else []
+except ValueError:                        # exits.jsonl — по подключению в строке
+    rows = []
+    for line in text.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+for p in rows:
+    if not isinstance(p, dict):
+        continue
+    if str(p.get("freeturn") or "").startswith("freeturn://"):
+        print("%s|%s|%s" % (p.get("cc") or "-", p.get("host") or "", p["freeturn"]))
+    elif p.get("freeturn_err"):
+        print("!%s|%s|%s" % (p.get("cc") or "-", p.get("host") or "", " ".join(str(p["freeturn_err"]).split())))' "$1" 2>/dev/null \
+  | while IFS='|' read -r cc host rest; do
+      mark=""; case "$cc" in !*) mark="!"; cc="${cc#!}" ;; esac
+      if [ "$cc" != "-" ]; then printf '%s%s %s|%s\n' "$mark" "$(cc_title "$cc")" "$host" "$rest"
+      else printf '%s%s|%s\n' "$mark" "$host" "$rest"; fi
+    done
+}
+freeturn_text() {   # freeturn_text «название|ссылка» … — как подключиться (для экрана и файла с доступами)
+  local l t
+  echo "1) Установите приложение FreeTurn (Android 7+): ${FT_APK}"
+  if [ "$#" -gt 1 ]; then
+    echo "2) В приложении «+» → вставьте ссылку; у каждого сервера своя (в них ключи — никому не пересылайте):"
+  else
+    echo "2) В приложении «+» → вставьте ссылку (в ней ключи — никому не пересылайте):"
+  fi
+  for l in "$@"; do t="${l%%|*}"; echo "   ${t:+${t}: }${l#*|}"; done
+  if [ -z "$FREETURN_CALL" ]; then
+    echo "3) Создайте звонок в VK (Звонки → «Создать звонок»), скопируйте ссылку https://vk.ru/call/join/…"
+    echo "   и вставьте её в приложение. Звонок не завершайте: через него идёт трафик."
+  else
+    echo "3) Ссылка на звонок VK уже в ней (FREETURN_CALL). Звонок не завершайте: через него идёт трафик."
+  fi
+  echo "4) Подключитесь: трафик идёт через серверы звонков VK — их не блокируют и при белых списках."
 }
 
 # ---------- режим: один сервер или мост (этот сервер в России → зарубежные серверы) ----------
@@ -2810,6 +3310,7 @@ if [ "$WHITE_LISTS" = "1" ] || { [ -z "$WHITE_LISTS" ] && [ -f "$WHITE_CONF" ]; 
 
 if [ "$VPN_ROLE" = "exit" ]; then TOTAL=7; elif [ "$BRIDGE" = "1" ]; then TOTAL=$((11 + EXIT_DIRECT)); else TOTAL=10; fi
 TOTAL=$((TOTAL + WHITE_ON))
+if [ "$FREETURN" = "1" ] && [ "$BRIDGE" != "1" ]; then TOTAL=$((TOTAL + 1)); fi   # FreeTurn (при мосте — на выходах)
 STEP=0
 step() { STEP=$((STEP + 1)); grn "[${STEP}/${TOTAL}] $*"; }
 
@@ -2921,6 +3422,7 @@ if [ "$WHITE_ONLY" = "1" ] && ! { [ -f "$SUB_FILTER_UNIT" ] && [ -s "$SUB_FILTER
 fi
 if [ "$WHITE_ONLY" = "1" ]; then
   TOTAL=3
+  if [ "$FREETURN" = "1" ] && [ -z "$SAVED_EXITS" ]; then TOTAL=4; fi   # FreeTurn (при мосте он на зарубежных серверах)
   step "Ставлю загрузку и проверку белых списков..."
   for b in python3 curl; do
     command -v "$b" >/dev/null 2>&1 || die "Не найден ${b}: запустите скрипт и выберите пункт 1 или 2 (полная настройка)."
@@ -2940,8 +3442,16 @@ row = sqlite3.connect(os.environ["DB"], timeout=30).execute("SELECT value FROM s
 m = re.match(r"(https?://[^/]+)", (row[0] or "") if row else "")
 print(m.group(1) if m else "")' 2>/dev/null || true)"
   if [ -z "$SUB_BASE" ]; then SUB_BASE="$(printf '%s' "$SUB_URL" | sed -nE 's#^(https?://[^/]+).*#\1#p')"; fi
+  # профиль Mihomo (Tunnel, FlClash): подписку Clash/Mihomo отдаёт панель, фильтр дописывает белые списки
+  if [ "$MIHOMO" = "1" ] && ! ensure_yaml; then ylw "    Нет python3-yaml — профиль Mihomo будет без белых списков."; fi
+  read -r CLASH_CHANGED CLASH_PATH < <(clash_db_update 1 2>/dev/null || echo "0 -")
   sub_filter_conf_white 1 || die "Не удалось записать настройки фильтра подписки."
+  sub_filter_conf_clash "$MIHOMO" || die "Не удалось записать настройки фильтра подписки."
   systemctl restart vpn-sub-filter >/dev/null 2>&1 || die "Фильтр подписки не перезапустился. Логи: journalctl -u vpn-sub-filter -e"
+  if [ "${CLASH_CHANGED:-0}" = "1" ]; then   # новые настройки подписки панель берёт при запуске
+    if [ "$MIHOMO" = "1" ]; then grn "    Профиль Mihomo для Tunnel включён в панели (панель перезапускается — пара секунд)."; fi
+    systemctl restart x-ui >/dev/null 2>&1 || ylw "    Панель не перезапустилась: systemctl status x-ui"
+  fi
   read -r F_PORT F_SCHEME < <(python3 -c 'import json, sys
 c = json.load(open(sys.argv[1]))
 print(int(c["port"]), "https" if c.get("cert") else "http")' "$SUB_FILTER_CONF" 2>/dev/null || echo "$SUB_PORT http")
@@ -2971,6 +3481,36 @@ print(int(c["port"]), "https" if c.get("cert") else "http")' "$SUB_FILTER_CONF" 
       ylw "    ✗ Страница проверки с телефона не отвечает. Логи: journalctl -u vpn-sub-filter -e"
     fi
   fi
+  SUB_ID="${SUB_URL##*/}"; CLASH_URL=""; TUNNEL_URL=""
+  if [ "$MIHOMO" = "1" ] && [ "${CLASH_PATH:--}" != "-" ] && [ -n "$SUB_BASE" ] && [ -n "$SUB_ID" ]; then
+    read -r MP MW MF <<< "$(mihomo_check "${F_SCHEME}://127.0.0.1:${F_PORT}${CLASH_PATH}${SUB_ID}")" || true
+    if [ "${MP:--}" != "-" ] && [ "${MP:-0}" -gt 0 ]; then
+      CLASH_URL="${SUB_BASE}${CLASH_PATH}${SUB_ID}"; TUNNEL_URL="$(tunnel_link "$CLASH_URL")"
+      grn "    ✓ Tunnel / Mihomo: профиль (подключений: ${MP}$([ "${MW:-0}" -gt 0 ] && echo ", из них белых списков: ${MW}")$([ "${MF:-0}" = 1 ] && echo ", автопереключение VPN → белые списки"))."
+    else
+      ylw "    ✗ Профиль Mihomo не отвечает. Логи: journalctl -u x-ui -e"
+    fi
+  fi
+  # FreeTurn — VPN через звонки VK: на одиночном сервере — здесь; при мосте — на зарубежных серверах
+  FT_LINKS=()
+  if [ -n "$SAVED_EXITS" ]; then
+    if [ "$FREETURN" = "1" ] && [ -f "$BRIDGE_FILE" ]; then
+      while IFS= read -r ft_line; do
+        case "$ft_line" in !*) ;; *) FT_LINKS+=("$ft_line") ;; esac
+      done < <(freeturn_exit_links "$BRIDGE_FILE")
+    fi
+  elif [ "$FREETURN" = "1" ]; then
+    step "FreeTurn — VPN через звонки VK (работает и при белых списках): ставлю сервер..."
+    if freeturn_setup ""; then
+      FT_LINKS+=("|${FT_LINK}")
+      grn "    FreeTurn работает: UDP-порт ${FREETURN_PORT}, WireGuard внутри сервера. Ссылка для приложения — ниже."
+    else
+      ylw "    FreeTurn не установился: ${FT_ERR:-причина неизвестна}."
+      tail -n 3 "$WORK/ft.log" 2>/dev/null | sed 's/^/    │ /' || true
+    fi
+  elif freeturn_remove; then
+    grn "    FreeTurn убран (FREETURN=0)."
+  fi
   echo
   ylw "============ БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА ============"
   white_summary
@@ -2987,17 +3527,39 @@ print(int(c["port"]), "https" if c.get("cert") else "http")' "$SUB_FILTER_CONF" 
     echo "Отдельной подпиской (только белые списки — если удобнее держать их отдельной группой):"
     echo "  ${WHITE_URL_SUB}"
   fi
-  if [ -f "$PROFILE" ]; then   # в файле с доступами раздел про белые списки — заново
+  if [ -n "$TUNNEL_URL" ]; then
+    echo
+    ylw "================ TUNNEL И ДРУГИЕ ПРИЛОЖЕНИЯ НА MIHOMO ================"
+    mihomo_text
+  fi
+  if [ "${#FT_LINKS[@]}" -gt 0 ]; then
+    if [ -n "$SAVED_EXITS" ]; then FT_WHERE="на зарубежных серверах моста"; else FT_WHERE="на этом сервере"; fi
+    echo
+    ylw "======== FREETURN — VPN ЧЕРЕЗ ЗВОНКИ VK (работает и при белых списках) ========"
+    freeturn_text "${FT_LINKS[@]}"
+    echo "Сервер FreeTurn — ${FT_WHERE}; там же управление: freeturn (ещё клиент: freeturn client add имя)."
+  elif [ "$FREETURN" = "1" ] && [ -n "$SAVED_EXITS" ]; then
+    echo
+    ylw "FreeTurn (VPN через звонки VK) при мосте ставится на зарубежные серверы — запустите полную"
+    ylw "настройку моста (команда с EXIT_HOST=…), и ссылки для приложения FreeTurn появятся в итоге."
+  fi
+  if [ -f "$PROFILE" ]; then   # в файле с доступами разделы про белые списки, Tunnel и FreeTurn — заново
     python3 - "$PROFILE" <<'PY' || true
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
-start = text.find("=== Белые списки")
-if start >= 0:
-    end = text.find("\n=== ", start)
-    text = text[:start] + (text[end + 1:] if end >= 0 else "")
+for head in ("=== Белые списки", "=== Tunnel", "=== FreeTurn"):
+    start = text.find(head)
+    if start >= 0:
+        end = text.find("\n=== ", start)
+        text = text[:start] + (text[end + 1:] if end >= 0 else "")
 open(sys.argv[1], "w", encoding="utf-8").write(text.rstrip("\n") + "\n")
 PY
-    { echo; echo "=== Белые списки для мобильного интернета ==="; white_summary; } >> "$PROFILE"
+    { echo; echo "=== Белые списки для мобильного интернета ==="; white_summary
+      if [ -n "$TUNNEL_URL" ]; then echo; echo "=== Tunnel и приложения на Mihomo (Clash Meta) ==="; mihomo_text; fi
+      if [ "${#FT_LINKS[@]}" -gt 0 ]; then
+        echo; echo "=== FreeTurn — VPN через звонки VK ==="; freeturn_text "${FT_LINKS[@]}"
+        echo "Сервер FreeTurn — ${FT_WHERE}; там же управление: freeturn (ещё клиент: freeturn client add имя)."
+      fi; } >> "$PROFILE"
     chmod 600 "$PROFILE"
     echo
     ylw "Всё сохранено на сервере: ${PROFILE}"
@@ -3008,7 +3570,7 @@ fi
 # ============================================================================
 step "Устанавливаю зависимости и ускоряю сеть..."
 export DEBIAN_FRONTEND=noninteractive
-PKGS=(curl openssl qrencode python3 socat cron ca-certificates kmod)
+PKGS=(curl openssl qrencode python3 python3-yaml socat cron ca-certificates kmod)
 if [ "$BRIDGE" = "1" ]; then PKGS+=(openssh-client sshpass); fi
 apt_retry update -y || die "Не удалось обновить список пакетов (apt-get update)."
 apt_retry install -y "${PKGS[@]}" || die "Не удалось установить пакеты: ${PKGS[*]}"
@@ -3134,8 +3696,9 @@ setup_exit() {
   grep -q 'VPN_ROLE' "$self" || die "По адресу ${SCRIPT_URL} лежит старая версия скрипта — загрузите новую в репозиторий."
   exit_ssh "cat > install-vpn-all.sh && chmod 700 install-vpn-all.sh" < "$self" \
     || die "Не удалось передать скрипт на ${EXIT_HOST}."
-  printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q XHTTP_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q bash install-vpn-all.sh' \
-    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$EXIT_XHTTP_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER"
+  printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q XHTTP_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q FREETURN=%q FREETURN_PORT=%q FREETURN_CALL=%q bash install-vpn-all.sh' \
+    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$EXIT_XHTTP_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER" \
+    "$FREETURN" "$FREETURN_PORT" "$FREETURN_CALL"
   rm -f "$EXIT_OUT"
   if ! exit_input | exit_ssh "$cmd" 2>&1 | exit_filter; then
     die "Настройка зарубежного сервера не удалась (подробности — выше)."
@@ -4378,6 +4941,20 @@ if [ "$VPN_ROLE" = "exit" ]; then   # зарубежный сервер мост
   else ylw "    Скорость измерить не удалось."; fi
   EXIT_CC="$(ip_country "$SERVER_IP")"   # страна по IP — российский сервер подпишет ей подключение
   if [ -n "$EXIT_CC" ]; then grn "    Страна сервера по IP: $(cc_title "$EXIT_CC")"; fi
+  # FreeTurn (VPN через звонки VK): при мосте он здесь — выход в интернет у этого сервера
+  EXIT_FT=""; EXIT_FT_ERR=""
+  if [ "$FREETURN" = "1" ]; then
+    step "FreeTurn — VPN через звонки VK: ставлю сервер..."
+    if freeturn_setup "$SERVER_IP"; then
+      EXIT_FT="$FT_LINK"
+      grn "    FreeTurn работает: UDP-порт ${FREETURN_PORT}, WireGuard внутри сервера."
+    else
+      EXIT_FT_ERR="${FT_ERR:-причина неизвестна}"
+      ylw "    FreeTurn не установился: ${EXIT_FT_ERR}"
+    fi
+  elif freeturn_remove; then
+    grn "    FreeTurn убран (FREETURN=0)."
+  fi
   umask 077
   cat > "$PROFILE" <<TXT
 === Этот сервер — выход моста ===
@@ -4397,11 +4974,16 @@ TXT
   PUBLIC_KEY="$PUBLIC_KEY" SHORT_ID="$SHORT_ID" NET_SPEED="$EXIT_NET_SPEED" XHTTP_OK="$XHTTP_OK" \
   XHTTP_PORT="$XHTTP_PORT" XHTTP_PBK="$XHTTP_PBK" XHTTP_SID="$XHTTP_SID" XHTTP_SNI="$XHTTP_SNI" \
   XHTTP_PATH="$XHTTP_PATH" EXIT_CC="$EXIT_CC" PANEL_LOCAL_PORT="$([ "$SERVER_FILTER" = "1" ] && echo "$PANEL_LOCAL_PORT")" \
-  PANEL_PATH="/${WEBPATH}/" NODE_TOKEN="$NODE_TOKEN" INB_TAG="$INB_TAG" BRIDGE_EMAIL="$CLIENT_EMAIL" python3 -c 'import json, os
+  PANEL_PATH="/${WEBPATH}/" NODE_TOKEN="$NODE_TOKEN" INB_TAG="$INB_TAG" BRIDGE_EMAIL="$CLIENT_EMAIL" \
+  FT="$EXIT_FT" FT_ERR="$EXIT_FT_ERR" python3 -c 'import json, os
 e = os.environ
 p = {"host": e["SERVER_IP"], "port": int(e["VPN_PORT"]), "id": e["UUID"],
      "flow": e["CLIENT_FLOW"], "sni": e["SNI"], "pbk": e["PUBLIC_KEY"], "sid": e["SHORT_ID"], "fp": "chrome",
      "speed": e["NET_SPEED"]}
+if e["FT"]:
+    p["freeturn"] = e["FT"]          # ссылка для приложения FreeTurn (VPN через звонки VK) на этот сервер
+elif e["FT_ERR"]:
+    p["freeturn_err"] = e["FT_ERR"]
 if e["EXIT_CC"]:
     p["cc"] = e["EXIT_CC"]
 if e["PANEL_LOCAL_PORT"] and e["NODE_TOKEN"]:
@@ -4654,6 +5236,7 @@ print(json.dumps({"port": int(e["PORT"]), "upstream": int(e["UP"]), "cert": e["C
                  indent=1))
 PY
   sub_filter_conf_white "$WHITE_READY" || return 1   # белые списки: файл с рабочими и отдельный адрес
+  sub_filter_conf_clash "$MIHOMO" || return 1         # профиль Mihomo: автовыбор, белые списки, автопереключение
   chmod 600 "$SUB_FILTER_CONF"
   cat > "$SUB_FILTER_UNIT" <<UNIT
 [Unit]
@@ -4697,7 +5280,7 @@ fi
 if [ "$SSL_OK" = "1" ]; then SUB_BASE="https://${ADDR}:${SUB_PORT}"; else SUB_BASE="http://${ADDR}:${SUB_PORT}"; fi
 write_sub_settings() {   # write_sub_settings 1|0 — подписку отдаёт фильтр (а панель — только ему) или сама панель
   DB="$DB" ROUTING="$ROUTING" SUB_PORT="$SUB_PORT" TITLE="$LABEL" FILTER="$1" INTERNAL="$SUB_INTERNAL_PORT" \
-  SUB_BASE="$SUB_BASE" python3 - > "$WORK/paths" <<'PY'
+  SUB_BASE="$SUB_BASE" python3 - > "$WORK/paths" <<'PY' || return 1
 import json, os, secrets, sqlite3
 con = sqlite3.connect(os.environ["DB"], timeout=30)
 cur = con.cursor()
@@ -4757,9 +5340,12 @@ con.commit()
 con.close()
 print(sub_path, json_path)
 PY
+  # профиль Mihomo (Tunnel, FlClash, Clash Meta): включить или выключить в панели
+  clash_db_update "$1" > "$WORK/clash" 2>/dev/null || printf '0 -\n' > "$WORK/clash"
 }
 write_sub_settings "$FILTER" || { systemctl start x-ui || true; die "Не удалось записать настройки подписки в базу панели."; }
 read -r SUB_PATH JSON_PATH < "$WORK/paths"
+read -r _ CLASH_PATH < "$WORK/clash" || CLASH_PATH="-"
 systemctl start x-ui
 wait_api || die "Панель не запустилась после настройки подписки. Логи: journalctl -u x-ui -e"
 FILTER_TUNE=0   # 1 — фильтр дописывает «Автовыбору» тонкие настройки
@@ -4808,9 +5394,38 @@ if [ "$WHITE_ON" = "1" ]; then
 fi
 
 # ============================================================================
+# FreeTurn — VPN через звонки VK (приложение FreeTurn для Android). При мосте он стоит на зарубежных
+# серверах (там выход в интернет), здесь — только на одиночном сервере.
+FT_LINKS=()        # «название|ссылка freeturn://»
+if [ "$FREETURN" = "1" ] && [ "$BRIDGE" != "1" ]; then
+  step "FreeTurn — VPN через звонки VK (работает и при белых списках): ставлю сервер..."
+  if freeturn_setup "$SERVER_IP"; then
+    FT_LINKS+=("|${FT_LINK}")
+    grn "    FreeTurn работает: UDP-порт ${FREETURN_PORT}, WireGuard внутри сервера. Ссылка для приложения — в итоге."
+  else
+    ylw "    FreeTurn не установился: ${FT_ERR:-причина неизвестна}."
+    tail -n 3 "$WORK/ft.log" 2>/dev/null | sed 's/^/    │ /' || true
+  fi
+elif [ "$FREETURN" = "0" ] && freeturn_remove; then
+  grn "    FreeTurn убран (FREETURN=0)."
+elif [ "$FREETURN" = "1" ] && [ -s "$WORK/exits.jsonl" ]; then   # мост: FreeTurn — на зарубежных серверах
+  while IFS= read -r ft_line; do
+    case "$ft_line" in
+      !*) ft_line="${ft_line#!}"; ylw "    FreeTurn на ${ft_line%%|*} не установился: ${ft_line#*|}" ;;
+      *) FT_LINKS+=("$ft_line") ;;
+    esac
+  done < <(freeturn_exit_links "$WORK/exits.jsonl")
+fi
+
+# ============================================================================
 if [ "$BRIDGE" = "1" ]; then step "Проверяю подписку, фильтры и мост..."; else step "Проверяю подписку и фильтры..."; fi
 SUB_URL="${SUB_BASE}${SUB_PATH}${SUB_ID}"
 JSON_URL="${SUB_BASE}${JSON_PATH}${SUB_ID}"
+CLASH_URL=""; TUNNEL_URL=""
+if [ "$MIHOMO" = "1" ] && [ "${CLASH_PATH:--}" != "-" ]; then
+  CLASH_URL="${SUB_BASE}${CLASH_PATH}${SUB_ID}"
+  TUNNEL_URL="$(tunnel_link "$CLASH_URL")"
+fi
 fetch_local() {   # fetch_local USER-AGENT /путь  ->  $WORK/h (заголовки), $WORK/b (тело)
   local _ target=("http://127.0.0.1:${SUB_PORT}$2")
   [ "$SSL_OK" = "1" ] && target=("https://127.0.0.1:${SUB_PORT}$2")
@@ -4914,6 +5529,15 @@ if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
     grn "    ✓ Проверка с телефона: страница работает (серверов для проверки: ${PN}$([ "${PX:-0}" = 1 ] && echo ", Xray для Android — на сервере"))"
   else
     ylw "    ✗ Проверка с телефона: страница не отвечает (journalctl -u vpn-sub-filter -e)"
+  fi
+fi
+if [ -n "$CLASH_URL" ]; then
+  if [ "$SSL_OK" = "1" ]; then LOCAL_CLASH="https://127.0.0.1:${SUB_PORT}${CLASH_PATH}${SUB_ID}"; else LOCAL_CLASH="http://127.0.0.1:${SUB_PORT}${CLASH_PATH}${SUB_ID}"; fi
+  read -r MP MW MF <<< "$(mihomo_check "$LOCAL_CLASH")" || true
+  if [ "${MP:--}" != "-" ] && [ "${MP:-0}" -gt 0 ]; then
+    grn "    ✓ Tunnel / Mihomo: профиль (подключений: ${MP}$([ "${MW:-0}" -gt 0 ] && echo ", из них белых списков: ${MW}")$([ "${MF:-0}" = 1 ] && echo ", автопереключение VPN → белые списки"))"
+  else
+    ylw "    ✗ Tunnel / Mihomo: профиль не отвечает (journalctl -u x-ui -e)"; CLASH_URL=""; TUNNEL_URL=""
   fi
 fi
 case "$CHECK_SERVER" in
@@ -5030,6 +5654,10 @@ qrencode -t ANSIUTF8 "${SUB_URL}" 2>/dev/null || ylw "(qrencode недоступ
 echo "Как добавить:"
 echo "  • Happ (Android / iPhone / ПК): «+» → вставить ссылку из буфера или отсканировать QR."
 echo "  • v2rayNG (Android): «+» → «Импорт из буфера обмена» → «Обновить подписку»."
+if [ -n "$TUNNEL_URL" ]; then
+  echo "  • Tunnel (Android): ссылка «Открыть в Tunnel» — ниже, в разделе TUNNEL."
+  echo "  • FlClash, Clash Meta, Clash Verge: эта же ссылка — они сами получат профиль Mihomo."
+fi
 if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUTO_OK" = "1" ] || [ -n "$WHITE_URL_SUB" ]; then
   echo "Подключения в подписке:"
   if [ "$FILTER_TUNE" = "1" ]; then
@@ -5063,6 +5691,23 @@ fi
 echo
 echo "JSON-вариант той же подписки (для приложений, которым нужен Xray JSON):"
 echo "  ${JSON_URL}"
+MIHOMO_PROFILE=""
+if [ -n "$TUNNEL_URL" ]; then
+  echo
+  ylw "================ TUNNEL И ДРУГИЕ ПРИЛОЖЕНИЯ НА MIHOMO ================"
+  mihomo_text
+  MIHOMO_PROFILE="$(printf '\n=== Tunnel и приложения на Mihomo (Clash Meta) ===\n'; mihomo_text)"
+fi
+FT_PROFILE=""
+if [ "${#FT_LINKS[@]}" -gt 0 ]; then
+  if [ "$BRIDGE" = "1" ]; then FT_WHERE="на зарубежных серверах моста"; else FT_WHERE="на этом сервере"; fi
+  echo
+  ylw "======== FREETURN — VPN ЧЕРЕЗ ЗВОНКИ VK (работает и при белых списках) ========"
+  freeturn_text "${FT_LINKS[@]}"
+  echo "Сервер FreeTurn — ${FT_WHERE}; там же управление: freeturn (ещё клиент: freeturn client add имя)."
+  FT_PROFILE="$(printf '\n=== FreeTurn — VPN через звонки VK ===\n'; freeturn_text "${FT_LINKS[@]}"
+                echo "Сервер FreeTurn — ${FT_WHERE}; там же управление: freeturn (ещё клиент: freeturn client add имя).")"
+fi
 WHITE_PROFILE=""
 if [ "$WHITE_ON" = "1" ]; then
   echo
@@ -5126,6 +5771,8 @@ Hysteria2: $([ "$HY2_OK" = "1" ] && echo "UDP-порт ${HY2_PORT}, TLS на ${A
 Одиночная ссылка (БЕЗ правил подписки — весь трафик через VPN):
 ${VLESS_URL}
 ${WHITE_PROFILE}
+${MIHOMO_PROFILE}
+${FT_PROFILE}
 TXT
 chmod 600 "$PROFILE"
 echo

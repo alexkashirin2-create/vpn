@@ -39,6 +39,11 @@
 #     в нём 8 самых быстрых по пингу; при включении телефон сразу пингует их все из СВОЕЙ сети
 #     (у каждого оператора и региона пропускают разные) и ведёт трафик через самый быстрый по пингу
 #     из работающих у него; каждые 2 минуты пинг повторяется, не отвечает — телефон переходит на другой.
+#     ПРОВЕРКА С ТЕЛЕФОНА — страница «…/test/» на порту подписки (адрес — в итоге установки): одна
+#     команда в Termux (Android) скачивает с сервера Xray и список серверов, проверяет каждый из
+#     мобильной сети телефона и отправляет результат на сервер. Серверы, которые работают у телефона,
+#     встают в подписке первыми («🏳️ БС ✅ 01 · …») и попадают в автоподбор (результат действует
+#     48 часов); те, что у телефона не заработали, уходят в конец списка.
 #
 # ЗАПУСК на чистом Ubuntu 22.04/24.04 или Debian 12 под root — одна команда из GitHub:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh)
@@ -316,7 +321,11 @@ write_sub_filter_program() {
 # быстрые — первыми), отдельной подпиской по своему адресу — до list_max. Для Happ, v2rayNG и v2rayN перед
 # ними — профиль автоподбора по пингу: приложение само пингует лучшие белые списки из сети этого
 # телефона и ведёт трафик через самый быстрый из тех, что работают именно у него.
-import base64, copy, json, os, re, socket, ssl, sys, threading, urllib.error, urllib.request
+# Проверка с телефона (страница …/test/): телефон в Termux скачивает отсюда Xray и список серверов,
+# проверяет их из мобильной сети и присылает отчёт; серверы, которые работают у телефона, идут
+# в подписке первыми (с ✅) и попадают в автоподбор.
+import base64, copy, hashlib, html, json, os, re, secrets, shutil, socket, ssl, sys, threading, time
+import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF = json.load(open(sys.argv[1]))
@@ -359,20 +368,91 @@ def tune(body):
 
 # ---------- белые списки ----------
 _white_lock = threading.Lock()
-_white = {"stamp": None, "sub": [], "list": [], "auto": []}
+_white = {"stamp": None, "all": [], "sub": [], "list": [], "auto": [], "phone": [], "verified": {}, "failed": set()}
+PHONE = WHITE.get("phone") or {}
+PHONE_DIR = PHONE.get("dir") or ""
+VERIFIED = os.path.join(PHONE_DIR, "verified.json") if PHONE_DIR else ""
+REPORTS = os.path.join(PHONE_DIR, "reports") if PHONE_DIR else ""
+_phone_lock = threading.Lock()
+
+
+def file_stamp(path):
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def item_key(item):
+    """постоянный код подключения: одинаков при любом номере и названии"""
+    return hashlib.sha1(json.dumps(item["outbound"], sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def fresh_verified():
+    """проверка с телефона за последние hours часов: (работают — код → пинг у телефона, сеть и время
+    самой свежей удачной проверки; не работают ни в одной из проверенных сетей — коды)"""
+    out, failed, limit = {}, set(), time.time() - float(PHONE.get("hours") or 48) * 3600
+    data = read_json(VERIFIED, {}) if VERIFIED else {}
+    for key, nets in (data.items() if isinstance(data, dict) else []):
+        for label, r in (nets.items() if isinstance(nets, dict) else []):
+            if not isinstance(r, dict) or float(r.get("time") or 0) < limit:
+                continue
+            if not r.get("ok"):
+                failed.add(key)
+                continue
+            cur = {"ms": int(r.get("ms") or 10 ** 6), "label": label, "time": int(r.get("time") or 0)}
+            old = out.get(key)
+            if old is None or (cur["time"], -cur["ms"]) > (old["time"], -old["ms"]):
+                out[key] = cur
+    return out, failed - set(out)
+
+
+def marked(items, verified):
+    """проверенные телефоном — с ✅ в названии (и в ссылке)"""
+    label = WHITE.get("label") or ""
+    out = []
+    for it in items:
+        if it.get("_key") in verified:
+            name = it["name"]
+            name = label + " ✅" + name[len(label):] if label and name.startswith(label) else "✅ " + name
+            it = dict(it, name=name, link=rename_link(it["link"], name))
+        out.append(it)
+    return out
+
+
+def rename_link(link, name):
+    try:
+        if link.lower().startswith("vmess://"):
+            body = link.split("://", 1)[1].split("#", 1)[0]
+            d = json.loads(base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+            d["ps"] = name
+            return "vmess://" + base64.b64encode(json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        return link.split("#", 1)[0] + "#" + urllib.parse.quote(name, safe="")
+    except (ValueError, TypeError):
+        return link
 
 
 def white_items(kind="sub"):
-    """белые списки из рабочих подключений (файл перечитывается, только когда изменился):
-    sub — для подписки, list — для отдельной подписки, auto — для профиля автоподбора"""
+    """белые списки из рабочих подключений (файлы перечитываются, только когда изменились):
+    sub — для подписки, list — для отдельной подписки, auto — для профиля автоподбора,
+    phone — для проверки с телефона, all — все рабочие, verified — работают у телефона,
+    failed — у телефона не работают"""
+    empty = {"verified": {}, "failed": set()}.get(kind, [])
     path = WHITE.get("file")
     if not path:
-        return []
-    try:
-        st = os.stat(path)
-    except OSError:
-        return []
-    stamp = (st.st_mtime_ns, st.st_size)
+        return empty
+    stamp = (file_stamp(path), file_stamp(VERIFIED) if VERIFIED else None, int(time.time() // 600))
+    if stamp[0] is None:
+        return empty
     with _white_lock:
         if stamp != _white["stamp"]:
             try:
@@ -380,10 +460,16 @@ def white_items(kind="sub"):
                     items = json.load(f).get("items") or []
                 items = [x for x in items if isinstance(x, dict) and isinstance(x.get("link"), str)
                          and isinstance(x.get("outbound"), dict) and x.get("name")]
-                _white.update(stamp=stamp,               # везде — самые быстрые по пингу
-                              sub=pick_best(items, int(WHITE.get("sub_max") or 50)),
-                              list=pick_best(items, int(WHITE.get("list_max") or 150)),
-                              auto=pick_best(items, int((WHITE.get("auto") or {}).get("max") or 0)))
+                for it in items:
+                    it["_key"] = item_key(it)
+                ver, bad = fresh_verified()
+                # везде — сначала работающие у телефона (по пингу у телефона), дальше самые быстрые по
+                # пингу с сервера, а не работающие у телефона — в самом конце
+                _white.update(stamp=stamp, all=items, verified=ver, failed=bad,
+                              sub=marked(pick_best(items, int(WHITE.get("sub_max") or 50), ver, bad), ver),
+                              list=marked(pick_best(items, int(WHITE.get("list_max") or 150), ver, bad), ver),
+                              auto=pick_best(items, int((WHITE.get("auto") or {}).get("max") or 0), ver, bad),
+                              phone=pick_best(items, int(PHONE.get("max") or 300), ver, bad))
             except (OSError, ValueError, AttributeError, TypeError):
                 pass                      # файл как раз переписывается — отдаём прежний список
         return _white[kind]
@@ -414,20 +500,40 @@ def server_host(outbound):
     return str(s.get("address") or "")
 
 
+def server_port(outbound):
+    """порт сервера подключения"""
+    s = outbound.get("settings") or {}
+    for key in ("vnext", "servers"):
+        for srv in s.get(key) or []:
+            if isinstance(srv, dict):
+                return srv.get("port")
+    return s.get("port")
+
+
 def ping_of(item):
     """пинг подключения — время ответа через него при последней проверке на сервере, мс"""
     return item["ms"] if isinstance(item.get("ms"), (int, float)) else 10 ** 9
 
 
-def pick_best(items, limit):
-    """самые быстрые по пингу, самые быстрые — первыми. Один и тот же сервер (с другим ключом или
-    портом) — только после всех остальных серверов, чтобы в списке не было одинаковых"""
+def fastest(items, limit):
+    """limit самых быстрых по пингу, самые быстрые — первыми. Один и тот же сервер (с другим ключом
+    или портом) — только после всех остальных серверов, чтобы в списке не было одинаковых"""
     seen, first, rest = set(), [], []
     for it in sorted(items, key=ping_of):
         host = server_host(it["outbound"])
         (rest if host in seen else first).append(it)
         seen.add(host)
-    return sorted((first + rest)[:limit], key=ping_of)
+    return sorted((first + rest)[:max(0, limit)], key=ping_of)
+
+
+def pick_best(items, limit, verified=None, failed=()):
+    """сначала работающие у телефона (самые быстрые у телефона — первыми), дальше самые быстрые по
+    пингу с сервера, а те, что у телефона не заработали, — в конце"""
+    verified = verified or {}
+    mine = sorted((it for it in items if it.get("_key") in verified), key=lambda it: verified[it["_key"]]["ms"])[:limit]
+    other = fastest([it for it in items if it.get("_key") not in verified and it.get("_key") not in failed],
+                    limit - len(mine))
+    return mine + other + fastest([it for it in items if it.get("_key") in failed], limit - len(mine) - len(other))
 
 
 def white_auto(template, chosen, level):
@@ -545,6 +651,792 @@ def update_interval(headers):
     return out
 
 
+# ---------- проверка с телефона ----------
+# Сервер не видит белые списки оператора, поэтому телефон проверяет серверы сам: страница …/test/
+# даёт команду для Termux, скрипт t.sh скачивает отсюда Xray (xray-arm64-v8a.gz) и список серверов
+# (bundle), проверяет каждый из мобильной сети и присылает отчёт (POST report). Рабочие у телефона
+# (verified.json, за последние hours часов) идут в подписке первыми — с ✅ — и попадают в автоподбор.
+PHONE_PORT = 41000                        # входы SOCKS на телефоне: 41000 — служебный, дальше по одному на сервер
+PHONE_XRAY = "xray-arm64-v8a.gz"
+REPORT_MAX = 256 * 1024
+_resolve = {"time": 0, "value": ""}
+
+
+def phone_base(handler):
+    """адрес сервера подписки, как его видит телефон: из настроек, иначе — из запроса"""
+    base = str(PHONE.get("base") or "").rstrip("/")
+    if not base:
+        host = handler.headers.get("Host") or "127.0.0.1:%d" % int(CONF["port"])
+        base = ("https://" if CERT else "http://") + host
+    return re.sub(r"[^A-Za-z0-9.:/\[\]_-]", "", base)
+
+
+def phone_resolve(base):
+    """«адрес:порт:IP» для curl --resolve — на случай, если DNS телефона не знает адрес сервера"""
+    u = urllib.parse.urlsplit(base)
+    host, port = u.hostname or "", u.port or (443 if u.scheme == "https" else 80)
+    if not host or re.match(r"^[0-9.]+$", host) or ":" in host:
+        return ""
+    now = time.time()
+    if now - _resolve["time"] > 600:
+        ip = str(PHONE.get("ip") or "")
+        if not ip:
+            try:
+                ip = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+            except (OSError, IndexError, UnicodeError):
+                ip = ""
+        _resolve.update(time=now, value="%s:%d:%s" % (host, port, ip) if ip else "")
+    return _resolve["value"]
+
+
+def xray_version():
+    try:
+        with open(os.path.join(PHONE_DIR, "xray-version"), encoding="utf-8") as f:
+            v = f.read().strip()
+        return v if re.match(r"^[0-9][0-9.]*$", v) else "-"
+    except OSError:
+        return "-"
+
+
+def phone_bundle():
+    """для телефона: строки «#P порт код tcp|udp адрес порт-сервера IP-с-сервера название» и настройки
+    Xray — вход SOCKS на каждый сервер. Каждый вход, выход и правило — отдельной строкой, а первым в
+    списке стоит служебный: телефон убирает отвергнутые Xray подключения по коду, не разбирая JSON.
+    Служебный выход — freedom: через первый выход Xray отправляет и свои запросы DNS"""
+    items = white_items("phone")
+    head, inb, outb, rules = [], [], [], []
+    for it in items:
+        key = it["_key"]
+        host = server_host(it["outbound"])
+        try:
+            sport = int(server_port(it["outbound"]))
+        except (TypeError, ValueError):
+            continue
+        if not re.match(r"^[A-Za-z0-9._:-]+$", host or ""):
+            continue
+        port = PHONE_PORT + len(head) + 1
+        ob = copy.deepcopy(it["outbound"])
+        ob["tag"] = "o-" + key
+        ss = ob.get("streamSettings")
+        if not isinstance(ss, dict):
+            ss = ob["streamSettings"] = {}
+        sock = ss.get("sockopt") if isinstance(ss.get("sockopt"), dict) else {}
+        sock["domainStrategy"] = "UseIPv4"    # адрес сервера — через DNS самого Xray (на Android системный не работает)
+        ss["sockopt"] = sock
+        udp = ob.get("protocol") == "hysteria" or ss.get("network") in ("kcp", "hysteria")
+        ip = str(it.get("ip") or "-")
+        if not re.match(r"^[0-9a-fA-F.:]+$", ip):
+            ip = "-"
+        name = " ".join(str(it.get("name") or key).split())
+        head.append("#P %d %s %s %s %d %s %s" % (port, key, "udp" if udp else "tcp", host, sport, ip, name))
+        inb.append(json.dumps({"tag": "in-" + key, "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                               "settings": {"udp": False}}, separators=(",", ":")))
+        outb.append(json.dumps(ob, separators=(",", ":")))
+        rules.append(json.dumps({"type": "field", "inboundTag": ["in-" + key], "outboundTag": "o-" + key},
+                                separators=(",", ":")))
+    lines = ["#B 1 %s %d %d" % (xray_version(), len(head), PHONE_PORT)] + head + [
+        "{", '"log":{"loglevel":"none"},',
+        '"inbounds":[{"tag":"in-x","listen":"127.0.0.1","port":%d,"protocol":"socks","settings":{"udp":false}}'
+        % PHONE_PORT] + ["," + x for x in inb] + [
+        "],", '"outbounds":[{"tag":"x","protocol":"freedom"}'] + ["," + x for x in outb] + [
+        "],", '"routing":{"rules":[{"type":"field","inboundTag":["in-x"],"outboundTag":"x"}'] + [
+        "," + x for x in rules] + ["]}", "}"]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def clean_label(text):
+    text = " ".join("".join(ch for ch in str(text) if ch.isprintable()).split())
+    return text[:40] or "Мобильный интернет"
+
+
+def phone_report(text, client):
+    """отчёт телефона: «ключ: значение» и строки «код мс» (работает) или «код - причина» (нет).
+    Возвращает (работают, проверено)"""
+    now = int(time.time())
+    rep = {"time": now, "label": "Мобильный интернет", "open": False, "xray": "", "script": "",
+           "client": client}
+    items, seen = [], set()
+    for line in text.splitlines()[:6000]:
+        line = line.strip()
+        m = re.match(r"^([0-9a-f]{12})\s+(\d{1,6}|-)(?:\s+([a-z]{1,10}))?$", line)
+        if m:
+            if m.group(1) not in seen:
+                seen.add(m.group(1))
+                items.append([m.group(1), int(m.group(2)) if m.group(2) != "-" else None, m.group(3) or ""])
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if key == "label":
+            rep["label"] = clean_label(value)
+        elif key == "open":
+            rep["open"] = value == "1"
+        elif key == "time" and value.isdigit():
+            rep["time"] = min(now, max(now - 7 * 86400, int(value)))
+        elif key in ("xray", "script"):
+            rep[key] = re.sub(r"[^0-9A-Za-z.+-]", "", value)[:20]
+    if not items:
+        raise ValueError("в отчёте нет ни одного сервера")
+    names = {it["_key"]: it["name"] for it in white_items("all")}
+    good = sorted((ms, key) for key, ms, _ in items if ms is not None)
+    rep.update(tested=len(items), ok=len(good), best=good[0][0] if good else None,
+               top=[[names.get(key, key), ms] for ms, key in good[:5]], items=items)
+    with _phone_lock:
+        os.makedirs(REPORTS, exist_ok=True)
+        if not rep["open"]:               # без ограничений (Wi-Fi) — сохраняем, но не учитываем
+            data = read_json(VERIFIED, {})
+            data = data if isinstance(data, dict) else {}
+            for key, ms, _ in items:
+                nets = data.get(key) if isinstance(data.get(key), dict) else {}
+                old = nets.get(rep["label"])
+                if isinstance(old, dict) and int(old.get("time") or 0) > rep["time"]:
+                    continue                  # есть результат новее (этот отчёт пришёл с опозданием)
+                nets[rep["label"]] = {"ok": ms is not None, "ms": ms, "time": rep["time"]}
+                data[key] = nets
+            limit = now - 7 * 86400           # неделя без проверки — забываем
+            for key in list(data):
+                nets = data[key] if isinstance(data[key], dict) else {}
+                nets = {k: v for k, v in nets.items() if isinstance(v, dict) and int(v.get("time") or 0) >= limit}
+                if nets:
+                    data[key] = nets
+                else:
+                    del data[key]
+            write_file(VERIFIED, json.dumps(data, ensure_ascii=False))
+        write_file(os.path.join(REPORTS, "%d-%s.json" % (rep["time"], secrets.token_hex(3))),
+                   json.dumps(rep, ensure_ascii=False))
+        files = sorted(f for f in os.listdir(REPORTS) if f.endswith(".json"))
+        for f in files[:-50]:             # храним 50 последних
+            try:
+                os.unlink(os.path.join(REPORTS, f))
+            except OSError:
+                pass
+    return rep["ok"], rep["tested"]
+
+
+def write_file(path, text):
+    tmp = "%s.%s.tmp" % (path, secrets.token_hex(3))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def phone_status():
+    """для страницы: отчёты телефонов и серверы, которые у них работают"""
+    ver = white_items("verified")
+    servers = []
+    for it in white_items("list"):
+        v = ver.get(it.get("_key"))
+        if v:
+            servers.append({"name": it["name"], "ms": v["ms"], "label": v["label"], "time": v["time"],
+                            "server_ms": it.get("ms")})
+    reports = []
+    try:
+        files = sorted((f for f in os.listdir(REPORTS) if f.endswith(".json")), reverse=True)[:20]
+    except OSError:
+        files = []
+    for f in files:
+        r = read_json(os.path.join(REPORTS, f), {})
+        if isinstance(r, dict):
+            reports.append({k: r.get(k) for k in ("time", "label", "open", "tested", "ok", "best", "top")})
+    sub_max = int(WHITE.get("sub_max") or 50)
+    return {"now": int(time.time()), "alive": len(white_items("all")), "candidates": len(white_items("phone")),
+            "verified": len(ver), "failed": len(white_items("failed")), "in_sub": min(len(ver), sub_max),
+            "sub_max": sub_max,
+            "hours": int(float(PHONE.get("hours") or 48)), "servers": servers[:150], "reports": reports}
+
+
+def phone_script(base):
+    url = base + (WHITE.get("path") or "/").rstrip("/") + "/test"
+    auto = str((WHITE.get("auto") or {}).get("name") or "")
+    sh = PHONE_SH.replace("__URL__", url).replace("__RESOLVE__", phone_resolve(base))
+    return sh.replace("__AUTO__", auto.replace("'", "")).encode("utf-8")
+
+
+def phone_page(base):
+    url = base + (WHITE.get("path") or "/").rstrip("/") + "/test"
+    cmd = 'command -v curl >/dev/null || pkg install -y curl; curl -fsSL "%s/t.sh" -o t.sh && bash t.sh' % url
+    auto = str((WHITE.get("auto") or {}).get("name") or "Автовыбор")
+    page = PHONE_HTML.replace("__CMD__", html.escape(cmd)).replace("__AUTO__", html.escape(auto))
+    return page.replace("__HOURS__", str(int(float(PHONE.get("hours") or 48)))).encode("utf-8")
+
+
+PHONE_SH = r'''#!/usr/bin/env bash
+# Проверка белых списков с телефона (Android, Termux): какие серверы белых списков работают
+# в ЭТОЙ мобильной сети. Скрипт отдаёт ваш сервер VPN (страница проверки), ставит его install-vpn-all.sh.
+#   bash t.sh             — проверить серверы из этой сети и отправить результат на сервер VPN
+#   bash t.sh "Билайн"    — то же, с названием сети (запоминается)
+#   bash t.sh --force     — проверить, даже если сейчас интернет без ограничений (Wi-Fi)
+# Первый запуск — по Wi-Fi: скачает Xray и список серверов. Дальше — в мобильном интернете.
+URL='__URL__'
+RESOLVE='__RESOLVE__'
+AUTO='__AUTO__'
+SVER='2026.10.14'
+DIR="${WLT_DIR:-${HOME:-.}/.vpn-wl-test}"
+TCP_JOBS="${WLT_TCP_JOBS:-16}"; PROBE_JOBS="${WLT_PROBE_JOBS:-8}"
+TCP_SEC="${WLT_TCP_SEC:-4}"; PROBE_SEC="${WLT_PROBE_SEC:-10}"
+PROBE_URLS=(https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204)
+read -r -a OPEN_URLS <<< "${WLT_OPEN_URLS:-https://www.gstatic.com/generate_204 https://1.1.1.1/cdn-cgi/trace https://www.wikipedia.org/}"
+RES=(); if [ -n "$RESOLVE" ]; then RES=(--resolve "$RESOLVE"); fi
+declare -A BAD=()
+X=""; XVER=""; XPID=""; T=""; ONLINE=0; OPEN=0; FORCE=0; LABEL=""; LABEL_ARG=""; SENT=""; VIA=""
+TOT=0; OKN=0; N=0
+
+if [ -t 1 ]; then G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; Z=$'\033[0m'; else G=""; Y=""; R=""; Z=""; fi
+say()  { printf '%s\n' "$*"; }
+good() { printf '%s%s%s\n' "$G" "$*" "$Z"; }
+warn() { printf '%s%s%s\n' "$Y" "$*" "$Z"; }
+fail() { printf '%s%s%s\n' "$R" "$*" "$Z" >&2; exit 1; }
+
+cleanup() {
+  if [ -n "$XPID" ]; then kill "$XPID" 2>/dev/null; fi
+  # shellcheck disable=SC2046
+  kill $(jobs -p) 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+trap 'echo; warn "Остановлено."; exit 130' INT TERM
+
+direct() {   # direct путь [опции curl] — запрос к серверу VPN напрямую
+  local p="$1"; shift
+  curl -fsS --noproxy '*' --connect-timeout 10 "${RES[@]}" "$@" "$URL/$p"
+}
+tunnel() {   # tunnel порт путь [опции curl] — запрос к серверу VPN через рабочий сервер (Xray на телефоне)
+  local port="$1" p="$2"; shift 2
+  curl -fsS --connect-timeout 15 -x "socks5h://127.0.0.1:$port" "$@" "$URL/$p"
+}
+fastest() {  # порты 2 самых быстрых рабочих серверов
+  [ -n "$T" ] && [ -s "$T/good" ] && [ -n "$XPID" ] || return 0
+  sort -n "$T/good" | head -n 2 | cut -d' ' -f2
+}
+count() { grep -c '^#P ' "$DIR/bundle" 2>/dev/null || true; }
+need() {
+  local b miss=()
+  for b in "$@"; do command -v "$b" >/dev/null 2>&1 || miss+=("$b"); done
+  [ ${#miss[@]} -eq 0 ] && return 0
+  if command -v pkg >/dev/null 2>&1; then
+    say "Ставлю ${miss[*]}..."
+    pkg install -y "${miss[@]}" >/dev/null 2>&1
+  fi
+  for b in "${miss[@]}"; do
+    command -v "$b" >/dev/null 2>&1 || fail "Не найден $b — установите: pkg install $b"
+  done
+}
+to_ms() {    # «0.412345» → MS=412
+  local t="${1/,/.}" s f
+  s=${t%%.*}; f=${t#*.}; [ "$f" = "$t" ] && f=0
+  f="${f}000"; f=${f:0:3}
+  [[ $s =~ ^[0-9]+$ ]] || s=0
+  [[ $f =~ ^[0-9]+$ ]] || f=0
+  MS=$(( 10#$s * 1000 + 10#$f ))
+}
+
+get_bundle() {   # свежий список серверов с сервера VPN → $DIR/bundle
+  if direct bundle -m 120 -o "$DIR/bundle.new" 2>/dev/null && head -n 1 "$DIR/bundle.new" | grep -q '^#B '; then
+    mv -f "$DIR/bundle.new" "$DIR/bundle"
+    return 0
+  fi
+  rm -f "$DIR/bundle.new"
+  return 1
+}
+
+xray_ver() { "$1" version 2>/dev/null | sed -n '1s/^Xray \([0-9][0-9.]*\).*/\1/p'; }
+use_xray() {   # use_xray файл — запускается ли этот Xray на телефоне; да — он становится $DIR/xray
+  chmod 755 "$1" 2>/dev/null
+  if [ -z "$(xray_ver "$1")" ]; then rm -f "$1"; return 1; fi
+  mv -f "$1" "$DIR/xray"
+}
+xray_from_server() {
+  case "$(uname -m)" in aarch64|arm64|armv8*) ;; *) return 1 ;; esac
+  say "Скачиваю Xray с сервера VPN (около 15 МБ)..."
+  local rc=1
+  if direct xray-arm64-v8a.gz -m 900 -o "$DIR/xray.gz" 2>/dev/null \
+     && gzip -dc "$DIR/xray.gz" > "$DIR/xray.new" 2>/dev/null && use_xray "$DIR/xray.new"; then rc=0; fi
+  rm -f "$DIR/xray.gz" "$DIR/xray.new"
+  return $rc
+}
+xray_from_github() {
+  local z zips
+  case "$(uname -m)" in
+    aarch64|arm64) zips="Xray-android-arm64-v8a.zip" ;;
+    armv8*|armv7*|arm*) zips="Xray-android-arm64-v8a.zip Xray-linux-arm32-v7a.zip" ;;
+    x86_64|amd64) zips="Xray-android-amd64.zip" ;;
+    i?86) zips="Xray-linux-32.zip" ;;
+    *) zips="Xray-android-arm64-v8a.zip" ;;
+  esac
+  command -v unzip >/dev/null 2>&1 || pkg install -y unzip >/dev/null 2>&1
+  command -v unzip >/dev/null 2>&1 || return 1
+  for z in $zips; do
+    say "Скачиваю Xray с GitHub ($z)..."
+    rm -rf "$DIR/x" "$DIR/x.zip"
+    curl -fsSL --connect-timeout 15 -m 900 -o "$DIR/x.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/$z" || continue
+    if unzip -q -o "$DIR/x.zip" xray -d "$DIR/x" 2>/dev/null && use_xray "$DIR/x/xray"; then
+      rm -rf "$DIR/x" "$DIR/x.zip"
+      return 0
+    fi
+  done
+  rm -rf "$DIR/x" "$DIR/x.zip"
+  return 1
+}
+get_xray() {
+  local want have
+  if [ -n "${WLT_XRAY:-}" ]; then X="$WLT_XRAY"; XVER=$(xray_ver "$X"); [ -n "$XVER" ] && return 0; fi
+  X="$DIR/xray"
+  want=$(sed -n '1s/^#B [0-9]* \([0-9][0-9.]*\) .*/\1/p' "$DIR/bundle" 2>/dev/null)
+  have=$(xray_ver "$X")
+  if [ -n "$have" ]; then   # на сервере другая версия — обновляем (не вышло — работаем с этой)
+    if [ -n "$want" ] && [ "$want" != "$have" ] && [ "$ONLINE" = 1 ]; then xray_from_server || true; fi
+  else
+    xray_from_server || xray_from_github || {
+      command -v xray >/dev/null 2>&1 || pkg install -y xray >/dev/null 2>&1
+      command -v xray >/dev/null 2>&1 && X="$(command -v xray)"
+    }
+  fi
+  XVER=$(xray_ver "$X")
+  [ -n "$XVER" ]
+}
+
+open_net() {   # 0 — интернет без ограничений: зарубежные сайты открываются напрямую (Wi-Fi, VPN)
+  local d="$DIR/open" u i=0
+  rm -rf "$d"; mkdir -p "$d"
+  for u in "${OPEN_URLS[@]}"; do
+    i=$((i + 1))
+    curl --noproxy '*' -s -o /dev/null --connect-timeout 5 -m 6 -w '%{http_code}' "$u" > "$d/$i" 2>/dev/null &
+  done
+  wait
+  i=0
+  for u in "$d"/*; do
+    case "$(cat "$u" 2>/dev/null)" in [1-5][0-9][0-9]) i=$((i + 1)) ;; esac
+  done
+  rm -rf "$d"
+  [ "$i" -ge 2 ]
+}
+
+get_label() {
+  local def saved=""
+  if [ -n "$LABEL_ARG" ]; then LABEL="$LABEL_ARG"
+  else
+    read -r saved 2>/dev/null < "$DIR/label"
+    if [ -n "$saved" ]; then LABEL="$saved"
+    else
+      def=$(getprop gsm.operator.alpha 2>/dev/null | sed 's/,/ \/ /g; s/^[ \/]*//; s/[ \/]*$//')
+      [ -n "$def" ] || def="Мобильный интернет"
+      if [ -t 0 ]; then
+        printf 'Как назвать эту сеть (оператор, город) [%s]: ' "$def"
+        read -r LABEL || LABEL=""
+      fi
+      LABEL=${LABEL:-$def}
+    fi
+  fi
+  LABEL=$(printf '%s' "$LABEL" | tr -d '\000-\037')
+  LABEL=${LABEL:0:40}
+  printf '%s\n' "$LABEL" > "$DIR/label"
+}
+
+tcp_state() {  # tcp_state код → ST: ok (сервер открывается) | udp | no; TIP — его IP
+  local tc="" rip="" ec=""
+  ST=no; TIP=""
+  IFS='|' read -r tc rip ec 2>/dev/null < "$T/c.$1"
+  if [ "$tc" = udp ]; then ST=udp
+  elif [ -n "${tc//[0.,]/}" ]; then ST=ok; TIP=$rip
+  fi
+  EC=$ec
+}
+stage_tcp() {   # 1) открывается ли сервер из этой сети (без Xray, сразу TCP_JOBS штук)
+  local n=0 port key kind host sport sip name u
+  while read -r _ port key kind host sport sip name; do
+    if [ "$kind" = udp ]; then echo udp > "$T/c.$key"; continue; fi
+    case "$host" in *:*) u="[$host]" ;; *) u="$host" ;; esac
+    curl --noproxy '*' -s -o /dev/null --connect-timeout "$TCP_SEC" -m $((TCP_SEC + 1)) \
+         -w '%{time_connect}|%{remote_ip}|%{exitcode}' "http://$u:$sport/" > "$T/c.$key" 2>/dev/null &
+    n=$((n + 1)); if [ "$n" -ge "$TCP_JOBS" ]; then wait -n 2>/dev/null; n=$((n - 1)); fi
+  done < "$T/ports"
+  wait
+  n=0   # адрес сервера не знает DNS телефона — ещё раз по IP, который видит сервер VPN
+  while read -r _ port key kind host sport sip name; do
+    [ "$kind" = udp ] && continue
+    tcp_state "$key"
+    [ "$ST" = no ] && [ "$EC" = 6 ] && [[ $sip =~ ^[0-9.]+$ ]] || continue
+    curl --noproxy '*' -s -o /dev/null --connect-timeout "$TCP_SEC" -m $((TCP_SEC + 1)) --resolve "$host:$sport:$sip" \
+         -w '%{time_connect}|%{remote_ip}|%{exitcode}' "http://$host:$sport/" > "$T/c.$key" 2>/dev/null &
+    n=$((n + 1)); if [ "$n" -ge "$TCP_JOBS" ]; then wait -n 2>/dev/null; n=$((n - 1)); fi
+  done < "$T/ports"
+  wait
+}
+HOSTS=""
+add_host() {   # add_host домен IP — адрес сервера для DNS Xray (только домены и только IPv4)
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] && [[ ! $1 =~ ^[0-9.]+$ ]] && [[ $2 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 0
+  case ",$HOSTS," in *",\"$1\":"*) return 0 ;; esac
+  HOSTS="${HOSTS:+$HOSTS,}\"$1\":\"$2\""
+}
+make_conf() {
+  {
+    head -n 1 "$T/config.json"
+    printf '"dns":{"hosts":{%s},"servers":["77.88.8.8","77.88.8.1","1.1.1.1"],"queryStrategy":"UseIPv4"},\n' "$HOSTS"
+    tail -n +2 "$T/config.json" | grep -v -F -f "$T/bad"
+  } > "$T/run.json"
+}
+stage_conf() {   # 2) настройки Xray: адреса серверов и только те подключения, которые этот Xray принимает
+  local port key kind host sport sip name out k tries=0 open=0 udp=0
+  while read -r _ port key kind host sport sip name; do
+    tcp_state "$key"
+    case "$ST" in
+      ok) open=$((open + 1)); add_host "$host" "$TIP" ;;
+      udp) udp=$((udp + 1)); add_host "$host" "$sip" ;;
+    esac
+  done < "$T/ports"
+  say "  Открываются из этой сети: $open из $((N - udp))$([ "$udp" -gt 0 ] && echo " (и ещё $udp — Hysteria2 по UDP, их проверит Xray)")."
+  : > "$T/bad"
+  while :; do
+    make_conf
+    out=$("$X" run -test -c "$T/run.json" 2>&1) && break
+    k=$(printf '%s\n' "$out" | grep -o 'with tag o-[0-9a-f]*' | head -n 1)
+    k=${k##*o-}
+    tries=$((tries + 1))
+    if [ -z "$k" ] || [ -n "${BAD[$k]:-}" ] || [ "$tries" -gt 60 ]; then
+      printf '%s\n' "$out" | tail -n 2 >&2
+      fail "Xray на телефоне не принимает настройки проверки."
+    fi
+    BAD[$k]=1
+    printf -- '-%s"\n' "$k" >> "$T/bad"
+  done
+  if [ ${#BAD[@]} -gt 0 ]; then warn "  Пропускаю: ${#BAD[@]} (их настройки не принимает Xray $XVER)."; fi
+  PROBE_N=$(( open + udp ))
+}
+stage_xray() {
+  local i r base
+  base=$(sed -n '1s/^#B [0-9]* [^ ]* [0-9]* \([0-9]*\).*/\1/p' "$DIR/bundle")
+  "$X" run -c "$T/run.json" > "$T/xray.log" 2>&1 &
+  XPID=$!
+  for i in $(seq 1 60); do
+    r=$(curl --noproxy '*' -s -o /dev/null --connect-timeout 1 -m 2 -w '%{time_connect}' "http://127.0.0.1:${base:-41000}/" 2>/dev/null)
+    [ -n "${r//[0.,]/}" ] && return 0
+    kill -0 "$XPID" 2>/dev/null || break
+    sleep 0.5
+  done
+  tail -n 3 "$T/xray.log" >&2
+  fail "Xray на телефоне не запустился."
+}
+stage_probe() {   # 3) настоящий запрос через каждый открывшийся сервер (через Xray, сразу PROBE_JOBS штук)
+  local n=0 i=0 port key kind host sport sip name code tt pids=()
+  while read -r _ port key kind host sport sip name; do
+    [ -n "${BAD[$key]:-}" ] && continue
+    tcp_state "$key"
+    [ "$ST" = no ] && continue
+    i=$((i + 1))
+    curl -s -o /dev/null --connect-timeout "$PROBE_SEC" -m "$PROBE_SEC" -x "socks5h://127.0.0.1:$port" \
+         -w '%{http_code}|%{time_total}' "${PROBE_URLS[0]}" > "$T/p.$key" 2>/dev/null &
+    pids+=("$!")
+    n=$((n + 1)); if [ "$n" -ge "$PROBE_JOBS" ]; then wait -n 2>/dev/null; n=$((n - 1)); fi
+    if [ -t 1 ]; then printf '\r  Проверяю через Xray: %d из %d ' "$i" "$PROBE_N"; fi
+  done < "$T/ports"
+  [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}" 2>/dev/null
+  if [ -t 1 ] && [ "$i" -gt 0 ]; then printf '\r'; fi
+  pids=(); n=0   # не ответил быстро (ошибка, а не тайм-аут) — ещё раз, другим адресом
+  while read -r _ port key kind host sport sip name; do
+    [ -f "$T/p.$key" ] || continue
+    code=""; tt=""
+    IFS='|' read -r code tt 2>/dev/null < "$T/p.$key"
+    [[ $code =~ ^[23][0-9][0-9]$ ]] && continue
+    to_ms "$tt"
+    [ "$MS" -lt $(( PROBE_SEC * 700 )) ] || continue
+    curl -s -o /dev/null --connect-timeout "$PROBE_SEC" -m "$PROBE_SEC" -x "socks5h://127.0.0.1:$port" \
+         -w '%{http_code}|%{time_total}' "${PROBE_URLS[1]}" > "$T/p.$key" 2>/dev/null &
+    pids+=("$!")
+    n=$((n + 1)); if [ "$n" -ge "$PROBE_JOBS" ]; then wait -n 2>/dev/null; n=$((n - 1)); fi
+  done < "$T/ports"
+  [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}" 2>/dev/null
+  return 0
+}
+collect() {
+  local port key kind host sport sip name code tt
+  : > "$T/items"; : > "$T/good"
+  while read -r _ port key kind host sport sip name; do
+    TOT=$((TOT + 1))
+    if [ -n "${BAD[$key]:-}" ]; then echo "$key - xray" >> "$T/items"; continue; fi
+    tcp_state "$key"
+    if [ "$ST" = no ]; then echo "$key - tcp" >> "$T/items"; continue; fi
+    code=""; tt=""
+    IFS='|' read -r code tt 2>/dev/null < "$T/p.$key"
+    if [[ $code =~ ^[23][0-9][0-9]$ ]]; then
+      to_ms "$tt"
+      [ "$MS" -gt 0 ] || MS=1
+      echo "$key $MS" >> "$T/items"
+      echo "$MS $port $name" >> "$T/good"
+      OKN=$((OKN + 1))
+    else
+      echo "$key - net" >> "$T/items"
+    fi
+  done < "$T/ports"
+}
+
+send_pending() {   # отправить все неотправленные отчёты: напрямую, иначе через рабочие серверы
+  local f port ok ans
+  for f in "$DIR"/pending/*.txt; do
+    [ -e "$f" ] || continue
+    ok=0
+    if ans=$(direct report -m 60 -H 'Content-Type: text/plain; charset=utf-8' --data-binary @"$f" 2>/dev/null); then
+      ok=1
+    else
+      for port in $(fastest); do
+        if ans=$(tunnel "$port" report -m 30 -H 'Content-Type: text/plain; charset=utf-8' --data-binary @"$f" 2>/dev/null); then
+          ok=1; VIA=tunnel; break
+        fi
+      done
+    fi
+    [ "$ok" = 1 ] || return 1     # этот не ушёл — остальные тоже не уйдут, отправим в следующий раз
+    rm -f "$f"
+    SENT=$ans
+  done
+  return 0
+}
+
+main() {
+  local a now f port p name
+  for a in "$@"; do
+    case "$a" in
+      -f|--force) FORCE=1 ;;
+      -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+      *) LABEL_ARG="$a" ;;
+    esac
+  done
+  mkdir -p "$DIR/pending" || fail "Не могу создать папку $DIR"
+  need curl gzip
+  say "=== Проверка белых списков с телефона ==="
+  if get_bundle; then
+    ONLINE=1
+  elif [ -s "$DIR/bundle" ]; then
+    warn "Сервер VPN напрямую не открывается — проверяю по списку, скачанному раньше."
+  else
+    fail "Нет связи с сервером VPN, а список серверов ещё не скачан. Подключитесь к Wi-Fi, выполните команду ещё раз, затем выключите Wi-Fi."
+  fi
+  get_xray || fail "Не удалось скачать Xray. Подключитесь к Wi-Fi и запустите ещё раз."
+  N=$(count)
+  if [ "${N:-0}" -eq 0 ]; then
+    fail "На сервере VPN пока нет рабочих серверов белых списков — проверьте позже."
+  fi
+  if open_net; then
+    OPEN=1
+    if [ "$FORCE" != 1 ]; then
+      good "✓ Всё готово: Xray $XVER и список серверов ($N) на телефоне."
+      say "Сейчас интернет без ограничений (Wi-Fi или включён VPN) — так белые списки не проверить."
+      say "Дальше: выключите Wi-Fi и VPN, включите мобильный интернет и выполните в Termux:"
+      good "  bash t.sh"
+      say "(проверить прямо сейчас всё равно: bash t.sh --force)"
+      if send_pending && [ -n "$SENT" ]; then good "✓ Отправлены результаты прошлых проверок."; fi
+      exit 0
+    fi
+    warn "Интернет без ограничений: результат сохранится на сервере, но в подписке учитываться не будет."
+  fi
+  get_label
+  T="$DIR/run"
+  rm -rf "$T"; mkdir -p "$T" || fail "Не могу создать папку $T"
+  grep '^#P ' "$DIR/bundle" > "$T/ports"
+  grep -v '^#' "$DIR/bundle" > "$T/config.json"
+  say "Сеть: $LABEL. Проверяю серверы: $N (1–3 минуты, не сворачивайте Termux)..."
+  stage_tcp
+  stage_conf
+  if [ "$PROBE_N" -gt 0 ]; then stage_xray; stage_probe; fi
+  collect
+  now=$(date +%s)
+  f="$DIR/pending/$now.txt"
+  { echo "v: 1"; echo "time: $now"; echo "label: $LABEL"; echo "open: $OPEN"; echo "xray: $XVER"
+    echo "script: $SVER"; echo "tested: $TOT"; echo; cat "$T/items"; } > "$f"
+  sort -n "$T/good" > "$DIR/last.txt"
+  echo
+  say "Проверено: $TOT · работают в этой сети: $OKN (за $((SECONDS / 60)) мин $((SECONDS % 60)) с)"
+  if [ "$OKN" -gt 0 ]; then
+    say "Самые быстрые:"
+    while read -r p port name; do printf '  %5s мс  %s\n' "$p" "$name"; done < <(head -n 10 "$DIR/last.txt")
+  else
+    warn "В этой сети не работает ни один сервер из списка. Проверьте, что Wi-Fi выключен, а мобильный"
+    warn "интернет включён; списки на сервере обновляются каждые несколько часов — попробуйте позже."
+  fi
+  say "Отправляю результат на сервер VPN..."
+  if send_pending; then
+    if [ "$OPEN" = 1 ]; then good "✓ Результат отправлен на сервер VPN (как проверка без ограничений — в подписке не учитывается)."
+    elif [ "$OKN" -gt 0 ]; then
+      good "✓ Результат отправлен на сервер VPN: эти серверы теперь первые в подписке (с ✅)${AUTO:+ и в «$AUTO»}."
+      say "Обновите подписку в приложении (Happ, v2rayNG и др.)."
+    else good "✓ Результат отправлен на сервер VPN."
+    fi
+  else
+    warn "✗ Отправить результат не удалось: нет связи с сервером VPN ни напрямую, ни через рабочие серверы."
+    warn "  Он сохранён и уйдёт при следующем запуске (например, по Wi-Fi): bash t.sh"
+  fi
+  if [ "$ONLINE" = 0 ] && [ "$VIA" = tunnel ]; then   # список обновим через рабочий сервер — для следующей проверки
+    for port in $(fastest); do
+      if tunnel "$port" bundle -m 90 -o "$DIR/bundle.new" 2>/dev/null && head -n 1 "$DIR/bundle.new" | grep -q '^#B '; then
+        mv -f "$DIR/bundle.new" "$DIR/bundle"
+        good "✓ Список серверов обновлён (через рабочий сервер) — для следующей проверки."
+        break
+      fi
+    done
+    rm -f "$DIR/bundle.new"
+  fi
+  rm -rf "$T"
+}
+
+main "$@"
+'''
+
+
+PHONE_HTML = r'''<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Проверка белых списков</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--text:#1a1d21;--muted:#5f6873;--line:#e2e5e9;--accent:#2563eb;--ok:#15803d;--warn:#b45309;--code:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#181c22;--text:#e6e9ed;--muted:#9aa3ae;--line:#29303a;--accent:#6c9cff;--ok:#4ade80;--warn:#f0b354;--code:#222832}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:760px;margin:0 auto;padding:16px}
+h1{font-size:22px;line-height:1.25;margin:8px 0 6px}
+h2{font-size:17px;margin:0 0 10px}
+p{margin:0 0 10px}
+a{color:var(--accent)}
+.lead{color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:14px 0}
+ol{margin:0;padding-left:22px}
+li{margin:0 0 14px}
+li:last-child{margin-bottom:0}
+.cmd{display:flex;flex-direction:column;align-items:flex-start;gap:6px;margin-top:6px}
+.cmd code{display:block;width:100%;background:var(--code);border-radius:8px;padding:8px 10px;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere;user-select:all}
+button{border:0;border-radius:8px;background:var(--accent);color:#fff;font:600 14px system-ui,sans-serif;padding:0 14px;min-height:36px;cursor:pointer}
+.note{color:var(--muted);font-size:14px}
+.card>.note{margin:12px 0 0}
+li .note{margin:8px 0 0}
+.stats{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--muted);font-size:14px;margin-bottom:10px}
+.stats b{color:var(--text)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+td.n{text-align:right;white-space:nowrap}
+.ok{color:var(--ok)}
+.warn{color:var(--warn)}
+.muted{color:var(--muted)}
+.empty{color:var(--muted);font-size:14px}
+.scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<main>
+<h1>🏳️ Проверка белых списков с телефона</h1>
+<p class="lead">Сервер VPN не видит белые списки вашего оператора: подключение, которое работает у сервера, в мобильной сети может не открываться. Здесь телефон сам проверяет серверы из своей сети — те, что работают у него, встают в подписке первыми (с ✅) и попадают в «__AUTO__».</p>
+
+<section class="card">
+<h2>Как проверить (Android)</h2>
+<ol>
+<li>Установите <b>Termux</b>: <a href="https://f-droid.org/packages/com.termux/" rel="noopener">F-Droid</a> или <a href="https://github.com/termux/termux-app/releases/latest" rel="noopener">GitHub</a> (файл <i>…arm64-v8a.apk</i>).</li>
+<li>Один раз — по Wi-Fi или в любой сети, где открывается эта страница: откройте Termux и вставьте команду. Она скачает Xray и список серверов (около 15 МБ).
+<div class="cmd"><code id="c1">__CMD__</code><button type="button" data-copy="c1">Копировать</button></div></li>
+<li>Выключите Wi-Fi и VPN, включите мобильный интернет и выполните в Termux:
+<div class="cmd"><code id="c2">bash t.sh</code><button type="button" data-copy="c2">Копировать</button></div>
+<p class="note">Проверка идёт 1–3 минуты — не сворачивайте Termux. Результат сам придёт на сервер (если сервер VPN напрямую не открывается — через один из рабочих серверов).</p></li>
+<li>Обновите подписку в приложении (Happ, v2rayNG и др.) — серверы, которые работают у вас, будут первыми.</li>
+</ol>
+<p class="note">Другая SIM-карта или город — проверьте и там, с названием сети: <code>bash t.sh "Билайн"</code>. Результат действует __HOURS__ ч; проверяйте время от времени — списки операторов меняются.</p>
+<p class="note">iPhone так проверить нельзя (Termux есть только на Android). Проверка с Android-телефона того же оператора подойдёт и для iPhone, а «__AUTO__» на iPhone сам пингует серверы из своей сети.</p>
+</section>
+
+<section class="card">
+<h2>Работают с телефона</h2>
+<div class="stats" id="stats"></div>
+<div class="scroll"><table id="servers" hidden><thead><tr><th>Сервер</th><th>Сеть</th><th class="n">Пинг</th><th class="n">Когда</th></tr></thead><tbody></tbody></table></div>
+<p class="empty" id="servers-empty">Пока нет — проверьте с телефона (шаги выше).</p>
+</section>
+
+<section class="card">
+<h2>Последние проверки</h2>
+<div class="scroll"><table id="reports" hidden><thead><tr><th>Когда</th><th>Сеть</th><th class="n">Работают</th><th class="n">Лучший</th></tr></thead><tbody></tbody></table></div>
+<p class="empty" id="reports-empty">Проверок ещё не было.</p>
+<p class="note" id="state"></p>
+</section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function ago(t, now) {
+  const s = Math.max(0, now - t);
+  if (s < 90) return "только что";
+  if (s < 3600) return Math.round(s / 60) + " мин назад";
+  if (s < 172800) return Math.round(s / 3600) + " ч назад";
+  return Math.round(s / 86400) + " дн назад";
+}
+function row(cells) {
+  const tr = document.createElement("tr");
+  for (const [text, cls] of cells) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    if (cls) td.className = cls;
+    tr.appendChild(td);
+  }
+  return tr;
+}
+function stat(label, value) {
+  const span = document.createElement("span");
+  span.append(label + ": ");
+  const b = document.createElement("b");
+  b.textContent = value;
+  span.append(b);
+  return span;
+}
+function fill(id, rows) {
+  const table = $(id), body = table.tBodies[0];
+  body.replaceChildren(...rows);
+  table.hidden = rows.length === 0;
+  $(id + "-empty").hidden = rows.length > 0;
+}
+async function load() {
+  try {
+    const r = await fetch("status.json", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    $("stats").replaceChildren(
+      stat("работают у сервера", d.alive),
+      stat("проверяются с телефона", d.candidates),
+      stat("работают с телефона", d.verified),
+      stat("не работают с телефона", d.failed),
+      stat("из них первыми в подписке", d.in_sub));
+    fill("servers", d.servers.map((s) => row([
+      [s.name, ""], [s.label, "muted"],
+      [s.ms + " мс", "n"], [ago(s.time, d.now), "n muted"]])));
+    fill("reports", d.reports.map((x) => row([
+      [ago(x.time, d.now), "muted"],
+      [x.label + (x.open ? " (без ограничений — не учитывается)" : ""), x.open ? "warn" : ""],
+      [x.ok + " из " + x.tested, x.ok > 0 ? "n ok" : "n"],
+      [x.best ? x.best + " мс" : "—", "n"]])));
+    $("state").textContent = "Обновляется само · " + new Date(d.now * 1000).toLocaleTimeString("ru-RU");
+  } catch (e) {
+    $("state").textContent = "Нет связи с сервером — повторю через 15 с.";
+  }
+}
+for (const b of document.querySelectorAll("button[data-copy]")) {
+  b.addEventListener("click", async () => {
+    const text = $(b.dataset.copy).textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    b.textContent = "Скопировано";
+    setTimeout(() => { b.textContent = "Копировать"; }, 1500);
+  });
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
+'''
+
+
 class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "nginx"
@@ -554,6 +1446,85 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self.forward(True)
+
+    def do_POST(self):                    # только отчёт проверки с телефона
+        wpath = (WHITE.get("path") or "").rstrip("/")
+        if not (PHONE_DIR and wpath and self.path.split("?", 1)[0] == wpath + "/test/report"):
+            self.send_error(404)
+            return
+        try:
+            size = int(self.headers.get("Content-Length") or "-1")
+        except ValueError:
+            size = -1
+        if size < 0 or size > REPORT_MAX:
+            self.send_error(411 if size < 0 else 413)
+            return
+        body = self.rfile.read(size)
+        client = self.client_address[0]
+        client = client[7:] if client.startswith("::ffff:") else client
+        try:
+            ok, tested = phone_report(body.decode("utf-8", "replace"), client)
+        except ValueError as err:
+            self.send_body(400, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), False)
+            return
+        except OSError:
+            self.send_body(500, "text/plain; charset=utf-8", "Не удалось сохранить отчёт\n".encode("utf-8"), False)
+            return
+        self.send_body(200, "text/plain; charset=utf-8",
+                       ("Принято: проверено %d, работают %d\n" % (tested, ok)).encode("utf-8"), False)
+
+    def send_body(self, status, ctype, body, head, extra=()):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        for key, value in extra:
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def send_file(self, path, ctype, head):
+        try:
+            f = open(path, "rb")
+        except OSError:
+            self.send_error(404)
+            return
+        with f:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if not head:
+                try:
+                    shutil.copyfileobj(f, self.wfile, 64 * 1024)   # медленный мобильный — без тайм-аута на кусок
+                except OSError:
+                    pass
+
+    def phone(self, sub, head):           # страница проверки с телефона и всё, что берёт t.sh
+        wpath = (WHITE.get("path") or "").rstrip("/")
+        if sub == "":
+            self.send_body(301, "text/plain; charset=utf-8", b"", head, [("Location", wpath + "/test/")])
+            return
+        try:
+            base = phone_base(self)
+            if sub == "/":
+                self.send_body(200, "text/html; charset=utf-8", phone_page(base), head)
+            elif sub == "/t.sh":
+                self.send_body(200, "text/plain; charset=utf-8", phone_script(base), head)
+            elif sub == "/bundle":
+                self.send_body(200, "text/plain; charset=utf-8", phone_bundle(), head)
+            elif sub == "/status.json":
+                self.send_body(200, "application/json; charset=utf-8",
+                               json.dumps(phone_status(), ensure_ascii=False).encode("utf-8"), head)
+            elif sub == "/" + PHONE_XRAY:
+                self.send_file(os.path.join(PHONE_DIR, PHONE_XRAY), "application/gzip", head)
+            else:
+                self.send_error(405 if sub == "/report" else 404)
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            self.send_body(500, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), head)
 
     def white_page(self, head):           # отдельная подписка: только белые списки
         links = [it["link"] for it in white_items("list")]
@@ -571,7 +1542,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def forward(self, head):
         wpath = (WHITE.get("path") or "").rstrip("/")
-        if wpath and self.path.split("?", 1)[0].rstrip("/") == wpath:
+        path = self.path.split("?", 1)[0]
+        if wpath and PHONE_DIR and (path == wpath + "/test" or path.startswith(wpath + "/test/")):
+            self.phone(path[len(wpath) + 5:], head)
+            return
+        if wpath and path.rstrip("/") == wpath:
             self.white_page(head)
             return
         req = urllib.request.Request(UPSTREAM + self.path, method="HEAD" if head else "GET")
@@ -1597,6 +2572,44 @@ AccuracySec=30s
 WantedBy=timers.target
 UNIT
   systemctl daemon-reload >/dev/null 2>&1 || true
+  if white_phone_setup; then
+    grn "    Проверка с телефона: Xray для Android готов — страница проверки отдаёт его в Termux."
+  else
+    ylw "    Xray для Android не скачался — телефон при проверке скачает его сам с GitHub."
+  fi
+  return 0
+}
+white_phone_setup() {   # проверка с телефона: папка для отчётов и Xray для Android (arm64) той же версии, что у панели
+  local dir="${WHITE_DATA}/phone" xr ver="" url tmp
+  mkdir -p "$dir/reports" || return 1
+  xr="$(compgen -G "${XUI_DIR}/bin/xray-linux-*" | head -n 1 || true)"
+  if [ -n "$xr" ]; then ver="$("$xr" version 2>/dev/null | sed -n '1s/^Xray \([0-9][0-9.]*\).*/\1/p' || true)"; fi
+  if [ -s "$dir/xray-arm64-v8a.gz" ] && { [ -z "$ver" ] || [ "$(cat "$dir/xray-version" 2>/dev/null)" = "$ver" ]; }; then
+    return 0
+  fi
+  tmp="$(mktemp -d)" || return 1
+  for url in ${ver:+"https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-android-arm64-v8a.zip"} \
+             "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-android-arm64-v8a.zip"; do
+    if curl -fsSL --connect-timeout 15 --max-time 300 -o "$tmp/x.zip" "$url" 2>/dev/null \
+       && python3 -c 'import gzip, os, shutil, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z, z.open("xray") as f, gzip.open(sys.argv[2] + ".tmp", "wb", 6) as g:
+    shutil.copyfileobj(f, g, 1 << 20)
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])' "$tmp/x.zip" "$dir/xray-arm64-v8a.gz" 2>/dev/null; then
+      case "$url" in */latest/*) echo "-" ;; *) echo "$ver" ;; esac > "$dir/xray-version"
+      rm -rf "$tmp"
+      return 0
+    fi
+  done
+  rm -rf "$tmp"
+  return 1
+}
+white_phone_check() {   # white_phone_check https://127.0.0.1:порт/путь/test/ — «N X»: серверов для проверки с телефона, есть ли Xray для Android (1/0)
+  local base="$1" n x=0 code
+  code="$(curl -sk --noproxy '*' --max-time 15 -o /dev/null -w '%{http_code}' "$base" 2>/dev/null || true)"
+  [ "$code" = 200 ] || { echo "- 0"; return 0; }
+  n="$(curl -sk --noproxy '*' --max-time 30 "${base}bundle" 2>/dev/null | sed -n '1s/^#B [0-9]* [^ ]* \([0-9]*\) .*/\1/p' || true)"
+  if [ "$(curl -sk --noproxy '*' --max-time 15 -I -o /dev/null -w '%{http_code}' "${base}xray-arm64-v8a.gz" 2>/dev/null || true)" = 200 ]; then x=1; fi
+  echo "${n:--} $x"
 }
 white_timer_on() {   # проверка по таймеру — каждые WHITE_CHECK_MIN минут (и после перезагрузки сервера)
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1633,7 +2646,7 @@ white_remove() {   # убрать белые списки: таймер, про�
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 sub_filter_conf_white() {   # sub_filter_conf_white 1|0 — в настройки фильтра подписки: белые списки или без них
-  WHITE="$1" WHITE_CONF="$WHITE_CONF" python3 - "$SUB_FILTER_CONF" <<'PY'
+  WHITE="$1" WHITE_CONF="$WHITE_CONF" SUB_BASE="${SUB_BASE:-}" python3 - "$SUB_FILTER_CONF" <<'PY'
 import json, os, sys
 conf = json.load(open(sys.argv[1]))
 conf.pop("white", None)
@@ -1642,7 +2655,11 @@ if os.environ["WHITE"] == "1":
     conf["white"] = {"file": os.path.join(w["data"], "alive.json"), "path": w["path"],
                      "title": w.get("title") or "Белые списки", "update_hours": int(w.get("update_hours") or 1),
                      "sub_max": int(w.get("sub_max") or 50), "list_max": int(w.get("list_max") or 150),
-                     "auto": w.get("auto") or {}}
+                     "label": w.get("label") or "", "auto": w.get("auto") or {},
+                     # проверка с телефона (страница …/test/): отчёты, Xray для Android; работающие у телефона
+                     # за последние hours часов — первыми в подписке; max — сколько серверов проверяет телефон
+                     "phone": {"dir": os.path.join(w["data"], "phone"), "hours": 48, "max": 300,
+                               "base": os.environ.get("SUB_BASE", "")}}
 with open(sys.argv[1], "w") as f:
     json.dump(conf, f, indent=1)
 PY
@@ -1659,10 +2676,20 @@ one = sum(1 for c in confs if str(c.get("remarks") or "").startswith(os.environ[
 auto = next((c for c in confs if c.get("remarks") == os.environ["AUTO"]), {})
 print(one, sum(1 for o in auto.get("outbounds") or [] if str(o.get("tag") or "").startswith("wl-")))' 2>/dev/null || true)"
   nb="$(curl -sk --noproxy '*' --max-time 20 -A 'Streisand/1.6' "$url" 2>/dev/null | python3 -c 'import base64, json, sys
+def key(link):   # ссылка без названия: проверенные с телефона приходят с «✅» в названии
+    if link.lower().startswith("vmess://"):
+        body = link.split("://", 1)[1].split("#", 1)[0]
+        try:
+            d = json.loads(base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+            d.pop("ps", None)
+            return "vmess:" + json.dumps(d, sort_keys=True)
+        except ValueError:
+            return link
+    return link.split("#", 1)[0]
 raw = "".join(sys.stdin.read().split())
 text = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
-alive = {x["link"] for x in json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []}
-print(sum(1 for line in text.splitlines() if line.strip() in alive))' "${WHITE_DATA}/alive.json" 2>/dev/null || true)"
+alive = {key(x["link"]) for x in json.load(open(sys.argv[1], encoding="utf-8")).get("items") or []}
+print(sum(1 for line in text.splitlines() if line.strip() and key(line.strip()) in alive))' "${WHITE_DATA}/alive.json" 2>/dev/null || true)"
   read -r nj na <<< "${nj:-0 0}" || true
   echo "${nj:-0} ${nb:-0} ${na:-0}"
 }
@@ -1681,7 +2708,13 @@ white_summary() {   # итог для экрана и для файла с до�
     echo "быстрых по пингу; при включении телефон сразу пингует их все из своей сети, потом каждые 2 минуты, и ведёт"
     echo "трафик через самый быстрый из работающих у него; перестал отвечать — переходит на другой."
   fi
-  if [ -n "${WHITE_URL_SUB:-}" ]; then echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"; fi
+  if [ -n "${WHITE_URL_SUB:-}" ]; then
+    echo "Отдельная подписка — только белые списки: ${WHITE_URL_SUB}"
+    echo "Проверка с телефона (Android) — какие из них работают именно в вашей мобильной сети:"
+    echo "  ${WHITE_URL_SUB}test/"
+    echo "  Откройте на телефоне и выполните команду оттуда в Termux; работающие у вас серверы встанут"
+    echo "  в подписке первыми (с ✅) и попадут в автоподбор."
+  fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
 }
 
@@ -1900,6 +2933,13 @@ if [ "$WHITE_ONLY" = "1" ]; then
   white_timer_on || ylw "    Таймер проверки не запустился: systemctl status vpn-white-lists.timer"
   step "Добавляю белые списки в подписку..."
   write_sub_filter_program
+  # ссылка-подписка — из файла с доступами, адрес сервера подписки — из настроек панели
+  SUB_URL="$(sed -n 's/^Ссылка: *//p' "$PROFILE" 2>/dev/null | head -n 1 || true)"
+  SUB_BASE="$(DB="$DB" python3 -c 'import os, re, sqlite3
+row = sqlite3.connect(os.environ["DB"], timeout=30).execute("SELECT value FROM settings WHERE key=?", ("subURI",)).fetchone()
+m = re.match(r"(https?://[^/]+)", (row[0] or "") if row else "")
+print(m.group(1) if m else "")' 2>/dev/null || true)"
+  if [ -z "$SUB_BASE" ]; then SUB_BASE="$(printf '%s' "$SUB_URL" | sed -nE 's#^(https?://[^/]+).*#\1#p')"; fi
   sub_filter_conf_white 1 || die "Не удалось записать настройки фильтра подписки."
   systemctl restart vpn-sub-filter >/dev/null 2>&1 || die "Фильтр подписки не перезапустился. Логи: journalctl -u vpn-sub-filter -e"
   read -r F_PORT F_SCHEME < <(python3 -c 'import json, sys
@@ -1909,13 +2949,6 @@ print(int(c["port"]), "https" if c.get("cert") else "http")' "$SUB_FILTER_CONF" 
     code="$(curl -sk --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' "${F_SCHEME}://127.0.0.1:${F_PORT}/" 2>/dev/null || true)"
     case "$code" in ""|000|502) sleep 1 ;; *) break ;; esac
   done
-  # ссылка-подписка — из файла с доступами, адрес сервера подписки — из настроек панели
-  SUB_URL="$(sed -n 's/^Ссылка: *//p' "$PROFILE" 2>/dev/null | head -n 1 || true)"
-  SUB_BASE="$(DB="$DB" python3 -c 'import os, re, sqlite3
-row = sqlite3.connect(os.environ["DB"], timeout=30).execute("SELECT value FROM settings WHERE key=?", ("subURI",)).fetchone()
-m = re.match(r"(https?://[^/]+)", (row[0] or "") if row else "")
-print(m.group(1) if m else "")' 2>/dev/null || true)"
-  if [ -z "$SUB_BASE" ]; then SUB_BASE="$(printf '%s' "$SUB_URL" | sed -nE 's#^(https?://[^/]+).*#\1#p')"; fi
   WHITE_URL_SUB=""; WP="$(white_path)"
   if [ -n "$SUB_BASE" ] && [ -n "$WP" ]; then WHITE_URL_SUB="${SUB_BASE}${WP}"; fi
   NJ=0; NB=0; NA=0
@@ -1929,6 +2962,14 @@ print(m.group(1) if m else "")' 2>/dev/null || true)"
     ylw "    ✗ Рабочие подключения есть (${WHITE_ALIVE}), но в ответе подписки их не видно. Логи: journalctl -u vpn-sub-filter -e"
   elif [ "$WHITE_ALIVE" -eq 0 ]; then
     ylw "    Рабочих подключений пока нет — появятся в подписке после следующей полной проверки (раз в час)."
+  fi
+  if [ -n "$WP" ]; then
+    read -r PN PX <<< "$(white_phone_check "${F_SCHEME}://127.0.0.1:${F_PORT}${WP}test/")" || true
+    if [ "${PN:--}" != "-" ]; then
+      grn "    ✓ Проверка с телефона: страница работает (серверов для проверки: ${PN}$([ "${PX:-0}" = 1 ] && echo ", Xray для Android — на сервере"))."
+    else
+      ylw "    ✗ Страница проверки с телефона не отвечает. Логи: journalctl -u vpn-sub-filter -e"
+    fi
   fi
   echo
   ylw "============ БЕЛЫЕ СПИСКИ ДЛЯ МОБИЛЬНОГО ИНТЕРНЕТА ============"
@@ -3867,6 +4908,12 @@ if [ "$WHITE_READY" = "1" ] && [ "$FILTER" = "1" ]; then
     ylw "    ✗ Белые списки: рабочих подключений пока нет — появятся после следующей полной проверки (раз в час)"
   else
     ylw "    ✗ Белые списки: рабочие подключения есть (${WHITE_ALIVE}), но в подписке их не видно (journalctl -u vpn-sub-filter -e)"
+  fi
+  read -r PN PX <<< "$(white_phone_check "${LOCAL_SUB%%"${SUB_PATH}${SUB_ID}"}$(white_path)test/")" || true
+  if [ "${PN:--}" != "-" ]; then
+    grn "    ✓ Проверка с телефона: страница работает (серверов для проверки: ${PN}$([ "${PX:-0}" = 1 ] && echo ", Xray для Android — на сервере"))"
+  else
+    ylw "    ✗ Проверка с телефона: страница не отвечает (journalctl -u vpn-sub-filter -e)"
   fi
 fi
 case "$CHECK_SERVER" in

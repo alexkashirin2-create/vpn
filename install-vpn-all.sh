@@ -107,6 +107,9 @@ SNI_USER="${SNI:-}"                   # SNI указан в команде — �
 SNI="${SNI:-www.microsoft.com}"       # домен-маскировка Reality (TLS 1.3, открыт из РФ)
 VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
 XHTTP_PORT="${XHTTP_PORT:-8443}"      # второе подключение VLESS + XHTTP (сайты открываются быстрее); 0 — не создавать
+REALITY_ALT="${REALITY_ALT:-auto}"   # запасной Reality с российской маскировкой: auto — если сервер в РФ, а SNI зарубежный; 1 — всегда; 0 — нет
+REALITY_ALT_PORT="${REALITY_ALT_PORT:-9443}"   # его порт
+REALITY_ALT_SNI="${REALITY_ALT_SNI:-ya.ru www.ozon.ru www.wildberries.ru vk.com mail.ru www.gosuslugi.ru}"   # кандидаты: берётся первый, что открывается с сервера
 WS_PORT="${WS_PORT:-2083}"            # третье подключение VLESS + WebSocket + TLS (как «LTE»-профили, проходит через CDN); 0 — нет
 HY2_PORT="${HY2_PORT:-443}"           # четвёртое подключение Hysteria2 — UDP-порт (с Reality на TCP 443 не мешают); 0 — нет
 PANEL_PORT="${PANEL_PORT:-}"          # порт панели (пусто = случайный, при повторном запуске — прежний)
@@ -155,6 +158,7 @@ EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль этого лог
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"  # мост: порт SSH зарубежного сервера
 EXIT_VPN_PORT="${EXIT_VPN_PORT:-443}" # мост: порт, на котором зарубежный сервер ждёт российский
 EXIT_XHTTP_PORT="${EXIT_XHTTP_PORT:-8443}" # мост: порт XHTTP на зарубежном сервере (0 — только TCP)
+PEXIT_PROTO="${PEXIT_PROTO:-ws}"       # мост: подключения «через РФ» — ws (WebSocket + TLS на свой домен: проходит, когда провайдер режет Reality) или xhttp (Reality)
 EXIT_DIRECT="${EXIT_DIRECT:-0}"       # мост: 0 — только через РФ (прямые подключения к зарубежным IP при белых списках не работают и в приложении висят «таймаутом»); 1 — ещё и узлы с прямым подключением
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh}"
 # ==========================================================================
@@ -213,6 +217,7 @@ if [[ "$BALANCE_APP_RTT" =~ ^[0-9]+$ ]]; then BALANCE_APP_RTT="${BALANCE_APP_RTT
 [[ "$BALANCE_APP_RTT" =~ ^[1-9][0-9]*(ms|s)$ ]] || die "BALANCE_APP_RTT указан неверно (например, 3s или 2500ms): ${BALANCE_APP_RTT}"
 case "$BALANCE_APP_RTT" in *ms) APP_RTT_TEXT="${BALANCE_APP_RTT%ms} мс" ;; *) APP_RTT_TEXT="${BALANCE_APP_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
+{ [[ "$REALITY_ALT_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$REALITY_ALT_PORT" -le 65535 ]; } || die "REALITY_ALT_PORT указан неверно: ${REALITY_ALT_PORT}"
 [ "$EXIT_DIRECT" = "0" ] || EXIT_DIRECT=1
 case "$(printf '%s' "$WHITE_LISTS" | tr '[:upper:]' '[:lower:]')" in
   "") WHITE_LISTS="" ;;
@@ -537,6 +542,96 @@ flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
 sys.stdout.buffer.write(("%s %s" % (flag, names.get(cc, cc).replace("_", " "))).encode())
 PY
 }
+
+# ---------- самопроверка подключений: как у телефона, настоящим запросом ----------
+# Берёт из подписки (как её получает Happ) каждое своё подключение — Reality, XHTTP, WS, Hysteria2,
+# «через РФ» — запускает с этими настройками Xray и пропускает через него запрос в интернет.
+# Запрос идёт с самого сервера, поэтому проверяет сервер и настройки, но не провайдера телефона:
+# работает здесь и «н/д» на телефоне — подключение режет сеть телефона (для Reality — смените SNI).
+OWN_OK=0; OWN_FAIL=0; OWN_REALITY_FAIL=0; OWN_TLS_OK=0
+own_conn_test() {   # own_conn_test URL-подписки [xray] [метка-белых-списков]
+  local url="$1" xr="${2:-}" wl="${3:-}" dir n name port proto pid _ ip line
+  OWN_OK=0; OWN_FAIL=0; OWN_REALITY_FAIL=0; OWN_TLS_OK=0
+  [ -n "$xr" ] || xr="$(compgen -G "/usr/local/x-ui/bin/xray-linux-*" | head -n 1 || true)"
+  [ -x "$xr" ] || { ylw "    Самопроверка пропущена: не найден Xray панели."; return 1; }
+  dir="$(mktemp -d)"
+  if ! curl -sk --noproxy '*' --max-time 20 -A 'Happ/3.0' -o "$dir/sub.json" "$url" 2>/dev/null; then
+    ylw "    Самопроверка пропущена: подписка не отвечает (${url})."; rm -rf "$dir"; return 1
+  fi
+  WL="$wl" python3 - "$dir/sub.json" "$dir" > "$dir/list" 2>/dev/null <<'PY' || { ylw "    Самопроверка пропущена: подписка не в формате Xray JSON."; rm -rf "$dir"; return 1; }
+import json, os, sys
+data = json.load(open(sys.argv[1]))
+wl = os.environ.get("WL") or ""
+port = 31800
+for i, c in enumerate(data if isinstance(data, list) else [data]):
+    name = str(c.get("remarks") or "")
+    if not name or (wl and name.startswith(wl)) or (c.get("routing") or {}).get("balancers"):
+        continue                                   # белые списки и «Автовыбор» — не свои отдельные подключения
+    proxy = next((o for o in c.get("outbounds") or [] if isinstance(o, dict) and o.get("tag") == "proxy"), None)
+    if not proxy:
+        continue
+    st = proxy.get("streamSettings") or {}
+    kind = "%s/%s/%s" % (proxy.get("protocol"), st.get("network") or "tcp", st.get("security") or "none")
+    port += 1
+    conf = {"log": {"loglevel": "warning"},
+            "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
+            "outbounds": [dict(proxy, tag="proxy")]}
+    json.dump(conf, open("%s/c%d.json" % (sys.argv[2], port), "w"))
+    print(port, kind, name.replace("\n", " "))
+    if port >= 31830:
+        break
+PY
+  if [ ! -s "$dir/list" ]; then ylw "    Самопроверка: в подписке нет своих подключений."; rm -rf "$dir"; return 1; fi
+  while read -r port proto name; do
+    XRAY_LOCATION_ASSET="$(dirname "$xr")" "$xr" run -c "$dir/c${port}.json" > "$dir/x${port}.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 20); do tcp_ok 127.0.0.1 "$port" && break; sleep 0.3; done
+    ip=""
+    for u in https://api.ipify.org https://ipv4.icanhazip.com; do
+      ip="$(env -u no_proxy -u NO_PROXY curl -s --max-time 12 -x "socks5h://127.0.0.1:${port}" "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+      is_ipv4 "$ip" && break; ip=""
+    done
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+    if [ -n "$ip" ]; then
+      OWN_OK=$((OWN_OK + 1))
+      case "$proto" in */tls) OWN_TLS_OK=$((OWN_TLS_OK + 1)) ;; esac
+      grn "    ✓ ${name} (${proto}): работает, выход в интернет — ${ip}"
+    else
+      OWN_FAIL=$((OWN_FAIL + 1))
+      case "$proto" in */reality) OWN_REALITY_FAIL=$((OWN_REALITY_FAIL + 1)) ;; esac
+      line="$(grep -iE 'error|failed|reality' "$dir/x${port}.log" 2>/dev/null | tail -n 1 | cut -c1-160 || true)"
+      ylw "    ✗ ${name} (${proto}): запрос не прошёл${line:+ — ${line}}"
+    fi
+  done < "$dir/list"
+  rm -rf "$dir"
+  return 0
+}
+reality_sni_hint() {   # reality_sni_hint IP-сервера SNI — подсказка: российский сервер с зарубежной маскировкой
+  local cc
+  case "$2" in *.ru|*.su|*.xn--p1ai|*.рф) return 0 ;; esac
+  cc="$(ip_country "$1")"
+  if [ "$cc" = "RU" ]; then
+    ylw "    ! Сервер в России, а маскировка Reality — зарубежный сайт (${2}). Провайдеры часто режут такие"
+    ylw "      подключения: у телефона Reality и XHTTP будут «н/д», хотя здесь работают. Помогает российский"
+    ylw "      сайт: запустите скрипт с SNI=ya.ru (или SNI=www.ozon.ru) в начале команды — ключи сохранятся."
+  fi
+}
+
+if [ "${CHECK:-}" = "1" ]; then   # только самопроверка: ничего не устанавливает и не меняет
+  grn "=== Самопроверка подключений из подписки ==="
+  C_SUB="$(sed -n 's/^Ссылка: *//p' "$PROFILE" 2>/dev/null | head -n 1 || true)"
+  [ -n "$C_SUB" ] || die "Не нашёл ссылку-подписку в ${PROFILE} — сначала установите VPN этим скриптом."
+  C_WL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("label") or "")' "$WHITE_CONF" 2>/dev/null || true)"
+  own_conn_test "$C_SUB" "" "${C_WL:-$WHITE_LABEL}" || exit 1
+  C_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  C_SNI="$(python3 -c 'import json, sqlite3, sys
+for (s,) in sqlite3.connect(sys.argv[1], timeout=30).execute("SELECT stream_settings FROM inbounds WHERE port=?", (int(sys.argv[2]),)):
+    n = ((json.loads(s or "{}").get("realitySettings") or {}).get("serverNames") or [""])[0]
+    if n: print(n); break' "$DB" "$VPN_PORT" 2>/dev/null || true)"
+  if [ -n "$C_SNI" ] && [ -n "$C_IP" ]; then reality_sni_hint "$C_IP" "$C_SNI"; fi
+  echo "Итог: работают ${OWN_OK}, не работают ${OWN_FAIL}. Проверка идёт с сервера: если здесь ✓, а в приложении «н/д» — подключение режет сеть телефона."
+  exit 0
+fi
 
 # ---------- фильтр подписки и белые списки: программы, которые ставит этот скрипт ----------
 # Фильтр подписки стоит перед панелью на порту подписки: дописывает «Автовыбору» тонкие настройки
@@ -4969,10 +5064,127 @@ elif [ "$HY2_PORT" != "0" ] && [ "$VPN_ROLE" != "exit" ] && [ "$SSL_OK" = "1" ];
   ylw "    Hysteria2 не настроился — остаются другие подключения."
 fi
 
+# Запасной вариант Reality — с российской маскировкой. Провайдеры часто режут Reality к российскому
+# серверу, если маскировка — зарубежный сайт (apple.com и т. п.), а с российским сайтом пропускают.
+# Скрипт сам выбирает сайт, который открывается с сервера, и добавляет второе подключение: в подписке
+# и в «Автовыборе» есть оба, телефон пользуется тем, что работает у него.
+ALT_OK=0; ALT_ID=""; ALT_SNI=""; ALT_LABEL="${ALT_LABEL:-${LABEL%-Reality}-XHTTP-RU}"
+ensure_reality_alt() {
+  local want=0 cc d st id port sni has msg
+  if [ "$VPN_ROLE" = "exit" ] || [ "${CLIENT_EMAIL:--}" = "-" ]; then return 0; fi
+  case "$REALITY_ALT" in
+    1|on|yes) want=1 ;;
+    0|off|no) want=0 ;;
+    *) case "$SNI" in *.ru|*.su|*.xn--p1ai) want=0 ;;
+         *) cc="$(ip_country "$SERVER_IP")"; if [ "$cc" = "RU" ]; then want=1; fi ;; esac ;;
+  esac
+  for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80; do
+    if [ "$REALITY_ALT_PORT" = "$p" ]; then ylw "    REALITY_ALT_PORT совпадает с другим портом — запасной Reality пропускаю."; want=0; fi
+  done
+  api GET /inbounds/list > "$WORK/inbounds-alt.json" || return 1
+  read -r st id sni has < <(PORT="$REALITY_ALT_PORT" UUID="$UUID" python3 - "$WORK/inbounds-alt.json" <<'PY' 2>/dev/null || echo "error - - -"
+import json, os, sys
+def obj(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v) if v else {}
+        except ValueError:
+            return {}
+    return v or {}
+for ib in json.load(open(sys.argv[1])).get("obj") or []:
+    if int(ib.get("port") or 0) != int(os.environ["PORT"]):
+        continue
+    s, st = obj(ib.get("settings")), obj(ib.get("streamSettings"))
+    if ib.get("protocol") in ("hysteria", "wireguard", "amneziawg", "tuic") or st.get("network") in ("kcp", "quic"):
+        continue
+    rs = st.get("realitySettings") or {}
+    if ib.get("protocol") == "vless" and st.get("security") == "reality" and st.get("network") == "xhttp":
+        has = any(c.get("id") == os.environ["UUID"] for c in (s.get("clients") or []))
+        print("reuse", ib["id"], (rs.get("serverNames") or ["-"])[0] or "-", "yes" if has else "no")
+    elif ib.get("tag") == "vpn-reality-alt":
+        print("old", ib["id"], "-", "-")        # прежний запасной (обычный Reality) — заменяем на XHTTP
+    else:
+        print("busy", ib["id"], "-", "-")
+    break
+else:
+    print("none - - -")
+PY
+)
+  if [ "$st" = "old" ]; then api POST "/inbounds/del/${id}" >/dev/null 2>&1 || true; st="none"; fi
+  if [ "$want" != "1" ]; then   # не нужен — прежний запасной (если был) убираем
+    if [ "$st" = "reuse" ]; then api POST "/inbounds/del/${id}" >/dev/null 2>&1 || true; fi
+    return 0
+  fi
+  if [ "$st" = "busy" ]; then ylw "    Порт ${REALITY_ALT_PORT} занят другим подключением — запасной Reality пропускаю (REALITY_ALT_PORT=…)."; return 0; fi
+  # сайт для маскировки: прежний, если ещё открывается, иначе первый подходящий из списка
+  ALT_SNI=""
+  if [ "$st" = "reuse" ] && [ "$sni" != "-" ] && [ "$sni" != "$SNI" ] && sni_check "$sni"; then ALT_SNI="$sni"; fi
+  if [ -z "$ALT_SNI" ]; then
+    for d in $REALITY_ALT_SNI; do
+      if [ "$d" != "$SNI" ] && sni_check "$d"; then ALT_SNI="$d"; break; fi
+    done
+  fi
+  if [ -z "$ALT_SNI" ]; then ylw "    Запасной Reality: ни один сайт из списка (${REALITY_ALT_SNI}) не открывается с сервера — пропускаю."; return 0; fi
+  if [ "$st" = "reuse" ] && [ "$sni" = "$ALT_SNI" ]; then
+    ALT_ID="$id"
+    sync_share_addr "$ALT_ID" "$ALT_LABEL" "" "$ADDR" || true   # адрес — явно: SNI из команды запасного не касается
+    if [ "$has" != "yes" ]; then attach_client "$ALT_ID" || return 1; fi
+  else
+    if [ "$st" = "reuse" ]; then api POST "/inbounds/del/${id}" >/dev/null 2>&1 || true; fi
+    local main_sni="$SNI" rc=0
+    SNI="$ALT_SNI"   # create_xhttp_inbound берёт маскировку из SNI
+    create_xhttp_inbound "$REALITY_ALT_PORT" "$ALT_LABEL" 3 "vpn-reality-alt" || rc=1
+    SNI="$main_sni"
+    [ "$rc" = "0" ] || return 1
+    ALT_ID="$MK_ID"
+    attach_client "$ALT_ID" || return 1   # тот же клиент, та же подписка
+  fi
+  if command -v ufw >/dev/null 2>&1; then ufw allow "${REALITY_ALT_PORT}/tcp" >/dev/null 2>&1 || true; fi
+  ALT_OK=1
+}
+if ensure_reality_alt && [ "$ALT_OK" = "1" ]; then
+  grn "    Запасной XHTTP «${ALT_LABEL}» на порту ${REALITY_ALT_PORT}: маскировка под ${ALT_SNI} — если провайдер режет Reality с ${SNI}."
+fi
+
 # Отдельное подключение к каждому зарубежному выходу: в приложении можно выбрать конкретный
 # сервер — он подписан страной по IP, «🇳🇱 Нидерланды (IP)» (порт 8444 — выход 1, 8445 — выход 2…).
 declare -A PEXIT_ID=() PEXIT_TAG=()
 PEXIT_LIST=""
+create_ws_inbound() {   # create_ws_inbound порт название порядок [метка] → MK_ID (VLESS + WebSocket + TLS на сертификат этого сервера)
+  local msg
+  WPORT="$1" WLABEL="$2" SORT="$3" XTAG="${4:-}" WPATH="/api/v2/ws/$(openssl rand -hex 12)" ADDR="$ADDR" CERT="$CERT" KEY="$KEY" \
+  python3 - > "$WORK/mkws.json" <<'PY'
+import json, os
+e = os.environ
+stream = {"network": "ws", "security": "tls", "externalProxy": [],
+          "wsSettings": {"acceptProxyProtocol": False, "path": e["WPATH"], "host": e["ADDR"],
+                         "headers": {}, "heartbeatPeriod": 30},
+          "tlsSettings": {"serverName": e["ADDR"], "minVersion": "1.2", "maxVersion": "1.3",
+                          "cipherSuites": "", "rejectUnknownSni": False, "disableSystemRoot": False,
+                          "enableSessionResumption": False,
+                          "certificates": [{"certificateFile": e["CERT"], "keyFile": e["KEY"],
+                                            "ocspStapling": 3600, "oneTimeLoading": False,
+                                            "usage": "encipherment", "buildChain": False}],
+                          "alpn": ["http/1.1"],
+                          "settings": {"allowInsecure": False, "fingerprint": "chrome", "echConfigList": ""}}}
+settings = {"clients": [], "decryption": "none", "encryption": "none", "fallbacks": []}
+sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"],
+            "metadataOnly": False, "routeOnly": False}
+inbound = {"remark": e["WLABEL"], "enable": True, "listen": "", "port": int(e["WPORT"]),
+           "protocol": "vless", "expiryTime": 0, "total": 0,
+           "shareAddrStrategy": "custom", "shareAddr": e["ADDR"],
+           "disableFlow": True, "subSortIndex": int(e["SORT"]),
+           "settings": json.dumps(settings), "streamSettings": json.dumps(stream),
+           "sniffing": json.dumps(sniffing)}
+if e.get("XTAG"):
+    inbound["tag"] = e["XTAG"]
+print(json.dumps(inbound))
+PY
+  api POST /inbounds/add "$WORK/mkws.json" > "$WORK/mkws-res.json" || return 1
+  if ! msg="$(api_ok "$WORK/mkws-res.json")"; then ylw "    Панель не приняла подключение «$2»: ${msg:-нет ответа}"; return 1; fi
+  MK_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["obj"]["id"])' "$WORK/mkws-res.json" 2>/dev/null || true)"
+  [ -n "$MK_ID" ]
+}
 ensure_exit_inbounds() {
   local n port host id rport rhost rtag has kind remark tag keep p
   if [ "$VPN_ROLE" = "exit" ] || [ "${CLIENT_EMAIL:--}" = "-" ]; then return 0; fi   # без моста — только уборка
@@ -4998,14 +5210,20 @@ for ib in data.get("obj") or []:
         host = remark[len(prefix):]
     if host:
         has = any(c.get("id") == os.environ["UUID"] for c in (s.get("clients") or []))
-        print("our", ib["id"], ib["port"], host, tag or "-", "yes" if has else "no")
+        net = st.get("network") or "tcp"
+        if net == "ws":
+            cert = (((st.get("tlsSettings") or {}).get("certificates") or [{}])[0]).get("certificateFile") or ""
+            net = "ws|" + cert
+        print("our", ib["id"], ib["port"], host, tag or "-", "yes" if has else "no", net)
     elif ib.get("protocol") in ("hysteria", "wireguard", "amneziawg", "tuic") or st.get("network") in ("kcp", "quic"):
         continue                             # UDP-подключения TCP-порты не занимают
     else:
-        print("busy", ib["id"], ib["port"], "-", "-", "-")
+        print("busy", ib["id"], ib["port"], "-", "-", "-", "-")
 PY
   # прежние подключения к выходам, которых больше нет (или порт достался другому выходу), — удаляем
-  while read -r kind id rport rhost rtag has; do
+  local want="xhttp" net
+  if [ "$PEXIT_PROTO" = "ws" ] && [ "$SSL_OK" = "1" ]; then want="ws|${CERT}"; fi
+  while read -r kind id rport rhost rtag has net; do
     [ "$kind" = "our" ] || continue
     keep=0
     for n in "${EXIT_OK_N[@]}"; do
@@ -5017,12 +5235,16 @@ PY
   for n in "${EXIT_OK_N[@]}"; do
     port=$((PEXIT_BASE + n)); host="${EX_HOST[$n]}"; id=""
     remark="$(exit_base "$n") (через РФ)"; tag="${PEXIT_TAG_PREFIX}${host}"
-    for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80; do
+    for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80 "$REALITY_ALT_PORT"; do
       if [ "$port" = "$p" ]; then port=""; fi
     done
     if [ -z "$port" ]; then ylw "    Выход ${n}: порт $((PEXIT_BASE + n)) занят другой настройкой — отдельного подключения не будет."; continue; fi
-    while read -r kind rid rport rhost rtag has; do
+    while read -r kind rid rport rhost rtag has net; do
       if [ "$rport" != "$port" ]; then continue; fi
+      if [ "$kind" = "our" ] && [ "$rhost" = "$host" ] && [ "$net" != "$want" ]; then
+        api POST "/inbounds/del/${rid}" >/dev/null 2>&1 || true   # другой вид подключения — пересоздаём
+        continue
+      fi
       if [ "$kind" = "our" ] && [ "$rhost" = "$host" ]; then id="$rid"
         if [ "$has" != "yes" ]; then attach_client "$id" || id=""; fi
         if [ -n "$id" ]; then sync_share_addr "$id" "$remark" "$tag" || true; fi   # и название со страной
@@ -5031,7 +5253,12 @@ PY
     done < "$WORK/pe.tsv"
     if [ "$id" = "busy" ]; then ylw "    Выход ${n}: порт ${port} занят другим подключением — отдельного подключения не будет."; continue; fi
     if [ -z "$id" ]; then
-      if create_xhttp_inbound "$port" "$remark" "$((10 + 2 * n))" "$tag" && attach_client "$MK_ID"; then
+      if [ "$want" != "xhttp" ]; then
+        create_ws_inbound "$port" "$remark" "$((10 + 2 * n))" "$tag" || continue
+      else
+        create_xhttp_inbound "$port" "$remark" "$((10 + 2 * n))" "$tag" || continue
+      fi
+      if attach_client "$MK_ID"; then
         id="$MK_ID"
       else
         continue
@@ -5073,6 +5300,7 @@ ensure_autoselect() {
   if [ -n "${INB_ID:-}" ] && [ "$INB_ID" != "-" ]; then ids+=("$INB_ID"); fi
   if [ "$WS_OK" = "1" ]; then ids+=("$WS_ID"); fi
   if [ "$HY2_OK" = "1" ]; then ids+=("$HY2_ID"); fi
+  if [ "$ALT_OK" = "1" ]; then ids+=("$ALT_ID"); fi
   for n in "${EXIT_OK_N[@]}"; do
     if [ -n "${PEXIT_ID[$n]:-}" ]; then ids+=("${PEXIT_ID[$n]}"); fi
     if [ -n "${DIRECT_ID[$n]:-}" ]; then ids+=("${DIRECT_ID[$n]}"); fi
@@ -5962,6 +6190,14 @@ if [ -n "$CLASH_URL" ]; then
     ylw "    ✗ Tunnel / Mihomo: профиль не отвечает (journalctl -u x-ui -e)"; CLASH_URL=""; TUNNEL_URL=""
   fi
 fi
+grn "    Проверяю каждое подключение настоящим запросом (как у телефона)..."
+if [ "$SSL_OK" = "1" ]; then OWN_URL="https://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; else OWN_URL="http://127.0.0.1:${SUB_PORT}${SUB_PATH}${SUB_ID}"; fi
+if own_conn_test "$OWN_URL" "$XRAY_BIN" "$([ "$WHITE_READY" = "1" ] && printf '%s' "$WHITE_LABEL")"; then
+  if [ "$OWN_REALITY_FAIL" -gt 0 ] && [ "$OWN_TLS_OK" -gt 0 ]; then
+    ylw "    ! Reality не работает даже с сервера, а TLS-подключения работают — проверьте, что ${SNI} открывается с сервера."
+  fi
+fi
+reality_sni_hint "$SERVER_IP" "$SNI"
 case "$CHECK_SERVER" in
   ok)   grn "    ✓ Сервер: рекламный домен уходит в блок" ;;
   fail) ylw "    ✗ Сервер: проверка фильтра рекламы не прошла" ;;
@@ -6030,6 +6266,313 @@ if [ "$BRIDGE" = "1" ] && [ -n "$TUNNEL_SPEED" ]; then
 fi
 
 # ============================================================================
+# ============================================================================
+# НАБЛЮДЕНИЕ В РЕАЛЬНОМ ВРЕМЕНИ (служба vpn-watch, каждые 2 минуты): сервер сам проверяет свои
+# подключения настоящим запросом, смотрит, через какие идёт трафик клиентов, при необходимости меняет
+# маскировку запасного XHTTP и выстраивает подписку: первыми — рабочие Reality, затем остальные.
+WATCH_PY="/usr/local/bin/vpn-watch.py"
+WATCH_CONF="/etc/x-ui/vpn-watch.json"
+WATCH_DATA="/var/lib/vpn-watch"
+WATCH_MIN="${WATCH_MIN:-2}"
+write_watch_program() {
+  cat > "$WATCH_PY" <<'PY'
+#!/usr/bin/env python3
+# Наблюдение за подключениями VPN (ставит install-vpn-all.sh, запускает таймер vpn-watch).
+# 1) каждое своё подключение из подписки проверяется настоящим запросом через Xray — как у телефона;
+# 2) трафик клиентов по каждому подключению: где он идёт — то подключение у людей работает;
+# 3) маскировка запасного XHTTP перестала открываться с сервера — берётся следующий сайт из списка;
+# 4) порядок в подписке: рабочие Reality первыми (с трафиком и меньшим пингом — выше), затем остальные.
+import json, os, socket, ssl, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+
+CONF = json.load(open(sys.argv[1], encoding="utf-8"))
+DATA = CONF.get("data") or "/var/lib/vpn-watch"
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+
+def log(text):
+    print(text, flush=True)
+
+
+def api(method, path, body=None, form=None):
+    url = CONF["api"].rstrip("/") + path
+    headers = {"Authorization": "Bearer " + CONF["token"]}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def obj(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v) if v else {}
+        except ValueError:
+            return {}
+    return v or {}
+
+
+def sni_ok(host):
+    """открывается ли сайт-маскировка с сервера по TLS 1.3 (без этого Reality не работает)"""
+    try:
+        c = ssl.create_default_context()
+        c.minimum_version = ssl.TLSVersion.TLSv1_3
+        with socket.create_connection((host, 443), timeout=6) as raw:
+            with c.wrap_socket(raw, server_hostname=host):
+                return True
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def recv_exact(sock, size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise OSError("closed")
+        data += chunk
+    return data
+
+
+def probe(port, timeout=10):
+    """запрос http://www.gstatic.com/generate_204 через SOCKS 127.0.0.1:port — мс или None"""
+    host, start = b"www.gstatic.com", time.monotonic()
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+            s.sendall(b"\x05\x01\x00")
+            if recv_exact(s, 2) != b"\x05\x00":
+                return None
+            s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + (80).to_bytes(2, "big"))
+            head = recv_exact(s, 4)
+            if head[1] != 0:
+                return None
+            size = {1: 4, 4: 16}.get(head[3])
+            if size is None:
+                size = recv_exact(s, 1)[0]
+            recv_exact(s, size + 2)
+            s.sendall(b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n")
+            reply = s.recv(64)
+            if not reply.startswith(b"HTTP/") or reply.split()[1][:1] not in (b"2", b"3"):
+                return None
+            return int((time.monotonic() - start) * 1000)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def self_test():
+    """{название подключения: мс или None} — по подписке, как её получает Happ"""
+    req = urllib.request.Request(CONF["sub"], headers={"User-Agent": "Happ/3.0"})
+    with urllib.request.urlopen(req, timeout=30, context=CTX) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    wl, items = CONF.get("wl_label") or "", []
+    for c in data if isinstance(data, list) else [data]:
+        name = str(c.get("remarks") or "")
+        if not name or (wl and name.startswith(wl)) or (c.get("routing") or {}).get("balancers"):
+            continue
+        proxy = next((o for o in c.get("outbounds") or [] if isinstance(o, dict) and o.get("tag") == "proxy"), None)
+        if proxy:
+            items.append((name, proxy))
+    if not items:
+        return {}
+    socks, ports = [], []
+    for _ in items:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        socks.append(s)
+        ports.append(s.getsockname()[1])
+    for s in socks:
+        s.close()
+    conf = {"log": {"loglevel": "none"}, "inbounds": [], "outbounds": [], "routing": {"rules": []}}
+    for i, ((name, proxy), port) in enumerate(zip(items, ports)):
+        conf["inbounds"].append({"tag": "i%d" % i, "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                                 "settings": {"udp": False}})
+        conf["outbounds"].append(dict(proxy, tag="o%d" % i))
+        conf["routing"]["rules"].append({"type": "field", "inboundTag": ["i%d" % i], "outboundTag": "o%d" % i})
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(conf, f)
+    proc = subprocess.Popen([CONF["xray"], "run", "-c", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=dict(os.environ, XRAY_LOCATION_ASSET=os.path.dirname(CONF["xray"])))
+    try:
+        time.sleep(1.5)
+        result = {}
+        for (name, _), port in zip(items, ports):
+            ms = probe(port)
+            if ms is None:
+                ms = probe(port)               # вторая попытка — один сбой ещё не поломка
+            result[name] = ms
+        return result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        os.unlink(path)
+
+
+def set_sni(ib, sni):
+    """новая маскировка Reality у подключения (ключи прежние)"""
+    full = api("GET", "/inbounds/get/%s" % ib["id"])["obj"]
+    full = obj(full)
+    st = obj(full.get("streamSettings"))
+    rs = st.setdefault("realitySettings", {})
+    rs["serverNames"] = [sni]
+    rs.pop("dest", None)
+    rs["target"] = sni + ":443"
+    full["streamSettings"] = st
+    for key in ("settings", "streamSettings", "sniffing"):
+        if not isinstance(full.get(key), str):
+            full[key] = json.dumps(full.get(key) or {})
+    full.pop("clientStats", None)
+    r = api("POST", "/inbounds/update/%s" % ib["id"], body=full)
+    return bool(r.get("success"))
+
+
+def main():
+    os.makedirs(DATA, exist_ok=True)
+    state_path = os.path.join(DATA, "state.json")
+    try:
+        state = json.load(open(state_path))
+    except (OSError, ValueError):
+        state = {}
+    traffic = state.get("traffic") or {}
+    inbounds = api("GET", "/inbounds/list").get("obj") or []
+    own = [ib for ib in inbounds if not ib.get("nodeId") and ib.get("enable", True)]
+    # 1) трафик клиентов: сколько прошло с прошлой проверки (сглаженно — за последние ~10–20 минут)
+    for ib in own:
+        key, total = str(ib["id"]), int(ib.get("up") or 0) + int(ib.get("down") or 0)
+        prev = traffic.get(key) or {}
+        delta = max(0, total - int(prev.get("total") or total))
+        traffic[key] = {"total": total, "avg": round(0.7 * float(prev.get("avg") or 0) + delta)}
+    # 2) маскировка: у запасного XHTTP — сменить, если сайт перестал открываться; у остальных — сообщить
+    for ib in own:
+        st = obj(ib.get("streamSettings"))
+        if st.get("security") != "reality":
+            continue
+        sni = ((st.get("realitySettings") or {}).get("serverNames") or [""])[0]
+        if not sni or sni_ok(sni):
+            continue
+        if ib.get("tag") == CONF.get("alt_tag"):
+            new = next((d for d in CONF.get("alt_sni") or [] if d != sni and sni_ok(d)), "")
+            if new and set_sni(ib, new):
+                log("«%s»: маскировка %s перестала открываться — переключил на %s." % (ib.get("remark"), sni, new))
+            else:
+                log("«%s»: маскировка %s не открывается, замены из списка нет." % (ib.get("remark"), sni))
+        else:
+            log("«%s»: маскировка %s не открывается с сервера — подключение не будет работать (смените SNI)." % (ib.get("remark"), sni))
+    # 3) настоящий запрос через каждое подключение
+    try:
+        test = self_test()
+    except (OSError, ValueError) as err:
+        test = {}
+        log("Самопроверка не прошла: %s" % err)
+    # 4) порядок в подписке: рабочие Reality первыми, затем остальные рабочие, затем нерабочие;
+    #    внутри — у кого есть трафик клиентов, затем меньший пинг. Подключения к выходам («через РФ») — как были.
+    pexit = CONF.get("pexit_tag") or "vpn-exit-"
+    rows = []
+    for ib in own:
+        if str(ib.get("tag") or "").startswith(pexit):
+            continue
+        st = obj(ib.get("streamSettings"))
+        name = ib.get("remark") or ""
+        ms = test.get(name)
+        works = ms is not None or name not in test     # не попало в проверку (например, UDP) — не наказываем
+        reality = st.get("security") == "reality"
+        avg = (traffic.get(str(ib["id"])) or {}).get("avg") or 0
+        rows.append(((0 if works else 1, 0 if reality else 1, 0 if avg > 0 else 1, -avg, ms if ms is not None else 10 ** 6),
+                     ib, ms, avg, works))
+    rows.sort(key=lambda r: r[0])
+    changed = []
+    for place, (_, ib, ms, avg, works) in enumerate(rows, 2):    # 1 — «Автовыбор»
+        if int(ib.get("subSortIndex") or 0) != place:
+            try:
+                api("POST", "/inbounds/%s/subSortIndex" % ib["id"], form={"subSortIndex": place})
+                changed.append(ib.get("remark") or str(ib["id"]))
+            except OSError:
+                pass
+    status = {"time": int(time.time()), "order": [
+        {"name": ib.get("remark"), "works": works, "ms": ms, "traffic": avg,
+         "reality": obj(ib.get("streamSettings")).get("security") == "reality"} for _, ib, ms, avg, works in rows],
+        "tested": test}
+    json.dump(status, open(os.path.join(DATA, "status.json"), "w"), ensure_ascii=False, indent=1)
+    state["traffic"] = traffic
+    json.dump(state, open(state_path, "w"))
+    line = " · ".join("%s %s" % ("✓" if r["works"] else "✗", r["name"]) + (" %d мс" % r["ms"] if r["ms"] else "")
+                      for r in status["order"])
+    log("Порядок: " + line + (" (изменён)" if changed else ""))
+    if len(sys.argv) > 2 and sys.argv[2] == "status":
+        print(json.dumps(status, ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+  chmod 755 "$WATCH_PY"
+}
+watch_setup() {   # watch_setup URL-подписки — программа, настройки и таймер службы vpn-watch
+  local py
+  py="$(command -v python3)"
+  write_watch_program
+  mkdir -p "$WATCH_DATA"
+  API="${API_SCHEME}://127.0.0.1:${PANEL_PORT}/${WEBPATH}/panel/api" TOKEN="$API_TOKEN" XR="$XRAY_BIN" SUB="$1" \
+  WL="$([ "$WHITE_READY" = "1" ] && printf '%s' "$WHITE_LABEL")" ALT="$REALITY_ALT_SNI" DATA="$WATCH_DATA" \
+  python3 - "$WATCH_CONF" <<'PY' || return 1
+import json, os, sys
+e = os.environ
+json.dump({"api": e["API"], "token": e["TOKEN"], "xray": e["XR"], "sub": e["SUB"], "wl_label": e["WL"],
+           "alt_tag": "vpn-reality-alt", "alt_sni": e["ALT"].split(), "pexit_tag": "vpn-exit-", "data": e["DATA"]},
+          open(sys.argv[1], "w"), ensure_ascii=False, indent=1)
+PY
+  chmod 600 "$WATCH_CONF"
+  cat > /etc/systemd/system/vpn-watch.service <<UNIT
+[Unit]
+Description=VPN watch: test every connection, follow client traffic, Reality first in the subscription
+After=network-online.target x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=${py} ${WATCH_PY} ${WATCH_CONF}
+Nice=10
+TimeoutStartSec=5min
+UNIT
+  cat > /etc/systemd/system/vpn-watch.timer <<UNIT
+[Unit]
+Description=VPN watch every ${WATCH_MIN} minutes
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=${WATCH_MIN}min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable vpn-watch.timer >/dev/null 2>&1 || true
+  systemctl restart vpn-watch.timer >/dev/null 2>&1
+}
+if [ "${WATCH:-1}" != "0" ] && [ -n "${OWN_URL:-}" ]; then
+  if watch_setup "$OWN_URL"; then
+    grn "    Наблюдение vpn-watch: каждые ${WATCH_MIN} мин сервер проверяет подключения и ставит рабочие Reality первыми."
+    "$(command -v python3)" "$WATCH_PY" "$WATCH_CONF" 2>&1 | sed 's/^/    /' || true
+  else
+    ylw "    Наблюдение vpn-watch не настроилось."
+  fi
+elif [ -f /etc/systemd/system/vpn-watch.timer ]; then
+  systemctl disable --now vpn-watch.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/vpn-watch.timer /etc/systemd/system/vpn-watch.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
 step "Формирую профиль..."
 VLESS_URL="vless://${UUID}@${ADDR}:${VPN_PORT}?type=tcp&encryption=none&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI}&sid=${SHORT_ID}&spx=%2F${CLIENT_FLOW:+&flow=${CLIENT_FLOW}}#${LABEL}"
 if [ "$API_SCHEME" = "https" ] && [ "$SSL_OK" = "1" ]; then
@@ -6089,6 +6632,7 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}» — XHTTP: сайты открываются быстрее;"; fi
   echo "  • «${LABEL}» — обычное Reality, запасное;"
   if [ "$WS_OK" = "1" ]; then echo "  • «${WS_LABEL}» — WebSocket + TLS, как «LTE»-профили; через CDN — для режима белых списков;"; fi
+  if [ "$ALT_OK" = "1" ]; then echo "  • «${ALT_LABEL}» — запасной XHTTP с маскировкой под ${ALT_SNI}: если обычный XHTTP «н/д», берите его;"; fi
   if [ "$HY2_OK" = "1" ]; then echo "  • «${HY2_LABEL}» — Hysteria2 (QUIC по UDP): быстрее на мобильном интернете с потерями; если оператор режет UDP, не подключится — тогда берите другие;"; fi
   if [ -n "$PEXIT_LIST" ]; then echo "  • через РФ к одному зарубежному серверу, каждый отдельно: ${PEXIT_LIST};"; fi
   if [ -n "$DIRECT_LIST" ]; then echo "  • напрямую к зарубежному серверу (телефон → сервер, без России): ${DIRECT_LIST}."; fi

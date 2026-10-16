@@ -1613,6 +1613,8 @@ PROBE_URLS=(https://www.gstatic.com/generate_204 https://cp.cloudflare.com/gener
 read -r -a OPEN_URLS <<< "${WLT_OPEN_URLS:-https://www.gstatic.com/generate_204 https://1.1.1.1/cdn-cgi/trace https://www.wikipedia.org/}"
 RES=(); if [ -n "$RESOLVE" ]; then RES=(--resolve "$RESOLVE"); fi
 declare -A BAD=()
+declare -A REMAP=()   # сервер → другой порт: на некоторых телефонах Android не даёт занять часть портов
+BASE_PORT=""
 X=""; XVER=""; XPID=""; T=""; ONLINE=0; OPEN=0; FORCE=0; LABEL=""; LABEL_ARG=""; SENT=""; VIA=""
 TOT=0; OKN=0; N=0
 
@@ -1809,6 +1811,13 @@ make_conf() {
     printf '"dns":{"hosts":{%s},"servers":["77.88.8.8","77.88.8.1","1.1.1.1"],"queryStrategy":"UseIPv4"},\n' "$HOSTS"
     tail -n +2 "$T/config.json" | grep -v -F -f "$T/bad"
   } > "$T/run.json"
+  local k
+  for k in "${!REMAP[@]}"; do   # перенесённые на другой порт
+    sed -i "s/\"tag\":\"in-$k\",\"listen\":\"127.0.0.1\",\"port\":[0-9]*/\"tag\":\"in-$k\",\"listen\":\"127.0.0.1\",\"port\":${REMAP[$k]}/" "$T/run.json"
+  done
+  if [ -n "$BASE_PORT" ]; then
+    sed -i "s/\"tag\":\"in-x\",\"listen\":\"127.0.0.1\",\"port\":[0-9]*/\"tag\":\"in-x\",\"listen\":\"127.0.0.1\",\"port\":$BASE_PORT/" "$T/run.json"
+  fi
 }
 stage_conf() {   # 2) настройки Xray: адреса серверов и только те подключения, которые этот Xray принимает
   local port key kind host sport sip name out k tries=0 open=0 udp=0
@@ -1837,19 +1846,45 @@ stage_conf() {   # 2) настройки Xray: адреса серверов и 
   if [ ${#BAD[@]} -gt 0 ]; then warn "  Пропускаю: ${#BAD[@]} (их настройки не принимает Xray $XVER)."; fi
   PROBE_N=$(( open + udp ))
 }
-stage_xray() {
-  local i r base
+stage_xray() {   # запуск Xray; порт, который Android не даёт занять, — заменяем другим и запускаем снова
+  local i r base tries=0 p key next moved=0
   base=$(sed -n '1s/^#B [0-9]* [^ ]* [0-9]* \([0-9]*\).*/\1/p' "$DIR/bundle")
-  "$X" run -c "$T/run.json" > "$T/xray.log" 2>&1 &
-  XPID=$!
-  for i in $(seq 1 60); do
-    r=$(curl --noproxy '*' -s -o /dev/null --connect-timeout 1 -m 2 -w '%{time_connect}' "http://127.0.0.1:${base:-41000}/" 2>/dev/null)
-    [ -n "${r//[0.,]/}" ] && return 0
-    kill -0 "$XPID" 2>/dev/null || break
-    sleep 0.5
+  base=${base:-41000}
+  next=$(awk '$1=="#P" && $2+0 > m {m=$2+0} END {print (m > 0 ? m : 41000) + 1000}' "$T/ports")
+  while :; do
+    "$X" run -c "$T/run.json" > "$T/xray.log" 2>&1 &
+    XPID=$!
+    for i in $(seq 1 60); do
+      r=$(curl --noproxy '*' -s -o /dev/null --connect-timeout 1 -m 2 -w '%{time_connect}' "http://127.0.0.1:${BASE_PORT:-$base}/" 2>/dev/null)
+      if [ -n "${r//[0.,]/}" ]; then
+        if [ "$moved" -gt 0 ]; then warn "  Портов, которые этот телефон не дал занять, — $moved: перенёс на другие."; fi
+        return 0
+      fi
+      kill -0 "$XPID" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill "$XPID" 2>/dev/null; wait "$XPID" 2>/dev/null
+    p=$(grep -o 'listen tcp 127\.0\.0\.1:[0-9]*' "$T/xray.log" | head -n 1 | grep -o '[0-9]*$')
+    tries=$((tries + 1))
+    if [ -z "$p" ] || [ "$tries" -gt 150 ]; then
+      grep -v 'deprecated' "$T/xray.log" | tail -n 3 >&2
+      fail "Xray на телефоне не запустился."
+    fi
+    while grep -q "\"port\":$next[,}]" "$T/run.json" || [ "$next" = "$p" ]; do next=$((next + 1)); done
+    if [ "$p" = "${BASE_PORT:-$base}" ]; then
+      BASE_PORT=$next
+    else
+      key=$(awk -v p="$p" '$1=="#P" && $2==p {print $3; exit}' "$T/ports")
+      if [ -z "$key" ]; then
+        grep -v 'deprecated' "$T/xray.log" | tail -n 3 >&2
+        fail "Xray на телефоне не запустился."
+      fi
+      REMAP[$key]=$next
+      awk -v k="$key" -v np="$next" '$1=="#P" && $3==k {$2=np} {print}' "$T/ports" > "$T/ports.new" && mv -f "$T/ports.new" "$T/ports"
+    fi
+    moved=$((moved + 1)); next=$((next + 1))
+    make_conf
   done
-  tail -n 3 "$T/xray.log" >&2
-  fail "Xray на телефоне не запустился."
 }
 stage_probe() {   # 3) настоящий запрос через каждый открывшийся сервер (через Xray, сразу PROBE_JOBS штук)
   local n=0 i=0 port key kind host sport sip name code tt pids=()

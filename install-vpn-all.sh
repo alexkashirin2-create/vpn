@@ -115,6 +115,11 @@ VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
 XHTTP_PORT="${XHTTP_PORT:-8443}"      # второе подключение VLESS + XHTTP (сайты открываются быстрее); 0 — не создавать
 REALITY_SELF="${REALITY_SELF:-auto}"   # Reality под свой домен (SNI — домен этого сервера, посторонним отвечает панель с настоящим
                                        # сертификатом): auto — на российском сервере с SSL; 1 — всегда (нужен SSL на домен); 0 — нет
+YOUTUBE_DIRECT="${YOUTUBE_DIRECT:-1}"   # мост: 1 — YouTube выходит в интернет с самого российского сервера, а не с зарубежного; 0 — как всё остальное
+FAKESITE="${FAKESITE:-auto}"           # сайт-приманка MySphere (github.com/iqubik/myfakesite) для Reality под свой домен: его видит
+                                       # всякий, кто откроет домен без ключа VPN; auto — вместе с Reality под свой домен; 0 — нет (отвечает панель)
+FAKESITE_PORT="${FAKESITE_PORT:-10443}"   # порт сайта-приманки — только внутри сервера (снаружи он виден через порт Reality)
+FAKESITE_SRC="${FAKESITE_SRC:-https://raw.githubusercontent.com/iqubik/myfakesite/main}"   # откуда брать страницу сайта
 XHTTP_TLS_PORT="${XHTTP_TLS_PORT:-2087}"   # вариант VLESS + XHTTP + TLS на свой сертификат (как WS, но HTTP/2 — быстрее); 0 — нет
 REALITY_ALT="${REALITY_ALT:-auto}"   # запасной Reality с российской маскировкой: auto — если сервер в РФ, а SNI зарубежный; 1 — всегда; 0 — нет
 REALITY_ALT_PORT="${REALITY_ALT_PORT:-9443}"   # его порт
@@ -227,8 +232,11 @@ if [[ "$BALANCE_APP_RTT" =~ ^[0-9]+$ ]]; then BALANCE_APP_RTT="${BALANCE_APP_RTT
 [[ "$BALANCE_APP_RTT" =~ ^[1-9][0-9]*(ms|s)$ ]] || die "BALANCE_APP_RTT указан неверно (например, 3s или 2500ms): ${BALANCE_APP_RTT}"
 case "$BALANCE_APP_RTT" in *ms) APP_RTT_TEXT="${BALANCE_APP_RTT%ms} мс" ;; *) APP_RTT_TEXT="${BALANCE_APP_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
+[ "$YOUTUBE_DIRECT" = "0" ] || YOUTUBE_DIRECT=1
 { [[ "$REALITY_ALT_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$REALITY_ALT_PORT" -le 65535 ]; } || die "REALITY_ALT_PORT указан неверно: ${REALITY_ALT_PORT}"
 { [[ "$XHTTP_TLS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$XHTTP_TLS_PORT" -le 65535 ]; } || die "XHTTP_TLS_PORT указан неверно: ${XHTTP_TLS_PORT}"
+{ [[ "$FAKESITE_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$FAKESITE_PORT" -le 65535 ]; } || die "FAKESITE_PORT указан неверно: ${FAKESITE_PORT}"
+[[ "$FAKESITE_SRC" =~ ^https://[A-Za-z0-9./_-]+$ ]] || die "FAKESITE_SRC — адрес https://… папки с сайтом: ${FAKESITE_SRC}"
 case "$SNI_USER" in
   auto) SNI_USER=""; SNI="www.microsoft.com" ;;
   self) REALITY_SELF=1 ;;   # SNI=self — то же, что REALITY_SELF=1
@@ -4577,6 +4585,224 @@ if [ "$VPN_ROLE" != "exit" ]; then   # выходу моста сертифик�
 fi
 
 # ============================================================================
+# ---------- сайт-приманка MySphere (github.com/iqubik/myfakesite, лицензия MIT) ----------
+# Reality под свой домен отправляет всех, кто пришёл без ключа VPN (браузер, поисковый робот, проверка
+# провайдера), на «настоящий» сайт этого домена. Вместо служебной страницы панели им открывается
+# правдоподобный сайт: страница MySphere с формой входа и ответами API, как у живого сервиса.
+# Страница и иконки — из проекта myfakesite; ответы API — тем же nginx, что и в оригинале (без Docker и PHP).
+# nginx слушает только 127.0.0.1:FAKESITE_PORT: порт 443 занят Reality, а порт 80 нужен acme.sh для сертификата.
+FAKESITE_DIR="/var/www/myfakesite"
+FAKESITE_CONF="/etc/nginx/conf.d/vpn-fakesite.conf"
+FAKESITE_HEADERS="/etc/nginx/snippets/vpn-fakesite-headers.conf"
+FAKESITE_CRON="/etc/cron.daily/vpn-fakesite"
+FAKESITE_ON=0
+fakesite_remove() {   # убрать сайт-приманку (сам nginx остаётся)
+  local had=0
+  if [ -f "$FAKESITE_CONF" ]; then had=1; fi
+  rm -f "$FAKESITE_CONF" "$FAKESITE_HEADERS" "$FAKESITE_CRON"
+  rm -rf "$FAKESITE_DIR"
+  if [ "$had" = "1" ] && command -v nginx >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+fakesite_setup() {   # сайт-приманка на https://127.0.0.1:FAKESITE_PORT с сертификатом домена; 0 — готов
+  local tmp f ver nv listen busy prc
+  if command -v ss >/dev/null 2>&1; then
+    busy="$(ss -Htlnp "sport = :${FAKESITE_PORT}" 2>/dev/null | grep -v nginx || true)"
+    if [ -n "$busy" ]; then ylw "    Сайт-приманка: порт ${FAKESITE_PORT} занят другой программой — пропускаю (FAKESITE_PORT=…)."; return 1; fi
+  fi
+  if ! command -v nginx >/dev/null 2>&1; then
+    # ставим nginx, не давая ему запуститься со стандартным сайтом на порту 80 (он нужен acme.sh)
+    prc=0
+    if [ ! -e /usr/sbin/policy-rc.d ]; then printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; chmod 755 /usr/sbin/policy-rc.d; prc=1; fi
+    apt_retry install -y nginx || true
+    if [ "$prc" = "1" ]; then rm -f /usr/sbin/policy-rc.d; fi
+    command -v nginx >/dev/null 2>&1 || { ylw "    Сайт-приманка: не удалось установить nginx — посторонним будет отвечать панель."; return 1; }
+  fi
+  rm -f /etc/nginx/sites-enabled/default   # стандартный сайт nginx слушает порт 80 — он нужен для продления сертификата
+  mkdir -p "$FAKESITE_DIR" /etc/nginx/conf.d /etc/nginx/snippets
+  tmp="$(mktemp -d)"
+  for f in index.html favicon.ico apple-touch-icon.png VERSION; do
+    curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 -o "$tmp/$f" "${FAKESITE_SRC}/data/${f}" 2>/dev/null || rm -f "$tmp/$f"
+  done
+  if grep -qi '<html' "$tmp/index.html" 2>/dev/null; then
+    for f in index.html favicon.ico apple-touch-icon.png VERSION; do
+      if [ -s "$tmp/$f" ]; then install -m 644 "$tmp/$f" "$FAKESITE_DIR/$f"; fi
+    done
+  elif [ -s "$FAKESITE_DIR/index.html" ]; then
+    ylw "    Сайт-приманка: страница не скачалась (${FAKESITE_SRC}) — оставляю прежнюю копию."
+  else
+    rm -rf "$tmp"
+    ylw "    Сайт-приманка: страница не скачалась (${FAKESITE_SRC}) — посторонним будет отвечать панель."
+    return 1
+  fi
+  rm -rf "$tmp"
+  ver="$(tr -cd '0-9.' < "$FAKESITE_DIR/VERSION" 2>/dev/null | head -c 16 || true)"
+  [ -n "$ver" ] || ver="1.0"
+  # HTTP/2: в nginx 1.25.1 и новее — отдельной строкой, раньше — в listen
+  nv="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9.]*\).*#\1#p')"
+  if python3 -c 'import sys; v=[int(x) for x in (sys.argv[1] or "0").split(".")[:3]]; sys.exit(0 if v >= [1, 25, 1] else 1)' "$nv" 2>/dev/null; then
+    listen="listen 127.0.0.1:${FAKESITE_PORT} ssl;
+    http2 on;"
+  else
+    listen="listen 127.0.0.1:${FAKESITE_PORT} ssl http2;"
+  fi
+  cat > "$FAKESITE_HEADERS" <<'NGX'
+# Заголовки безопасности сайта-приманки (как в github.com/iqubik/myfakesite) — ставит install-vpn-all.sh
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Permitted-Cross-Domain-Policies "none" always;
+add_header X-Robots-Tag "noindex, nofollow" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Referrer-Policy "no-referrer" always;
+add_header Strict-Transport-Security "max-age=15552000; includeSubDomains" always;
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; media-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self';" always;
+NGX
+  cat > "$FAKESITE_CONF.new" <<'NGX'
+# Сайт-приманка MySphere — по мотивам github.com/iqubik/myfakesite (MIT). Ставит install-vpn-all.sh.
+# Его видит всякий, кто открывает домен сервера без ключа VPN: Reality (порт 443) передаёт таких
+# посетителей сюда. Слушает только внутри сервера. Убрать: запустить install-vpn-all.sh с FAKESITE=0.
+limit_req_zone $binary_remote_addr zone=fakesite_auth:10m rate=3r/m;
+map $request_id $fakesite_auth_msg {
+    default     "Неверный логин или пароль. Попробуйте ещё раз.";
+    "~^[0-3]"   "Пользователь не найден.";
+    "~^[4-7]"   "Неверный пароль.";
+    "~^[8-b]"   "Аккаунт временно заблокирован. Попробуйте позже.";
+    "~^[c-f]"   "Слишком много попыток. Подождите и попробуйте снова.";
+}
+server {
+    __LISTEN__
+    server_name __DOMAIN__;
+    ssl_certificate __CERT__;
+    ssl_certificate_key __KEY__;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:fakesite:5m;
+    root __ROOT__;
+    index index.html;
+    server_tokens off;
+    access_log off;
+    limit_req_status 429;
+    include __HEADERS__;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    location = /api/status {
+        default_type application/json;
+        include __HEADERS__;
+        add_header X-Powered-By "MySphere/__VERSION__" always;
+        add_header X-Request-Id "$request_id" always;
+        return 200 '{"online":true,"maintenance":false,"version":"__VERSION__","build":"2026.03.15","product":"MySphere","api":"1.0"}';
+    }
+    error_page 429 = @rate_limited;
+    location @rate_limited {
+        default_type application/json;
+        include __HEADERS__;
+        add_header Retry-After "20" always;
+        return 429 '{"status":"error","message":"Слишком много запросов. Попробуйте через 20 секунд."}';
+    }
+    location = /api/auth {
+        limit_req zone=fakesite_auth burst=2 nodelay;
+        default_type application/json;
+        include __HEADERS__;
+        add_header X-Request-Id "$request_id" always;
+        add_header Set-Cookie "ms_session=eyJhbGciOiJIUzI1NiJ9.$request_id.sig; Path=/; HttpOnly; Secure; SameSite=Strict" always;
+        add_header Set-Cookie "__Host-ms_privacy=ack; Path=/; Secure; SameSite=Strict" always;
+        return 401 '{"status":"error","message":"$fakesite_auth_msg"}';
+    }
+    location ~ ^/api/(files|users)(/.*)?$ {
+        default_type application/json;
+        include __HEADERS__;
+        add_header X-Request-Id "$request_id" always;
+        return 401 '{"status":"error","message":"Требуется авторизация"}';
+    }
+    location = /api/settings {
+        default_type application/json;
+        include __HEADERS__;
+        add_header X-Request-Id "$request_id" always;
+        return 200 '{"status":"ok","lang":"ru","theme":"auto","notifications":true,"two_factor":false,"storage":{"used":2847193600,"total":10737418240},"last_login":"2026-04-10T18:32:07Z"}';
+    }
+    location = /robots.txt {
+        default_type text/plain;
+        return 200 'User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /admin/
+Disallow: /internal/
+';
+    }
+    location = /heartbeat {
+        default_type application/json;
+        return 200 '{"ok":true,"ts":$msec}';
+    }
+    location = /.well-known/security.txt {
+        default_type text/plain;
+        add_header Access-Control-Allow-Origin "*" always;
+        return 200 'Contact: mailto:admin@__DOMAIN__
+Preferred-Languages: ru, en
+Expires: 2027-01-01T00:00:00Z
+';
+    }
+    location ^~ /.well-known/ {
+        return 404;
+    }
+    location = /favicon.ico {
+        expires 30d;
+        include __HEADERS__;
+        add_header Cache-Control "public, immutable" always;
+    }
+    location = /apple-touch-icon.png {
+        expires 30d;
+        include __HEADERS__;
+        add_header Cache-Control "public, immutable" always;
+    }
+    location = /VERSION {
+        return 404;
+    }
+    location ~ \.php$ {
+        return 404;
+    }
+    location ~ ^/(?:\.ht.*|\.git.*|\.env.*|data/|config/|lib/|3rdparty/|templates/) {
+        return 404;
+    }
+}
+NGX
+  LISTEN="$listen" DOMAIN="$ADDR" CERTF="$CERT" KEYF="$KEY" ROOT="$FAKESITE_DIR" HDR="$FAKESITE_HEADERS" VER="$ver" \
+  python3 - "$FAKESITE_CONF.new" <<'PY' || { rm -f "$FAKESITE_CONF.new"; return 1; }
+import os, sys
+e = os.environ
+text = open(sys.argv[1], encoding="utf-8").read()
+for key, value in (("__LISTEN__", e["LISTEN"]), ("__DOMAIN__", e["DOMAIN"]), ("__CERT__", e["CERTF"]),
+                   ("__KEY__", e["KEYF"]), ("__ROOT__", e["ROOT"]), ("__HEADERS__", e["HDR"]), ("__VERSION__", e["VER"])):
+    text = text.replace(key, value)
+open(sys.argv[1], "w", encoding="utf-8").write(text)
+PY
+  if [ -f "$FAKESITE_CONF" ]; then cp "$FAKESITE_CONF" "$FAKESITE_CONF.old"; fi
+  mv -f "$FAKESITE_CONF.new" "$FAKESITE_CONF"
+  if ! nginx -t >"$WORK/nginx-t.log" 2>&1; then
+    ylw "    Сайт-приманка: nginx не принял настройки — посторонним будет отвечать панель:"
+    tail -n 3 "$WORK/nginx-t.log" | sed 's/^/      /'
+    if [ -f "$FAKESITE_CONF.old" ]; then mv -f "$FAKESITE_CONF.old" "$FAKESITE_CONF"; else rm -f "$FAKESITE_CONF"; fi
+    return 1
+  fi
+  rm -f "$FAKESITE_CONF.old"
+  systemctl enable nginx >/dev/null 2>&1 || true
+  systemctl restart nginx >/dev/null 2>&1 || { ylw "    Сайт-приманка: nginx не запустился (journalctl -u nginx -e)."; return 1; }
+  # сертификат продлевается сам (acme.sh) — nginx перечитывает его раз в сутки
+  printf '#!/bin/sh\n# install-vpn-all.sh: сайт-приманка перечитывает продлённый сертификат\nsystemctl reload nginx >/dev/null 2>&1 || true\n' > "$FAKESITE_CRON"
+  chmod 755 "$FAKESITE_CRON"
+  for _ in $(seq 1 10); do
+    if curl -sk --noproxy '*' --max-time 5 --resolve "${ADDR}:${FAKESITE_PORT}:127.0.0.1" \
+         "https://${ADDR}:${FAKESITE_PORT}/api/status" 2>/dev/null | grep -q '"product":"MySphere"'; then
+      return 0
+    fi
+    sleep 1
+  done
+  ylw "    Сайт-приманка: nginx запущен, но не отвечает на https://127.0.0.1:${FAKESITE_PORT} — посторонним будет отвечать панель."
+  return 1
+}
+
 # Reality под свой домен (self): SNI — домен этого сервера, который и правда указывает на его IP, а посторонним
 # (и проверкам провайдера) отвечает сама панель с настоящим сертификатом на этот домен. Маскировку под чужой
 # сайт (apple.com, ya.ru) провайдеры режут, сверяя SNI с IP; свой домен эту проверку проходит.
@@ -4591,14 +4817,20 @@ if [ "$VPN_ROLE" != "exit" ]; then
   if [ "$WANT_SELF" = "1" ]; then
     if [ "$SSL_OK" = "1" ] && ! is_ipv4 "$ADDR"; then
       SELF_ON=1; SNI="$ADDR"; SNI_USER="$ADDR"; REALITY_TARGET="127.0.0.1:${PANEL_PORT}"
+      if [ "$FAKESITE" != "0" ] && fakesite_setup; then
+        FAKESITE_ON=1; REALITY_TARGET="127.0.0.1:${FAKESITE_PORT}"   # посторонним — сайт-приманка, а не панель
+      fi
     else
       ylw "    Reality под свой домен невозможен без SSL-сертификата на домен — маскировка остаётся прежней."
     fi
   fi
   if [ "$SNI_USER" = "self" ]; then SNI_USER=""; SNI="www.microsoft.com"; fi   # не получилось — как обычно
 fi
+if [ "$FAKESITE_ON" != "1" ] && [ -f "$FAKESITE_CONF" ]; then fakesite_remove; fi   # больше не нужен
 step "Готовлю подключение VLESS + Reality..."
-if [ "$SELF_ON" = "1" ]; then
+if [ "$SELF_ON" = "1" ] && [ "$FAKESITE_ON" = "1" ]; then
+  grn "    Reality маскируется под свой домен ${ADDR}: посторонним открывается сайт-приманка MySphere."
+elif [ "$SELF_ON" = "1" ]; then
   grn "    Reality маскируется под свой домен ${ADDR}: посторонним отвечает панель с настоящим сертификатом."
 fi
 XRAY_BIN=""
@@ -5590,7 +5822,7 @@ if api POST /xray/ > "$WORK/xray-get.json" && api_ok "$WORK/xray-get.json" >/dev
   FILTER_STATE="$(BLOCK_ADS="$BLOCK_ADS" BLOCK_QUIC="$BLOCK_QUIC" BRIDGE="$BRIDGE" \
     BRIDGE_OUTS="${BRIDGE_OUTS[*]:-}" BRIDGE_FALLBACK="$BRIDGE_FALLBACK" PEXIT_MAP="$PEXIT_MAP" \
     BRIDGE_PREF="$BRIDGE_PREF" BRIDGE_ALT="$BRIDGE_ALT" POOL_EXPECTED="$POOL_EXPECTED" MAX_RTT="$BALANCE_MAX_RTT" \
-    PANEL_LOCAL_PORT="$PANEL_LOCAL_PORT" PANEL_LOCAL_TAGS="$PANEL_LOCAL_TAGS" \
+    PANEL_LOCAL_PORT="$PANEL_LOCAL_PORT" PANEL_LOCAL_TAGS="$PANEL_LOCAL_TAGS" YOUTUBE_DIRECT="$YOUTUBE_DIRECT" \
     python3 - "$WORK/xray-get.json" "$WORK/xray-new.json" <<'PY' || echo "error"
 import json, os, sys
 obj = json.load(open(sys.argv[1]))["obj"]
@@ -5607,7 +5839,7 @@ ADS, EXIT = "geosite:category-ads-all", "bridge-exit"
 POOL = EXIT + "-"
 is_ads = lambda r: r.get("domain") == [ADS] and r.get("outboundTag") == "blocked"
 is_ru = lambda r: r.get("outboundTag") == "direct" and (
-    r.get("domain") == ["geosite:category-ru"] or r.get("ip") == ["geoip:ru"])
+    r.get("domain") in (["geosite:category-ru"], ["geosite:youtube"]) or r.get("ip") == ["geoip:ru"])
 is_quic = lambda r: r.get("network") == "udp" and str(r.get("port")) == "443" and r.get("outboundTag") == "blocked"
 # свои прежние правила убираем и ставим заново — повторный запуск ничего не дублирует
 ours_exit = lambda r: (str(r.get("outboundTag") or "").startswith(EXIT)
@@ -5650,6 +5882,8 @@ for o in outs:
 if os.environ["BRIDGE"] == "1":
     if "direct" not in tags:
         print("no-direct-outbound"); raise SystemExit
+    if os.environ.get("YOUTUBE_DIRECT") == "1":   # YouTube — с этого (российского) сервера, не с зарубежного
+        add.append({"type": "field", "domain": ["geosite:youtube"], "outboundTag": "direct"})
     add.append({"type": "field", "domain": ["geosite:category-ru"], "outboundTag": "direct"})
     add.append({"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
     files = os.environ["BRIDGE_OUTS"].split()
@@ -5712,6 +5946,7 @@ fi
 if [ "$SERVER_FILTER" = "1" ]; then
   if [ "$BLOCK_ADS" = "1" ] && [ "$VPN_ROLE" != "exit" ]; then grn "    Сервер блокирует рекламу и трекеры для всего VPN-трафика."; fi
   if [ "$BRIDGE" = "1" ]; then grn "    Российские сайты сервер открывает сам, остальное — через ${EXIT_TEXT}."; fi
+  if [ "$BRIDGE" = "1" ] && [ "$YOUTUBE_DIRECT" = "1" ]; then grn "    YouTube сервер открывает сам, не через зарубежные серверы (выключить: YOUTUBE_DIRECT=0)."; fi
   if [ "$BLOCK_QUIC" = "1" ]; then grn "    Для скорости: QUIC переведён на TCP, сайты открываются по IPv4 без ожидания IPv6."
   else grn "    Для скорости: сайты открываются по IPv4 без ожидания IPv6."; fi
 elif [ "$BRIDGE" = "1" ]; then
@@ -6771,7 +7006,8 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$XTLS_OK" = "1" ] || [ "$HY
     echo "  • «${AUTO_LABEL}» — приложение само ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED});"
     echo "    пинг больше ${APP_RTT_TEXT} или потери — подключение отключается (выберите этот профиль);"
   elif [ "$AUTO_OK" = "1" ]; then echo "  • «${AUTO_LABEL}» — приложение само выбирает лучший путь (выберите его);"; fi
-  if [ "$SELF_ON" = "1" ]; then MASK_TEXT="маскировка под свой домен ${ADDR}"; else MASK_TEXT="маскировка под ${SNI}"; fi
+  if [ "$SELF_ON" = "1" ] && [ "$FAKESITE_ON" = "1" ]; then MASK_TEXT="маскировка под свой домен ${ADDR}, посторонним — сайт-приманка MySphere"
+  elif [ "$SELF_ON" = "1" ]; then MASK_TEXT="маскировка под свой домен ${ADDR}"; else MASK_TEXT="маскировка под ${SNI}"; fi
   if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}» — XHTTP + Reality (${MASK_TEXT}): сайты открываются быстрее;"; fi
   echo "  • «${LABEL}» — Reality (${MASK_TEXT});"
   if [ "$WS_OK" = "1" ]; then echo "  • «${WS_LABEL}» — WebSocket + TLS, как «LTE»-профили; через CDN — для режима белых списков;"; fi
@@ -6874,7 +7110,7 @@ SNI:       ${SNI}
 UUID:      ${UUID}
 PublicKey: ${PUBLIC_KEY}
 ShortID:   ${SHORT_ID}
-Маскировка: $([ "$SELF_ON" = "1" ] && echo "свой домен ${ADDR} (посторонним отвечает панель, порт ${PANEL_PORT})" || echo "${SNI}")
+Маскировка: $([ "$SELF_ON" = "1" ] && { [ "$FAKESITE_ON" = "1" ] && echo "свой домен ${ADDR} (посторонним — сайт-приманка MySphere на 127.0.0.1:${FAKESITE_PORT})" || echo "свой домен ${ADDR} (посторонним отвечает панель, порт ${PANEL_PORT})"; } || echo "${SNI}")
 XHTTP:     $([ "$XHTTP_OK" = "1" ] && echo "порт ${XHTTP_PORT}, путь ${XHTTP_PATH} (в подписке — первым)" || echo "не настроен")
 WebSocket: $([ "$WS_OK" = "1" ] && echo "порт ${WS_PORT}, путь ${WS_PATH}, TLS на ${ADDR}" || echo "не настроен")
 XHTTP-TLS: $([ "$XTLS_OK" = "1" ] && echo "порт ${XHTTP_TLS_PORT}, TLS на ${ADDR}" || echo "не настроен")

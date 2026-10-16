@@ -90,7 +90,8 @@
 # По умолчанию — только через РФ (EXIT_DIRECT=0); узлы и прямые подключения: EXIT_DIRECT=1.
 # Тонкие настройки балансировки (и для моста, и для «Автовыбора» в приложении):
 #   BALANCE_EXPECTED=2   — сколько лучших серверов работают одновременно;
-#   BALANCE_MAX_RTT=1s   — максимальный пинг (например, 800ms): кто медленнее — отключается.
+#   BALANCE_MAX_RTT=1s   — мост: максимальный пинг до выхода (например, 800ms): кто медленнее — отключается;
+#   BALANCE_APP_RTT=3s   — «Автовыбор» в приложении: максимальный пинг с телефона.
 #
 # Повторный запуск на том же сервере безопасен: ключи VPN сохраняются (меняется
 # только пароль панели); после смены IP сервера ссылки сами переходят на новый IP.
@@ -102,6 +103,7 @@ set -euo pipefail
 
 # ===================== настройки (можно не трогать) =====================
 DOMAIN="${DOMAIN:-}"                  # auto — домен создастся сам, ip — по IP, или свой домен; пусто — спросить
+SNI_USER="${SNI:-}"                   # SNI указан в команде — сменить его и у уже созданных подключений
 SNI="${SNI:-www.microsoft.com}"       # домен-маскировка Reality (TLS 1.3, открыт из РФ)
 VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
 XHTTP_PORT="${XHTTP_PORT:-8443}"      # второе подключение VLESS + XHTTP (сайты открываются быстрее); 0 — не создавать
@@ -114,12 +116,13 @@ LABEL="${LABEL:-MyVPN-Reality}"       # имя подключения и под�
 BLOCK_ADS="${BLOCK_ADS:-1}"           # 1 — блокировать рекламу и трекеры, 0 — не блокировать
 BLOCK_QUIC="${BLOCK_QUIC:-1}"         # 1 — QUIC (UDP 443) через VPN гасится: приложения сразу берут TCP, так быстрее
 BALANCE_EXPECTED="${BALANCE_EXPECTED:-2}"  # «Автовыбор» и мост: сколько лучших серверов работают одновременно
-BALANCE_MAX_RTT="${BALANCE_MAX_RTT:-1s}"   # максимальный пинг: сервер или подключение медленнее — отключается
+BALANCE_MAX_RTT="${BALANCE_MAX_RTT:-1s}"   # мост (на сервере): максимальный пинг до выхода — медленнее отключается
+BALANCE_APP_RTT="${BALANCE_APP_RTT:-3s}"   # «Автовыбор» в приложении: максимальный пинг (телефон → РФ → выход: на мобильном часто больше 1 с)
 SUB_FILTER="${SUB_FILTER:-1}"         # 1 — подписку отдаёт фильтр, который дописывает «Автовыбору» эти настройки; 0 — сама панель (с белыми списками фильтр нужен всё равно)
 WHITE_LISTS="${WHITE_LISTS:-}"        # белые списки: 1 — включить, only — только они (VPN уже установлен), 0 — убрать; пусто — как в прошлый раз
 WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссылки на txt-списки через пробел; пусто — как в прошлый раз; default — igareck
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
-WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
+WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-30}"          # белые списки: как часто проверять каждое подключение (минуты)
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
 WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-5}"             # белые списки: сколько самых быстрых серверов телефон сам пингует в профиле автоподбора (0 — без профиля)
 WHITE_SUB_MAX="${WHITE_SUB_MAX:-15}"              # белые списки: сколько самых быстрых по пингу рабочих — в подписке (отдельная ссылка — до 30); короче список — быстрее проверка пинга в приложении
@@ -206,6 +209,9 @@ PEXIT_BASE="${PEXIT_BASE:-8443}"                  # их порты: 8444, 8445,
 if [[ "$BALANCE_MAX_RTT" =~ ^[0-9]+$ ]]; then BALANCE_MAX_RTT="${BALANCE_MAX_RTT}ms"; fi
 [[ "$BALANCE_MAX_RTT" =~ ^[1-9][0-9]*(ms|s)$ ]] || die "BALANCE_MAX_RTT указан неверно (например, 1s или 800ms): ${BALANCE_MAX_RTT}"
 case "$BALANCE_MAX_RTT" in *ms) RTT_TEXT="${BALANCE_MAX_RTT%ms} мс" ;; *) RTT_TEXT="${BALANCE_MAX_RTT%s} с" ;; esac
+if [[ "$BALANCE_APP_RTT" =~ ^[0-9]+$ ]]; then BALANCE_APP_RTT="${BALANCE_APP_RTT}ms"; fi
+[[ "$BALANCE_APP_RTT" =~ ^[1-9][0-9]*(ms|s)$ ]] || die "BALANCE_APP_RTT указан неверно (например, 3s или 2500ms): ${BALANCE_APP_RTT}"
+case "$BALANCE_APP_RTT" in *ms) APP_RTT_TEXT="${BALANCE_APP_RTT%ms} мс" ;; *) APP_RTT_TEXT="${BALANCE_APP_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
 [ "$EXIT_DIRECT" = "0" ] || EXIT_DIRECT=1
 case "$(printf '%s' "$WHITE_LISTS" | tr '[:upper:]' '[:lower:]')" in
@@ -3206,8 +3212,8 @@ conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"])
         "test_urls": ["https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204"],
         # проверка: сначала открывается ли сервер (3 с), затем настоящий запрос через подключение (8 с);
         # все — раз в час (full_check_minutes), между ними — только рабочие
-        "timeout": 8, "tcp_timeout": 3, "workers": 64, "tcp_workers": 128, "batch": 300,
-        "max_items": 3000, "full_check_minutes": 60,
+        "timeout": 8, "tcp_timeout": 3, "workers": 24, "tcp_workers": 64, "batch": 150,
+        "max_items": 800, "full_check_minutes": 180,
         # у каждого рабочего — вход и выход (в России или нет); выход в России: last — в конец, drop — убрать
         "ru_exit": e["RU_EXIT"],
         # в подписке — sub_max самых быстрых по пингу рабочих, в отдельной подписке — до list_max
@@ -3234,7 +3240,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=${py} ${WHITE_PY} ${WHITE_CONF} auto
-Nice=10
+Nice=19
+CPUQuota=40%
+IOSchedulingClass=idle
 TimeoutStartSec=40min
 UNIT
   cat > "$WHITE_TIMER" <<UNIT
@@ -4016,6 +4024,24 @@ case "$MODE" in
     fi ;;
 esac
 grn "    Адрес для подключения: ${ADDR}"
+sni_check() {   # sni_check домен — открывается ли он с этого сервера по TLS 1.3 (иначе Reality не работает)
+  curl -s -o /dev/null --tlsv1.3 --connect-timeout 5 --max-time 8 "https://$1/" 2>/dev/null
+}
+SNI_NOW="${SNI_USER:-$(python3 -c 'import json, sqlite3, sys
+for (s,) in sqlite3.connect(sys.argv[1], timeout=30).execute("SELECT stream_settings FROM inbounds WHERE port=?", (int(sys.argv[2]),)):
+    n = ((json.loads(s or "{}").get("realitySettings") or {}).get("serverNames") or [""])[0]
+    if n: print(n); break' "$DB" "$VPN_PORT" 2>/dev/null || true)}"
+SNI_NOW="${SNI_NOW:-$SNI}"
+if sni_check "$SNI_NOW"; then
+  grn "    Маскировка Reality ${SNI_NOW}: открывается с сервера."
+else
+  ylw "    ✗ Маскировка Reality ${SNI_NOW} не открывается с этого сервера по TLS 1.3 — подключения Reality"
+  ylw "      (XHTTP, Reality, «через РФ») работать не будут. Подходящие отсюда домены:"
+  for d in www.apple.com dl.google.com www.samsung.com www.nvidia.com ya.ru www.ozon.ru www.wildberries.ru; do
+    if [ "$d" != "$SNI_NOW" ] && sni_check "$d"; then ylw "        $d"; fi
+  done
+  ylw "      Запустите скрипт ещё раз с SNI=домен в начале команды (ключи и подписка сохранятся)."
+fi
 
 # ============================================================================
 # МОСТ: зарубежный сервер настраивается отсюда по SSH этим же скриптом (роль exit)
@@ -4545,7 +4571,7 @@ PY
 sync_share_addr() {   # sync_share_addr [id] [название] [метка] [адрес|keep] — ссылки ведут на выбранный адрес (после смены IP или домена)
   local st id="${1:-$INB_ID}"
   api GET "/inbounds/get/${id}" > "$WORK/inb-get.json" || return 1
-  st="$(SHARE_ADDR="${4:-$ADDR}" NEW_REMARK="${2:-}" NEW_TAG="${3:-}" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
+  st="$(SHARE_ADDR="${4:-$ADDR}" NEW_REMARK="${2:-}" NEW_TAG="${3:-}" NEW_SNI="$([ -z "${4:-}" ] && printf '%s' "$SNI_USER")" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
 import json, os, sys
 ib = json.load(open(sys.argv[1]))["obj"]
 if isinstance(ib, str):
@@ -4559,6 +4585,18 @@ if ip != "keep" and not (ib.get("shareAddrStrategy") == "custom" and ib.get("sha
 for key, new in (("remark", e.get("NEW_REMARK")), ("tag", e.get("NEW_TAG"))):
     if new and ib.get(key) != new:      # заодно — новое название и метка подключения
         ib[key] = new
+        if state == "same":
+            state = "changed"
+sni = e.get("NEW_SNI") or ""
+if sni:                                 # SNI из команды: новая маскировка Reality (ключи прежние)
+    st = ib.get("streamSettings")
+    st = json.loads(st) if isinstance(st, str) and st else (st or {})
+    rs = st.get("realitySettings") if st.get("security") == "reality" else None
+    if isinstance(rs, dict) and (rs.get("serverNames") != [sni] or (rs.get("target") or rs.get("dest")) != sni + ":443"):
+        rs["serverNames"] = [sni]
+        rs.pop("dest", None)
+        rs["target"] = sni + ":443"
+        ib["streamSettings"] = st
         if state == "same":
             state = "changed"
 if state == "same":
@@ -4588,7 +4626,8 @@ PY
 case "${STATE:-error}" in
   reuse)
     [ "$SHORT_ID" = "-" ] && SHORT_ID=""
-    [ "$OLD_SNI" != "-" ] && SNI="$OLD_SNI"
+    if [ "$OLD_SNI" != "-" ] && [ -z "$SNI_USER" ]; then SNI="$OLD_SNI"; fi
+    if [ -n "$SNI_USER" ] && [ "$OLD_SNI" != "$SNI_USER" ]; then grn "    Маскировка Reality меняется: ${OLD_SNI} → ${SNI_USER} (ключи прежние)."; fi
     [ "${CLIENT_FLOW:--}" = "-" ] && CLIENT_FLOW=""
     grn "    На порту ${VPN_PORT} уже есть подключение — оставляю его, ключи прежние."
     sync_share_addr "$INB_ID" "$LABEL" || ylw "    Не удалось обновить адрес сервера в ссылках — проверьте подключение в панели."
@@ -4733,7 +4772,7 @@ PY
   case "$st" in
     reuse)
       [ "$XHTTP_SID" = "-" ] && XHTTP_SID=""
-      [ "$XHTTP_SNI" = "-" ] && XHTTP_SNI="$SNI"
+      if [ "$XHTTP_SNI" = "-" ] || [ -n "$SNI_USER" ]; then XHTTP_SNI="$SNI"; fi
       sync_share_addr "$XHTTP_ID" "$XHTTP_LABEL" || true ;;
     replace|none)
       if [ "$st" = "replace" ]; then
@@ -5607,14 +5646,14 @@ setup_sub_filter() {   # ставит и запускает фильтр; ждё
   write_sub_filter_program
   if [ "$SSL_OK" = "1" ]; then certf="$CERT"; keyf="$KEY"; scheme=https; fi
   PORT="$SUB_PORT" UP="$SUB_INTERNAL_PORT" CERTF="$certf" KEYF="$keyf" EXPECTED="$BALANCE_EXPECTED" \
-  MAX_RTT="$BALANCE_MAX_RTT" TUNE="$SUB_FILTER" python3 - > "$SUB_FILTER_CONF" <<'PY' || return 1
+  MAX_RTT="$BALANCE_APP_RTT" TUNE="$SUB_FILTER" python3 - > "$SUB_FILTER_CONF" <<'PY' || return 1
 import json, os
 e = os.environ
 print(json.dumps({"port": int(e["PORT"]), "upstream": int(e["UP"]), "cert": e["CERTF"], "key": e["KEYF"],
                   # expected — сколько лучших подключений работают сразу; maxRTT — предельный пинг;
                   # tolerance — допустимая доля неудачных проверок (как в профилях коммерческих VPN).
                   # SUB_FILTER=0, а фильтр нужен только для белых списков — «Автовыбор» не трогаем
-                  "leastLoad": {"expected": int(e["EXPECTED"]), "maxRTT": e["MAX_RTT"], "tolerance": 0.05}
+                  "leastLoad": {"expected": int(e["EXPECTED"]), "maxRTT": e["MAX_RTT"], "tolerance": 0.3}
                   if e["TUNE"] == "1" else {}},
                  indent=1))
 PY
@@ -5689,7 +5728,7 @@ settings = {
     "subJsonUserAgentRegex": r"(?i)^(v2rayng|v2rayn|happ)/",
     # «Автовыбор»: пинг каждого подключения раз в минуту (как в профилях коммерческих VPN)
     "subJsonObservatory": json.dumps({"destination": "http://www.gstatic.com/generate_204",
-                                      "interval": "1m", "sampling": 2, "timeout": "3s"}),
+                                      "interval": "1m", "sampling": 3, "timeout": "6s"}),
     "remarkTemplate": "{{INBOUND}}",     # в приложении — просто название подключения
     # правила для конфигов JSON-подписки; пустой subRoutingRules => этот же
     # профиль уходит в Happ заголовком "routing" и включается сам
@@ -5736,7 +5775,7 @@ if [ "$FILTER" = "1" ]; then
   if setup_sub_filter; then
     if [ "$SUB_FILTER" = "1" ] && [ "$AUTO_OK" = "1" ]; then
       FILTER_TUNE=1
-      grn "    Фильтр подписки: «${AUTO_LABEL}» ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED}), пинг больше ${RTT_TEXT} или потери — подключение отключается."
+      grn "    Фильтр подписки: «${AUTO_LABEL}» ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED}), пинг больше ${APP_RTT_TEXT} или потери — подключение отключается."
     fi
     if [ "$WHITE_READY" = "1" ]; then grn "    Фильтр подписки добавляет в неё рабочие подключения белых списков."; fi
   else
@@ -5824,7 +5863,7 @@ fetch_local() {   # fetch_local USER-AGENT /путь  ->  $WORK/h (заголо�
 CHECK_HAPP=0
 CHECK_JSON=0
 if fetch_local "Happ/3.0" "${SUB_PATH}${SUB_ID}" && AUTO_OK="$AUTO_OK" FILTER="$FILTER_TUNE" \
-   MAX_RTT="$BALANCE_MAX_RTT" python3 - "$WORK/b" <<'PY' 2>/dev/null
+   MAX_RTT="$BALANCE_APP_RTT" python3 - "$WORK/b" <<'PY' 2>/dev/null
 import json, os, sys
 data = json.load(open(sys.argv[1]))
 assert isinstance(data, list) and data
@@ -5889,7 +5928,7 @@ else
 fi
 if [ "$CHECK_HAPP" = "1" ]; then
   if [ "$FILTER_TUNE" = "1" ]; then
-    grn "    ✓ Happ: в подписке «${AUTO_LABEL}» (лучших сразу — ${BALANCE_EXPECTED}, пинг до ${RTT_TEXT}) и каждое подключение отдельно, правила внутри каждого"
+    grn "    ✓ Happ: в подписке «${AUTO_LABEL}» (лучших сразу — ${BALANCE_EXPECTED}, пинг до ${APP_RTT_TEXT}) и каждое подключение отдельно, правила внутри каждого"
   elif [ "$AUTO_OK" = "1" ]; then grn "    ✓ Happ: в подписке «${AUTO_LABEL}» и каждое подключение отдельно, правила внутри каждого"
   else grn "    ✓ Happ: правила приходят вместе с подпиской"; fi
 else ylw "    ✗ Happ: правила в ответе подписки не найдены"; fi
@@ -6045,7 +6084,7 @@ if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUT
   echo "Подключения в подписке:"
   if [ "$FILTER_TUNE" = "1" ]; then
     echo "  • «${AUTO_LABEL}» — приложение само ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED});"
-    echo "    пинг больше ${RTT_TEXT} или потери — подключение отключается (выберите этот профиль);"
+    echo "    пинг больше ${APP_RTT_TEXT} или потери — подключение отключается (выберите этот профиль);"
   elif [ "$AUTO_OK" = "1" ]; then echo "  • «${AUTO_LABEL}» — приложение само выбирает лучший путь (выберите его);"; fi
   if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}» — XHTTP: сайты открываются быстрее;"; fi
   echo "  • «${LABEL}» — обычное Reality, запасное;"
@@ -6150,7 +6189,7 @@ ShortID:   ${SHORT_ID}
 XHTTP:     $([ "$XHTTP_OK" = "1" ] && echo "порт ${XHTTP_PORT}, путь ${XHTTP_PATH} (в подписке — первым)" || echo "не настроен")
 WebSocket: $([ "$WS_OK" = "1" ] && echo "порт ${WS_PORT}, путь ${WS_PATH}, TLS на ${ADDR}" || echo "не настроен")
 Hysteria2: $([ "$HY2_OK" = "1" ] && echo "UDP-порт ${HY2_PORT}, TLS на ${ADDR} (пароль у каждого клиента свой — в подписке)" || echo "не настроен")
-Автовыбор: $(if [ "$FILTER_TUNE" = "1" ]; then echo "лучших подключений одновременно — ${BALANCE_EXPECTED}, пинг до ${RTT_TEXT} (настройки дописывает фильтр подписки vpn-sub-filter)"; elif [ "$AUTO_OK" = "1" ]; then echo "есть, без тонких настроек"; else echo "нет"; fi)
+Автовыбор: $(if [ "$FILTER_TUNE" = "1" ]; then echo "лучших подключений одновременно — ${BALANCE_EXPECTED}, пинг до ${APP_RTT_TEXT} (настройки дописывает фильтр подписки vpn-sub-filter)"; elif [ "$AUTO_OK" = "1" ]; then echo "есть, без тонких настроек"; else echo "нет"; fi)
 Одиночная ссылка (БЕЗ правил подписки — весь трафик через VPN):
 ${VLESS_URL}
 ${WHITE_PROFILE}

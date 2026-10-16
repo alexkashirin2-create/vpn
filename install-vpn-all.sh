@@ -34,10 +34,10 @@
 #     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
 #     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
 #     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
-#     после проверки. В подписку идут 50 самых быстрых рабочих по пингу (самые быстрые — первыми),
-#     после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 150).
+#     после проверки. В подписку идут 15 самых быстрых рабочих по пингу (самые быстрые — первыми),
+#     после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 30).
 #     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN):
-#     в нём 8 самых быстрых по пингу; при включении телефон сразу пингует их все из СВОЕЙ сети
+#     в нём 5 самых быстрых по пингу; при включении телефон сразу пингует их все из СВОЕЙ сети
 #     (у каждого оператора и региона пропускают разные) и ведёт трафик через самый быстрый по пингу
 #     из работающих у него; каждые 2 минуты пинг повторяется, не отвечает — телефон переходит на другой.
 #     ПРОВЕРКА С ТЕЛЕФОНА — страница «…/test/» на порту подписки (адрес — в итоге установки): одна
@@ -45,6 +45,11 @@
 #     мобильной сети телефона и отправляет результат на сервер. Серверы, которые работают у телефона,
 #     встают в подписке первыми («🏳️ БС ✅ 01 · …») и попадают в автоподбор (результат действует
 #     48 часов); те, что у телефона не заработали, уходят в конец списка.
+#     ВХОД И ВЫХОД: у каждого рабочего подключения сервер определяет, где вход (IP сервера подключения —
+#     по базе российских IP-сетей RIPE) и где выход (с какого IP подключение выходит в интернет).
+#     Первыми в подписке и в автоподборе — вход в России (проходит белые списки по IP), выход за рубежом
+#     («… · РФ→🌍»); с выходом в России («… · выход РФ») заблокированные сайты не откроются — они в конце
+#     списка и не попадают в автоподбор. WHITE_RU_EXIT=drop — убрать их из подписки совсем.
 #   • TUNNEL (Android, github.com/hussaroff/tunnel) И ДРУГИЕ ПРИЛОЖЕНИЯ НА MIHOMO (FlClash, Clash Meta,
 #     Clash Verge) получают полный профиль Mihomo: свои подключения и «🚀 Автовыбор», белые списки
 #     с автовыбором и «🔀 Автопереключение» — свой VPN, а когда он не отвечает (белые списки), сразу
@@ -82,7 +87,7 @@
 # всех серверов ведутся на российском сервере, а в одной ссылке-подписке у каждого
 # зарубежного сервера два подключения — «через РФ» и «напрямую» (телефон → сервер, без России).
 # Панели зарубежных серверов из интернета не видны — российская обращается к ним по мосту.
-# Только через РФ, без узлов: EXIT_DIRECT=0.
+# По умолчанию — только через РФ (EXIT_DIRECT=0); узлы и прямые подключения: EXIT_DIRECT=1.
 # Тонкие настройки балансировки (и для моста, и для «Автовыбора» в приложении):
 #   BALANCE_EXPECTED=2   — сколько лучших серверов работают одновременно;
 #   BALANCE_MAX_RTT=1s   — максимальный пинг (например, 800ms): кто медленнее — отключается.
@@ -116,8 +121,25 @@ WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссы
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
 WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-15}"          # белые списки: как часто проверять каждое подключение (минуты)
 WHITE_LABEL="${WHITE_LABEL:-🏳️ БС}"              # белые списки: начало названий этих подключений в приложении
-WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-8}"             # белые списки: сколько самых быстрых серверов телефон сам пингует в профиле автоподбора (0 — без профиля)
-WHITE_SUB_MAX="${WHITE_SUB_MAX:-50}"              # белые списки: сколько самых быстрых по пингу рабочих — в подписке (отдельная ссылка — до 150)
+WHITE_AUTO_MAX="${WHITE_AUTO_MAX:-5}"             # белые списки: сколько самых быстрых серверов телефон сам пингует в профиле автоподбора (0 — без профиля)
+WHITE_SUB_MAX="${WHITE_SUB_MAX:-15}"              # белые списки: сколько самых быстрых по пингу рабочих — в подписке (отдельная ссылка — до 30); короче список — быстрее проверка пинга в приложении
+WHITE_RU_EXIT="${WHITE_RU_EXIT:-last}"            # белые списки с выходом в интернет из России: last — в конец списка, drop — убрать
+# Сбор белого CIDR-списка пингом (ICMP): какие IP отвечают, их ASN и страна, сборка в подсети → локальные файлы.
+# Отдельный режим: WHITE_ICMP=1 собирает списки и выходит, VPN не трогает. Запуск:
+#   WHITE_ICMP=1 WHITE_ICMP_ASN=13238,15169 bash <(curl -fsSL …)
+WHITE_ICMP="${WHITE_ICMP:-}"              # 1 — собрать CIDR-список пингом и выйти; пусто — не собирать
+WHITE_ICMP_ASN="${WHITE_ICMP_ASN:-}"      # ASN через запятую (напр. 13238,15169); префиксы берутся из RIPEstat
+WHITE_ICMP_CIDR="${WHITE_ICMP_CIDR:-}"    # свои CIDR через запятую; можно вместе с ASN
+WHITE_ICMP_IN="${WHITE_ICMP_IN:-}"        # свой файл с IP или CSV (по строке) — вместо выборки по ASN/CIDR
+WHITE_ICMP_OUT="${WHITE_ICMP_OUT:-${WHITE_DATA:-/var/lib/vpn-white-lists}/icmp}"  # куда класть результат
+WHITE_ICMP_SUBNET="${WHITE_ICMP_SUBNET:-24}"   # длина префикса для subnets.csv и white-cidr-local.txt
+WHITE_ICMP_SAMPLE="${WHITE_ICMP_SAMPLE:-1}"    # сколько адресов на префикс пинговать (1 — только .1)
+WHITE_ICMP_FULL="${WHITE_ICMP_FULL:-0}"        # 1 — пинговать все адреса префикса (с защитой WHITE_ICMP_MAX)
+WHITE_ICMP_MAXPFX="${WHITE_ICMP_MAXPFX:-22}"   # при FULL пропускать префиксы крупнее /N (защита от огромного скана)
+WHITE_ICMP_MAX="${WHITE_ICMP_MAX:-50000}"      # предел числа кандидатов
+WHITE_ICMP_CONC="${WHITE_ICMP_CONC:-256}"      # параллельных пингов (фолбэк, если нет fping)
+WHITE_ICMP_TMO="${WHITE_ICMP_TMO:-800}"        # таймаут одного пинга, мс
+WHITE_ICMP_RETRY="${WHITE_ICMP_RETRY:-1}"      # повторов пинга на адрес
 MIHOMO="${MIHOMO:-1}"                 # профиль Mihomo (Clash Meta) для Tunnel, FlClash, Clash Meta и Verge: 1 — включить, 0 — выключить
 TUNNEL_TORRENT="${TUNNEL_TORRENT:-0}" # Tunnel: торренты 0 — мимо VPN (на сервер не придут жалобы), 1 — только через разрешённые серверы, 2 — через любой
 FREETURN="${FREETURN:-1}"             # FreeTurn — VPN через звонки VK (работает и при белых списках): 1 — поставить, 0 — убрать
@@ -130,7 +152,7 @@ EXIT_PASS="${EXIT_PASS:-}"            # мост: пароль этого лог
 EXIT_SSH_PORT="${EXIT_SSH_PORT:-22}"  # мост: порт SSH зарубежного сервера
 EXIT_VPN_PORT="${EXIT_VPN_PORT:-443}" # мост: порт, на котором зарубежный сервер ждёт российский
 EXIT_XHTTP_PORT="${EXIT_XHTTP_PORT:-8443}" # мост: порт XHTTP на зарубежном сервере (0 — только TCP)
-EXIT_DIRECT="${EXIT_DIRECT:-1}"       # мост: 1 — зарубежные серверы становятся узлами этой панели, у каждого — прямое подключение; 0 — только через РФ
+EXIT_DIRECT="${EXIT_DIRECT:-0}"       # мост: 0 — только через РФ (прямые подключения к зарубежным IP при белых списках не работают и в приложении висят «таймаутом»); 1 — ещё и узлы с прямым подключением
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/alexkashirin2-create/vpn/main/install-vpn-all.sh}"
 # ==========================================================================
 VPN_ROLE="${VPN_ROLE:-}"              # служебное: exit — так скрипт запускается на зарубежном сервере моста
@@ -200,6 +222,11 @@ esac
   || die "WHITE_AUTO_MAX — сколько серверов в автоподборе, от 0 (без него) до 30: ${WHITE_AUTO_MAX}"
 { [[ "$WHITE_SUB_MAX" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$WHITE_SUB_MAX" -ge 5 ] && [ "$WHITE_SUB_MAX" -le 300 ]; } \
   || die "WHITE_SUB_MAX — сколько белых списков в подписке, от 5 до 300: ${WHITE_SUB_MAX}"
+case "$(printf '%s' "$WHITE_RU_EXIT" | tr '[:upper:]' '[:lower:]')" in
+  last|"") WHITE_RU_EXIT=last ;;
+  drop|0|no|off) WHITE_RU_EXIT=drop ;;
+  *) die "WHITE_RU_EXIT: last — выход в РФ в конец списка, drop — убрать (сейчас: ${WHITE_RU_EXIT})" ;;
+esac
 WHITE_AUTO_NAME="${WHITE_LABEL} 🚀 Автовыбор"     # профиль автоподбора белых списков в приложении
 [ "$MIHOMO" = "0" ] || MIHOMO=1
 [[ "$TUNNEL_TORRENT" =~ ^[012]$ ]] || die "TUNNEL_TORRENT — 0 (торренты мимо VPN), 1 или 2: ${TUNNEL_TORRENT}"
@@ -209,6 +236,182 @@ if [ -n "$FREETURN_CALL" ] && ! [[ "$FREETURN_CALL" =~ ^https://(m\.)?vk\.(ru|co
   die "FREETURN_CALL — ссылка на звонок VK вида https://vk.ru/call/join/…: ${FREETURN_CALL}"
 fi
 if [[ "$XUI_VERSION" =~ ^[0-9] ]]; then XUI_VERSION="v${XUI_VERSION}"; fi
+
+# ---------- сбор белого CIDR-списка пингом (ICMP) ----------
+# Самостоятельный режим WHITE_ICMP=1: собрать IP, которые отвечают на ICMP, с их ASN и страной,
+# и свернуть в подсети. Ничего из VPN не трогает. Пишет в $WHITE_ICMP_OUT:
+#   prefixes.txt candidates.txt alive-ips.txt alive.csv subnets.csv white-cidr-local.txt
+# Шаги с сетью (RIPEstat для ASN→префиксы, Team Cymru для ASN+страны) рассчитаны на сервер.
+white_icmp_build() {
+  local out="$WHITE_ICMP_OUT"
+  command -v python3 >/dev/null 2>&1 || die "Нужен python3."
+  mkdir -p "$out" || die "Не создать каталог: $out"
+  local pfx="$out/prefixes.txt" cand="$out/candidates.txt" alive="$out/alive-ips.txt"
+  local enr="$out/enriched.tsv" acsv="$out/alive.csv" scsv="$out/subnets.csv" clist="$out/white-cidr-local.txt"
+
+  # 1) кандидаты --------------------------------------------------------------
+  if [ -n "$WHITE_ICMP_IN" ]; then
+    [ -r "$WHITE_ICMP_IN" ] || die "Не прочитать WHITE_ICMP_IN: $WHITE_ICMP_IN"
+    grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "$WHITE_ICMP_IN" | sort -u > "$cand" || true
+    : > "$pfx"
+    grn "    Беру IP из файла: $WHITE_ICMP_IN"
+  else
+    : > "$pfx"
+    local c a js
+    for c in $(printf '%s' "$WHITE_ICMP_CIDR" | tr ',' ' '); do [ -n "$c" ] && printf '%s\n' "$c" >> "$pfx"; done
+    for a in $(printf '%s' "$WHITE_ICMP_ASN" | tr ',' ' '); do
+      a="${a#[Aa][Ss]}"; [ -n "$a" ] || continue
+      grn "    Префиксы AS${a}…"
+      js="$(curl -fsS --max-time 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${a}" 2>/dev/null || true)"
+      if [ -n "$js" ]; then
+        printf '%s' "$js" | python3 - >> "$pfx" <<'PY' || true
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for p in d["data"]["prefixes"]:
+        if ":" not in p["prefix"]:
+            print(p["prefix"])
+except Exception:
+    pass
+PY
+      elif command -v whois >/dev/null 2>&1; then
+        whois -h whois.radb.net -- "-i origin AS${a}" 2>/dev/null | awk '/^route:/{print $2}' >> "$pfx" || true
+      else
+        ylw "    AS${a}: RIPEstat недоступен и нет whois — пропуск (apt-get install -y whois)."
+      fi
+    done
+    sort -u -o "$pfx" "$pfx" 2>/dev/null || true
+    local npfx; npfx="$(grep -c . "$pfx" 2>/dev/null || true)"; npfx="${npfx:-0}"
+    [ "$npfx" -gt 0 ] || die "Нет префиксов. Задайте WHITE_ICMP_ASN и/или WHITE_ICMP_CIDR (или WHITE_ICMP_IN)."
+    grn "    Префиксов: $npfx"
+    WIC_FULL="$WHITE_ICMP_FULL" WIC_SAMPLE="$WHITE_ICMP_SAMPLE" WIC_MAX="$WHITE_ICMP_MAX" WIC_MAXPFX="$WHITE_ICMP_MAXPFX" \
+    python3 - "$pfx" "$cand" <<'PY' || die "Не удалось развернуть префиксы."
+import ipaddress, os, sys
+pfx, cand = sys.argv[1], sys.argv[2]
+e = os.environ
+full = e["WIC_FULL"] == "1"; sample = int(e["WIC_SAMPLE"]); mx = int(e["WIC_MAX"]); maxpfx = int(e["WIC_MAXPFX"])
+out, seen = [], set()
+def add(ip):
+    s = str(ip)
+    if s not in seen:
+        seen.add(s); out.append(s)
+for line in open(pfx):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        net = ipaddress.ip_network(line, strict=False)
+    except Exception:
+        continue
+    if net.version != 4:
+        continue
+    hosts = list(net.hosts()) or [net.network_address]
+    if full:
+        if net.prefixlen < maxpfx:
+            print(f"skip {net} (крупнее /{maxpfx})", file=sys.stderr); continue
+        for h in hosts: add(h)
+    else:
+        for h in hosts[:sample]: add(h)
+    if len(out) >= mx:
+        print(f"предел WHITE_ICMP_MAX={mx}", file=sys.stderr); break
+open(cand, "w").write("\n".join(out[:mx]) + ("\n" if out else ""))
+print(f"кандидатов: {min(len(out), mx)}", file=sys.stderr)
+PY
+  fi
+  local ncand; ncand="$(grep -c . "$cand" 2>/dev/null || true)"; ncand="${ncand:-0}"
+  [ "$ncand" -gt 0 ] || die "Нет кандидатов для пинга."
+
+  # 2) ICMP-скан --------------------------------------------------------------
+  grn "    Пингую $ncand адресов…"
+  : > "$alive"
+  if command -v fping >/dev/null 2>&1; then
+    fping -a -q -r "$WHITE_ICMP_RETRY" -t "$WHITE_ICMP_TMO" < "$cand" > "$alive" 2>/dev/null || true
+  else
+    local ts=$(( (WHITE_ICMP_TMO + 999) / 1000 )); [ "$ts" -lt 1 ] && ts=1
+    TS="$ts" RETRY="$WHITE_ICMP_RETRY" xargs -P "$WHITE_ICMP_CONC" -I{} sh -c '
+      n=0; while [ "$n" -le "$RETRY" ]; do
+        ping -c1 -W "$TS" "{}" >/dev/null 2>&1 && { echo "{}"; break; }
+        n=$((n+1)); done' < "$cand" > "$alive" 2>/dev/null || true
+  fi
+  sort -u -o "$alive" "$alive" 2>/dev/null || true
+  local nup; nup="$(grep -c . "$alive" 2>/dev/null || true)"; nup="${nup:-0}"
+  grn "    Ответили на ICMP: $nup из $ncand"
+
+  # 3) обогащение ASN + страна (Team Cymru, один запрос) ----------------------
+  python3 - "$alive" "$enr" <<'PY' || true
+import socket, sys
+alive, enr = sys.argv[1], sys.argv[2]
+ips = [l.strip() for l in open(alive) if l.strip()]
+raw = ""
+if ips:
+    try:
+        q = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
+        s = socket.create_connection(("whois.cymru.com", 43), timeout=30)
+        s.sendall(q.encode()); buf = b""
+        while True:
+            d = s.recv(65536)
+            if not d: break
+            buf += d
+        s.close(); raw = buf.decode(errors="replace")
+    except Exception as ex:
+        print(f"Team Cymru недоступен ({ex}); ASN/страна останутся пустыми", file=sys.stderr)
+info = {}
+for line in raw.splitlines():
+    if "|" not in line or line.lower().startswith("bulk"): continue
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 7: continue
+    asn, ip, prefix, cc, reg, alloc, name = parts[:7]
+    if not ip or ip == "IP": continue
+    info[ip] = (cc, asn, name)
+with open(enr, "w") as o:
+    for ip in ips:
+        cc, asn, name = info.get(ip, ("", "", ""))
+        o.write(f"{ip}\t{cc}\t{asn}\t{name}\n")
+PY
+
+  # 4) выходные файлы ---------------------------------------------------------
+  python3 - "$enr" "$acsv" "$scsv" "$clist" "$WHITE_ICMP_SUBNET" <<'PY' || die "Не удалось записать результат."
+import csv, ipaddress, sys
+enr, acsv, scsv, clist, sp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+rows = []
+try:
+    for l in open(enr):
+        parts = (l.rstrip("\n").split("\t") + ["", "", "", ""])[:4]
+        if parts[0]: rows.append(tuple(parts))
+except OSError:
+    pass
+w = csv.writer(open(acsv, "w", newline=""))
+w.writerow(["ip", "location", "asn", "as_name"])
+for ip, cc, asn, name in rows: w.writerow([ip, cc, asn, name])
+nets = {}
+for ip, cc, asn, name in rows:
+    net = str(ipaddress.ip_network(f"{ip}/{sp}", strict=False))
+    e = nets.setdefault(net, {"cc": set(), "asn": set(), "n": 0})
+    e["n"] += 1
+    if cc: e["cc"].add(cc)
+    if asn: e["asn"].add(asn)
+order = sorted(nets, key=lambda n: ipaddress.ip_network(n))
+w = csv.writer(open(scsv, "w", newline=""))
+w.writerow(["subnet", "asn", "location", "live_ips"])
+for net in order:
+    e = nets[net]
+    w.writerow([net, "|".join(sorted(e["asn"])), "|".join(sorted(e["cc"])), e["n"]])
+with open(clist, "w") as f:
+    for net in order: f.write(net + "\n")
+print(f"alive.csv: {len(rows)} строк   subnets.csv / white-cidr-local.txt: {len(nets)} подсетей", file=sys.stderr)
+PY
+  grn "    Готово. Файлы в: $out"
+  ylw "      alive.csv — IP, страна, ASN, имя AS"
+  ylw "      subnets.csv — подсети /$WHITE_ICMP_SUBNET с ASN и страной"
+  ylw "      white-cidr-local.txt — плоский CIDR-список (как WHITE-CIDR-RU-checked.txt)"
+  grn "    Подключить к белым спискам: выложите white-cidr-local.txt по ссылке и добавьте её в WHITE_URL."
+  return 0
+}
+if [ -n "$WHITE_ICMP" ] && [ "$WHITE_ICMP" != "0" ]; then
+  grn "=== Сбор белого CIDR-списка пингом (ICMP) ==="
+  white_icmp_build
+  exit 0
+fi
 
 WORK="$(mktemp -d)"
 TUNNEL_PID=""
@@ -489,12 +692,15 @@ def white_items(kind="sub"):
                 for it in items:
                     it["_key"] = item_key(it)
                 ver, bad = fresh_verified()
+                # в автоподбор — без выхода в РФ (с ним заблокированные сайты не откроются), если есть другие
+                no_ru = [x for x in items if x.get("out_ru") is not True]
+                auto_max = int((WHITE.get("auto") or {}).get("max") or 0)
                 # везде — сначала работающие у телефона (по пингу у телефона), дальше самые быстрые по
                 # пингу с сервера, а не работающие у телефона — в самом конце
                 _white.update(stamp=stamp, all=items, verified=ver, failed=bad,
-                              sub=marked(pick_best(items, int(WHITE.get("sub_max") or 50), ver, bad), ver),
-                              list=marked(pick_best(items, int(WHITE.get("list_max") or 150), ver, bad), ver),
-                              auto=pick_best(items, int((WHITE.get("auto") or {}).get("max") or 0), ver, bad),
+                              sub=marked(pick_best(items, int(WHITE.get("sub_max") or 15), ver, bad), ver),
+                              list=marked(pick_best(items, int(WHITE.get("list_max") or 30), ver, bad), ver),
+                              auto=pick_best(no_ru if len(no_ru) >= min(2, auto_max) else items, auto_max, ver, bad),
                               phone=pick_best(items, int(PHONE.get("max") or 300), ver, bad))
             except (OSError, ValueError, AttributeError, TypeError):
                 pass                      # файл как раз переписывается — отдаём прежний список
@@ -541,15 +747,30 @@ def ping_of(item):
     return item["ms"] if isinstance(item.get("ms"), (int, float)) else 10 ** 9
 
 
+def tier(item):
+    """вход в РФ и выход за рубежом — лучшие (проходят белые списки по IP и открывают заблокированные
+    сайты); дальше выход за рубежом; выход не определился; выход в РФ — в самом конце"""
+    out = item.get("out_ru")
+    if out is True:
+        return 3
+    if out is None:
+        return 2
+    return 0 if item.get("in_ru") is True else 1
+
+
+def rank(item):
+    return tier(item), ping_of(item)
+
+
 def fastest(items, limit):
-    """limit самых быстрых по пингу, самые быстрые — первыми. Один и тот же сервер (с другим ключом
-    или портом) — только после всех остальных серверов, чтобы в списке не было одинаковых"""
+    """limit лучших: сначала по входу и выходу (tier), внутри — самые быстрые по пингу. Один и тот же
+    сервер (с другим ключом или портом) — только после всех остальных серверов, чтобы не было одинаковых"""
     seen, first, rest = set(), [], []
-    for it in sorted(items, key=ping_of):
+    for it in sorted(items, key=rank):
         host = server_host(it["outbound"])
         (rest if host in seen else first).append(it)
         seen.add(host)
-    return sorted((first + rest)[:max(0, limit)], key=ping_of)
+    return sorted((first + rest)[:max(0, limit)], key=rank)
 
 
 def pick_best(items, limit, verified=None, failed=()):
@@ -1124,7 +1345,7 @@ def phone_status():
         r = read_json(os.path.join(REPORTS, f), {})
         if isinstance(r, dict):
             reports.append({k: r.get(k) for k in ("time", "label", "open", "tested", "ok", "best", "top")})
-    sub_max = int(WHITE.get("sub_max") or 50)
+    sub_max = int(WHITE.get("sub_max") or 15)
     return {"now": int(time.time()), "alive": len(white_items("all")), "candidates": len(white_items("phone")),
             "verified": len(ver), "failed": len(white_items("failed")), "in_sub": min(len(ver), sub_max),
             "sub_max": sub_max,
@@ -1985,11 +2206,12 @@ write_white_program() {
 #   vpn-white-lists.py НАСТРОЙКИ.json check   — проверить всё
 #   vpn-white-lists.py НАСТРОЙКИ.json quick   — перепроверить только рабочие
 #   vpn-white-lists.py НАСТРОЙКИ.json status  — итог последней проверки (JSON)
-import base64, binascii, collections, concurrent.futures, fcntl, glob, ipaddress, json, os, re, socket, ssl
-import subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+import base64, binascii, bisect, collections, concurrent.futures, fcntl, glob, ipaddress, json, os, re, socket
+import ssl, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
 SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2")
 MAX_BYTES = 8 * 1024 * 1024
+IPV4 = re.compile(rb"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
 FLAG = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 
 
@@ -2011,7 +2233,14 @@ def load_conf(path):
                        ("workers", 64), ("tcp_workers", 128), ("batch", 300),
                        ("max_items", 4000),        # сколько разных подключений из всех источников проверять
                        ("full_check_minutes", 60),  # полная проверка; между ними — только рабочие
-                       ("sub_max", 50), ("list_max", 150), ("xray_dir", "/usr/local/x-ui/bin")):
+                       ("sub_max", 15), ("list_max", 30), ("xray_dir", "/usr/local/x-ui/bin"),
+                       # российские IP-сети (вход и выход подключения): ipverse — сводка базы RIPE, затем сама RIPE
+                       ("ru_ranges", ["https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt",
+                                      "https://cdn.jsdelivr.net/gh/ipverse/rir-ip@master/country/ru/ipv4-aggregated.txt",
+                                      "https://ftp.ripe.net/pub/stats/ripencc/delegated-ripencc-latest"]),
+                       # IP выхода: сайты, которые отвечают IP-адресом того, кто к ним пришёл
+                       ("exit_urls", ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://4.ident.me"]),
+                       ("ru_exit", "last")):        # выход в России: last — в конец списка, drop — убрать
         conf.setdefault(key, value)
     return conf
 
@@ -2054,14 +2283,87 @@ def reason(err):
 
 
 # ---------------------------------------------------------------- скачивание списков
-def fetch(url):
+def fetch(url, limit=MAX_BYTES):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (vpn-white-lists)",
                                                "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read(MAX_BYTES + 1)
-    if len(raw) > MAX_BYTES:
-        raise ValueError("файл больше 8 МБ")
+        raw = resp.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("файл больше %d МБ" % (limit // (1024 * 1024)))
     return raw
+
+
+# ---------------------------------------------------------------- российские IP-сети
+RU_FILE = "ru-ipv4.txt"
+
+
+def parse_ru(text):
+    """сети России: строки «1.2.3.0/24» (ipverse) или «ripencc|RU|ipv4|начало|сколько|…» (RIPE) →
+    отсортированные непересекающиеся диапазоны (начало, конец) числами"""
+    nets = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            p = line.split("|")
+            if len(p) > 4 and p[1] == "RU" and p[2] == "ipv4":
+                try:
+                    start = int(ipaddress.IPv4Address(p[3]))
+                    nets.append((start, start + int(p[4]) - 1))
+                except ValueError:
+                    pass
+            continue
+        try:
+            n = ipaddress.IPv4Network(line, strict=False)
+        except ValueError:
+            continue
+        nets.append((int(n.network_address), int(n.broadcast_address)))
+    nets.sort()
+    merged = []
+    for a, b in nets:
+        if merged and a <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def ru_networks(conf, state):
+    """российские сети — раз в сутки скачиваем заново; не скачались — берём прежние"""
+    path = os.path.join(conf["data"], RU_FILE)
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        age = float("inf")
+    if age > 24 * 3600:
+        for url in conf["ru_ranges"]:
+            try:
+                nets = parse_ru(fetch(url, 64 * 1024 * 1024).decode("utf-8", "replace"))
+            except (OSError, ValueError):
+                continue
+            if len(nets) > 1000:                   # у России — тысячи сетей; меньше — файл не тот или битый
+                write_atomic(path, "".join("%d %d\n" % n for n in nets))
+                break
+    try:
+        with open(path, encoding="utf-8") as f:
+            nets = [tuple(int(x) for x in line.split()) for line in f if line.strip()]
+    except (OSError, ValueError):
+        nets = []
+    state["ru_ranges"] = len(nets)
+    return nets
+
+
+def in_nets(ip, nets):
+    """True — IP в российской сети, False — нет, None — не знаем (нет IP, IPv6 или нет базы сетей)"""
+    if not ip or not nets:
+        return None
+    try:
+        v = int(ipaddress.IPv4Address(ip))
+    except ValueError:
+        return None
+    i = bisect.bisect_right(nets, (v, float("inf"))) - 1
+    return i >= 0 and nets[i][0] <= v <= nets[i][1]
 
 
 def extract_links(raw):
@@ -2504,8 +2806,9 @@ def recv_exact(sock, size):
 CTX = ssl.create_default_context()
 
 
-def probe(port, url, timeout):
-    """запрос url через SOCKS-вход 127.0.0.1:port; время ответа в мс или None"""
+def probe(port, url, timeout, body=False):
+    """запрос url через SOCKS-вход 127.0.0.1:port; время ответа в мс или None.
+    body=True — (время, тело ответа) или None"""
     u = urllib.parse.urlsplit(url)
     secure = u.scheme == "https"
     host, dport = u.hostname, u.port or (443 if secure else 80)
@@ -2536,11 +2839,19 @@ def probe(port, url, timeout):
             if not chunk:
                 break
             reply += chunk
+        ms = int((time.monotonic() - start) * 1000)
         status = reply.split(b"\r\n", 1)[0].split()
-        if len(status) >= 2 and status[0].startswith(b"HTTP/") and status[1].isdigit() \
-                and 200 <= int(status[1]) < 400:
-            return int((time.monotonic() - start) * 1000)
-        return None
+        if not (len(status) >= 2 and status[0].startswith(b"HTTP/") and status[1].isdigit()
+                and 200 <= int(status[1]) < 400):
+            return None
+        if not body:
+            return ms
+        while len(reply) < 8192:                   # тело ответа: сайты с IP отвечают коротко и закрывают соединение
+            chunk = conn.recv(2048)
+            if not chunk:
+                break
+            reply += chunk
+        return ms, reply.partition(b"\r\n\r\n")[2]
     except (OSError, ValueError, UnicodeError):
         return None
     finally:
@@ -2549,6 +2860,23 @@ def probe(port, url, timeout):
                 conn.close()
             except OSError:
                 pass
+
+
+def exit_ip(port, urls, timeout, first=0):
+    """IP, с которого подключение выходит в интернет (через SOCKS-вход port); "" — не узнали.
+    Сайты с IP чередуем по подключениям, чтобы не упереться в ограничения одного из них"""
+    for k in range(min(2, len(urls))):
+        r = probe(port, urls[(first + k) % len(urls)], timeout, body=True)
+        if not r:
+            continue
+        for m in IPV4.finditer(r[1][:512]):
+            ip = m.group(1).decode("ascii")
+            try:
+                if ipaddress.IPv4Address(ip).is_global:
+                    return ip
+            except ValueError:
+                continue
+    return ""
 
 
 def internet_ok(conf):
@@ -2565,8 +2893,11 @@ def internet_ok(conf):
 
 
 def probe_batch(xray, conf, items, work):
-    """одна пачка: временный Xray со входом на каждое подключение, запрос через каждое"""
+    """одна пачка: временный Xray со входом на каждое подключение, запрос через каждое;
+    у ответивших, чей выход ещё не известен, — и IP выхода. Итог: [(мс или None, IP выхода или "")]"""
     ports = free_ports(len(items))
+    need_exit = {p: not it.get("exit_ip") for p, it in zip(ports, items)}
+    exit_urls = list(conf.get("exit_urls") or [])
     path = os.path.join(work, "check.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(xray_config(items, ports), f)
@@ -2594,7 +2925,7 @@ def probe_batch(xray, conf, items, work):
                 err = ""
             raise RuntimeError("Xray для проверки не запустился%s" % (": " + err if err else ""))
 
-        def one(port):
+        def ping(port):
             for url in conf["test_urls"][:2]:
                 t0 = time.monotonic()
                 ms = probe(port, url, timeout)
@@ -2603,6 +2934,12 @@ def probe_batch(xray, conf, items, work):
                 if time.monotonic() - t0 >= timeout * 0.8:   # не ответил вовсе — второй раз не ждём
                     return None
             return None
+
+        def one(port):
+            ms = ping(port)
+            if ms is None or not need_exit[port] or not exit_urls:
+                return ms, ""
+            return ms, exit_ip(port, exit_urls, timeout, port % len(exit_urls))
 
         with concurrent.futures.ThreadPoolExecutor(int(conf["workers"])) as pool:
             return list(pool.map(one, ports))
@@ -2630,6 +2967,9 @@ def check(conf, state, items, quick=False):
             raise RuntimeError("Xray не принял ни одно подключение из списка: %s" % (why or "формат не поддерживается"))
         if not internet_ok(conf):
             raise RuntimeError("у сервера сейчас нет связи с интернетом — проверку пропускаю")
+        nets = ru_networks(conf, state)            # где вход и выход подключения: в России или нет
+        if not nets:
+            log("Базу российских IP-сетей скачать не удалось — вход и выход подключений не определяю.")
         # 1) открывается ли сервер подключения вообще — быстро, без Xray
         with concurrent.futures.ThreadPoolExecutor(int(conf["tcp_workers"])) as pool:
             checked = list(pool.map(lambda it: reachable(it, float(conf["tcp_timeout"])), items))
@@ -2643,8 +2983,10 @@ def check(conf, state, items, quick=False):
         size = max(1, int(conf["batch"]))
         for i in range(0, len(todo), size):
             batch = todo[i:i + size]
-            for it, ms in zip(batch, probe_batch(xray, conf, batch, work)):
+            for it, (ms, ex) in zip(batch, probe_batch(xray, conf, batch, work)):
                 results[it["n"]] = ms
+                if ex:
+                    it["exit_ip"] = ex
             if len(todo) > size:
                 log("  проверено %d из %d…" % (min(i + size, len(todo)), len(todo)))
     finally:
@@ -2652,6 +2994,30 @@ def check(conf, state, items, quick=False):
             os.unlink(os.path.join(work, name))
         os.rmdir(work)
     alive = [dict(it, ms=results[it["n"]]) for it in items if results.get(it["n"]) is not None]
+    # вход (IP сервера подключения) и выход (IP, с которого оно выходит в интернет): в России или нет.
+    # Вход в России — подключение проходит белые списки по IP; выход за рубежом — открываются и
+    # заблокированные сайты. Отметка — в названии: «… · РФ→🌍» лучшие, «… · выход РФ» — только российский интернет
+    for it in alive:
+        it["in_ru"] = in_nets(it.get("ip") or "", nets)
+        it["out_ru"] = in_nets(it.get("exit_ip") or "", nets)
+        base = it.get("base_name") or it["name"]
+        tag = ""
+        if it["out_ru"] is True:
+            tag = " · выход РФ"
+        elif it["out_ru"] is False and it["in_ru"] is True:
+            tag = " · РФ→🌍"
+        it["base_name"] = base
+        if it["name"] != base + tag:
+            it["name"] = base + tag
+            it["link"] = rename(it["link"], it["name"])
+    ru_good = sum(1 for it in alive if it["in_ru"] is True and it["out_ru"] is False)
+    abroad = sum(1 for it in alive if it["in_ru"] is not True and it["out_ru"] is False)
+    ru_exit = sum(1 for it in alive if it["out_ru"] is True)
+    no_exit = sum(1 for it in alive if it["out_ru"] is None)
+    answered = len(alive)
+    if conf.get("ru_exit") == "drop":
+        alive = [it for it in alive if it["out_ru"] is not True]
+    state.update(ru_good=ru_good, exit_abroad=abroad, ru_exit=ru_exit, exit_unknown=no_exit)
     closed = sum(1 for r in reach if r is False)
     opened = sum(1 for it, r in zip(items, reach) if r is True and results.get(it["n"]) is None)
     udp = sum(1 for it, r in zip(items, reach) if r is None and results.get(it["n"]) is None)
@@ -2674,7 +3040,7 @@ def check(conf, state, items, quick=False):
     if failed and not alive and closed == failed:
         log("Этот сервер не может подключиться ни к одному серверу из списка — похоже, исходящие "
             "соединения ограничивает хостер или сеть сервера.")
-    if not alive:
+    if not answered:
         # не ответило ни одно — скорее всего, сбой связи у самого сервера, а не у всех подключений
         # сразу: оставляем прежние рабочие (те, что ещё есть в списке) до следующей проверки
         keys = {json.dumps(it["outbound"], sort_keys=True) for it in items}
@@ -2690,7 +3056,11 @@ def check(conf, state, items, quick=False):
             return
     write_atomic(path, json.dumps({"updated": now, "total": total, "alive": len(alive), "items": alive},
                                   ensure_ascii=False))
-    log("%s %d: работают %d, не отвечают %d%s." % (kind, len(items), len(alive), failed, detail))
+    log("%s %d: работают %d, не отвечают %d%s." % (kind, len(items), answered, failed, detail))
+    if answered and nets:
+        log("  вход в РФ, выход за рубежом — %d; выход за рубежом — %d; выход в РФ — %d%s; выход не определился — %d."
+            % (ru_good, abroad, ru_exit, " (убраны из подписки)" if conf.get("ru_exit") == "drop" else
+               " (в конце списка)", no_exit))
     if not quick and bad:
         log("Не проверялись: %d (Xray этого сервера не принимает их настройки)." % len(bad))
 
@@ -2773,7 +3143,7 @@ white_setup() {   # программа, настройки и таймер бе�
   write_white_program
   mkdir -p "$(dirname "$WHITE_CONF")" "$WHITE_DATA"
   WHITE_URL="$WHITE_URL" REFRESH="$WHITE_REFRESH_HOURS" LABEL="$WHITE_LABEL" DATA="$WHITE_DATA" \
-  AUTO_MAX="$WHITE_AUTO_MAX" AUTO_NAME="$WHITE_AUTO_NAME" SUB_MAX="$WHITE_SUB_MAX" XDIR="${XUI_DIR}/bin" \
+  AUTO_MAX="$WHITE_AUTO_MAX" AUTO_NAME="$WHITE_AUTO_NAME" SUB_MAX="$WHITE_SUB_MAX" XDIR="${XUI_DIR}/bin" RU_EXIT="$WHITE_RU_EXIT" \
   python3 - "$WHITE_CONF" <<'PY' || return 1
 import json, os, secrets, sys
 e = os.environ
@@ -2838,8 +3208,10 @@ conf = {"sources": sources, "custom": custom, "refresh_hours": int(e["REFRESH"])
         # все — раз в час (full_check_minutes), между ними — только рабочие
         "timeout": 8, "tcp_timeout": 3, "workers": 64, "tcp_workers": 128, "batch": 300,
         "max_items": 3000, "full_check_minutes": 60,
+        # у каждого рабочего — вход и выход (в России или нет); выход в России: last — в конец, drop — убрать
+        "ru_exit": e["RU_EXIT"],
         # в подписке — sub_max самых быстрых по пингу рабочих, в отдельной подписке — до list_max
-        "sub_max": int(e["SUB_MAX"]), "list_max": max(150, int(e["SUB_MAX"])),
+        "sub_max": int(e["SUB_MAX"]), "list_max": max(30, int(e["SUB_MAX"])),
         # для фильтра подписки: адрес отдельной подписки (прежний), её название в приложении
         # и как часто приложению обновлять подписку (часы) — тогда нерабочие пропадают и с телефона
         "path": old.get("path") or "/" + secrets.token_hex(8) + "/",
@@ -2924,17 +3296,24 @@ white_timer_on() {   # проверка по таймеру — каждые WHI
 }
 WHITE_TOTAL=0; WHITE_ALIVE=0; WHITE_ERR=""
 WHITE_WORKING=0; WHITE_SRC_OK=0; WHITE_SRC_ALL=0
+WHITE_RU_GOOD=0; WHITE_EXIT_ABROAD=0; WHITE_RU_EXIT_N=0; WHITE_RU_NETS=0
 white_state() {   # итог последней проверки → WHITE_TOTAL (подключений во всех списках), WHITE_WORKING (рабочих),
-                  # WHITE_ALIVE (из них в подписке), WHITE_SRC_OK/WHITE_SRC_ALL (источников скачано/всего), WHITE_ERR
+                  # WHITE_ALIVE (из них в подписке), WHITE_SRC_OK/WHITE_SRC_ALL (источников скачано/всего), WHITE_ERR,
+                  # WHITE_RU_GOOD (вход в РФ, выход за рубежом), WHITE_EXIT_ABROAD (выход за рубежом, вход не в РФ),
+                  # WHITE_RU_EXIT_N (выход в РФ), WHITE_RU_NETS (российских сетей в базе; 0 — вход и выход не определялись)
   local st
   st="$(python3 "$WHITE_PY" "$WHITE_CONF" status 2>/dev/null | python3 -c 'import json, sys
 d = json.load(sys.stdin)
 err = " ".join(str(d.get("check_error") or d.get("download_error") or "").split())
 print(int(d.get("total") or 0), int(d.get("alive_now") or 0), int(d.get("in_subscription") or 0),
-      int(d.get("sources_ok") or 0), int(d.get("sources_total") or 0), err or "-")' 2>/dev/null || echo "0 0 0 0 0 -")"
-  read -r WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL WHITE_ERR <<< "$st" || true
+      int(d.get("sources_ok") or 0), int(d.get("sources_total") or 0), int(d.get("ru_good") or 0),
+      int(d.get("exit_abroad") or 0), int(d.get("ru_exit") or 0), int(d.get("ru_ranges") or 0), err or "-")' 2>/dev/null \
+    || echo "0 0 0 0 0 0 0 0 0 -")"
+  read -r WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL WHITE_RU_GOOD WHITE_EXIT_ABROAD \
+    WHITE_RU_EXIT_N WHITE_RU_NETS WHITE_ERR <<< "$st" || true
   local v
-  for v in WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL; do
+  for v in WHITE_TOTAL WHITE_WORKING WHITE_ALIVE WHITE_SRC_OK WHITE_SRC_ALL WHITE_RU_GOOD WHITE_EXIT_ABROAD \
+           WHITE_RU_EXIT_N WHITE_RU_NETS; do
     [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" '%s' 0
   done
   if [ "${WHITE_ERR:--}" = "-" ]; then WHITE_ERR=""; fi
@@ -2960,7 +3339,7 @@ if os.environ["WHITE"] == "1":
     w = json.load(open(os.environ["WHITE_CONF"], encoding="utf-8"))
     conf["white"] = {"file": os.path.join(w["data"], "alive.json"), "path": w["path"],
                      "title": w.get("title") or "Белые списки", "update_hours": int(w.get("update_hours") or 1),
-                     "sub_max": int(w.get("sub_max") or 50), "list_max": int(w.get("list_max") or 150),
+                     "sub_max": int(w.get("sub_max") or 15), "list_max": int(w.get("list_max") or 30),
                      "label": w.get("label") or "", "auto": w.get("auto") or {},
                      # проверка с телефона (страница …/test/): отчёты, Xray для Android; работающие у телефона
                      # за последние hours часов — первыми в подписке; max — сколько серверов проверяет телефон
@@ -3008,7 +3387,11 @@ white_summary() {   # итог для экрана и для файла с до�
   echo "Источники: ${src}."
   echo "Новые списки — каждые ${WHITE_REFRESH_HOURS} ч; каждое подключение проверяется настоящим запросом: все — раз в час,"
   echo "рабочие — каждые ${WHITE_CHECK_MIN} мин. Нерабочее пропадает из подписки сразу после проверки (приложение обновляет её раз в час)."
-  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} самых быстрых по пингу${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  echo "Сейчас: подключений во всех списках — ${WHITE_TOTAL}, рабочих — ${WHITE_WORKING}; в подписке — ${WHITE_ALIVE} лучших${WHITE_ERR:+ (последняя проверка: ${WHITE_ERR})}."
+  if [ "$WHITE_RU_NETS" -gt 0 ]; then
+    echo "Вход и выход рабочих: вход в РФ, выход за рубежом («… · РФ→🌍», в подписке первыми) — ${WHITE_RU_GOOD};"
+    echo "выход за рубежом — ${WHITE_EXIT_ABROAD}; выход в РФ («… · выход РФ», заблокированные сайты через них не откроются) — ${WHITE_RU_EXIT_N}$([ "$WHITE_RU_EXIT" = "drop" ] && echo ", убраны из подписки (WHITE_RU_EXIT=drop)" || echo ", в конце списка, не в автоподборе")."
+  fi
   if [ "$WHITE_AUTO_MAX" -gt 1 ]; then
     echo "Автоподбор для каждого устройства — профиль «${WHITE_AUTO_NAME}» (Happ, v2rayNG, v2rayN): в нём ${WHITE_AUTO_MAX} самых"
     echo "быстрых по пингу; при включении телефон сразу пингует их все из своей сети, потом каждые 2 минуты, и ведёт"

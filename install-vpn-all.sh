@@ -137,6 +137,9 @@ BALANCE_MAX_RTT="${BALANCE_MAX_RTT:-1s}"   # мост (на сервере): м�
 BALANCE_APP_RTT="${BALANCE_APP_RTT:-3s}"   # «Автовыбор» в приложении: максимальный пинг (телефон → РФ → выход: на мобильном часто больше 1 с)
 SUB_FILTER="${SUB_FILTER:-1}"         # 1 — подписку отдаёт фильтр, который дописывает «Автовыбору» эти настройки; 0 — сама панель (с белыми списками фильтр нужен всё равно)
 WHITE_LISTS="${WHITE_LISTS:-}"        # белые списки: 1 — включить, only — только они (VPN уже установлен), 0 — убрать; пусто — как в прошлый раз
+ONLINE_PAGE="${ONLINE_PAGE:-1}"        # страница «Кто подключён»: 1 — есть (журнал подключений Xray — только в памяти, сайты не хранятся); 0 — нет
+WHITE_SUBS="${WHITE_SUBS:-}"          # белые списки: сторонние подписки (ссылки через пробел) — добавятся к спискам и проверятся вместе с ними;
+                                       # их же можно добавлять и удалять на странице «Выбор серверов»
 WHITE_URL="${WHITE_URL:-}"            # белые списки: свои ссылки на txt-списки через пробел; пусто — как в прошлый раз; default — igareck
 WHITE_REFRESH_HOURS="${WHITE_REFRESH_HOURS:-5}"   # белые списки: как часто скачивать список заново (часы)
 WHITE_CHECK_MIN="${WHITE_CHECK_MIN:-30}"          # белые списки: как часто проверять каждое подключение (минуты)
@@ -233,6 +236,9 @@ if [[ "$BALANCE_APP_RTT" =~ ^[0-9]+$ ]]; then BALANCE_APP_RTT="${BALANCE_APP_RTT
 case "$BALANCE_APP_RTT" in *ms) APP_RTT_TEXT="${BALANCE_APP_RTT%ms} мс" ;; *) APP_RTT_TEXT="${BALANCE_APP_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
 [ "$YOUTUBE_DIRECT" = "0" ] || YOUTUBE_DIRECT=1
+[ "$ONLINE_PAGE" = "0" ] || ONLINE_PAGE=1
+PAGE_KEYS="/etc/x-ui/vpn-page-keys.json"   # секретные ключи страниц «Выбор серверов» и «Кто подключён» — не меняются между запусками
+ACCESS_LOG="/dev/shm/vpn-access.log"       # журнал подключений Xray для страницы «Кто подключён» (в памяти, стирается каждые 5 с)
 { [[ "$REALITY_ALT_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$REALITY_ALT_PORT" -le 65535 ]; } || die "REALITY_ALT_PORT указан неверно: ${REALITY_ALT_PORT}"
 { [[ "$XHTTP_TLS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$XHTTP_TLS_PORT" -le 65535 ]; } || die "XHTTP_TLS_PORT указан неверно: ${XHTTP_TLS_PORT}"
 { [[ "$FAKESITE_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$FAKESITE_PORT" -le 65535 ]; } || die "FAKESITE_PORT указан неверно: ${FAKESITE_PORT}"
@@ -681,7 +687,7 @@ write_sub_filter_program() {
 # Проверка с телефона (страница …/test/): телефон в Termux скачивает отсюда Xray и список серверов,
 # проверяет их из мобильной сети и присылает отчёт; серверы, которые работают у телефона, идут
 # в подписке первыми (с ✅) и попадают в автоподбор.
-import base64, copy, hashlib, html, json, os, re, secrets, shutil, socket, ssl, sys, threading, time
+import base64, copy, hashlib, hmac, html, json, os, re, secrets, shutil, socket, ssl, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -731,6 +737,39 @@ PHONE_DIR = PHONE.get("dir") or ""
 VERIFIED = os.path.join(PHONE_DIR, "verified.json") if PHONE_DIR else ""
 REPORTS = os.path.join(PHONE_DIR, "reports") if PHONE_DIR else ""
 _phone_lock = threading.Lock()
+# выбор серверов на странице …/manage/КЛЮЧ/: режим и отмеченные вручную (коды подключений)
+CHOICE = os.path.join(os.path.dirname(WHITE["file"]), "choice.json") if WHITE.get("file") else ""
+ADMIN = str(WHITE.get("admin") or "")
+MODES = ("auto", "manual", "mix")
+
+
+def read_choice():
+    """(режим, отмеченные коды): auto — сервер выбирает сам; manual — только отмеченные;
+    mix — отмеченные первыми, остальное — автоматически"""
+    d = read_json(CHOICE, {}) if CHOICE else {}
+    mode = d.get("mode") if isinstance(d, dict) and d.get("mode") in MODES else "auto"
+    keys = [k for k in (d.get("keys") or []) if isinstance(k, str) and re.fullmatch(r"[0-9a-f]{12}", k)] \
+        if isinstance(d, dict) else []
+    return mode, keys[:500]
+
+
+def choose(items, limit, ver, bad, mode, keys):
+    """подключения для подписки по выбору на странице. Если отмеченных среди рабочих больше нет или
+    у телефона (в мобильной сети при ограничениях) не работает ни одно из них — к ним сами
+    добавляются рабочие, чтобы без интернета не остаться"""
+    if mode == "auto" or not keys:
+        return pick_best(items, limit, ver, bad)
+    wanted = set(keys)
+    picked = [it for it in items if it.get("_key") in wanted]
+    if not picked:
+        return pick_best(items, limit, ver, bad)
+    picked = pick_best(picked, min(len(picked), 100), ver, bad)
+    if mode == "manual" and any(it.get("_key") not in bad for it in picked):
+        return picked
+    rest = [it for it in items if it.get("_key") not in wanted]
+    return picked + pick_best(rest, max(0, limit - len(picked)), ver, bad)
+
+
 
 
 def file_stamp(path):
@@ -807,7 +846,8 @@ def white_items(kind="sub"):
     path = WHITE.get("file")
     if not path:
         return empty
-    stamp = (file_stamp(path), file_stamp(VERIFIED) if VERIFIED else None, int(time.time() // 600))
+    stamp = (file_stamp(path), file_stamp(VERIFIED) if VERIFIED else None,
+             file_stamp(CHOICE) if CHOICE else None, int(time.time() // 600))
     if stamp[0] is None:
         return empty
     with _white_lock:
@@ -820,15 +860,20 @@ def white_items(kind="sub"):
                 for it in items:
                     it["_key"] = item_key(it)
                 ver, bad = fresh_verified()
+                mode, keys = read_choice()
                 # в автоподбор — без выхода в РФ (с ним заблокированные сайты не откроются), если есть другие
                 no_ru = [x for x in items if x.get("out_ru") is not True]
                 auto_max = int((WHITE.get("auto") or {}).get("max") or 0)
                 # везде — сначала работающие у телефона (по пингу у телефона), дальше самые быстрые по
                 # пингу с сервера, а не работающие у телефона — в самом конце
+                if mode == "auto" or not keys:
+                    auto = pick_best(no_ru if len(no_ru) >= min(2, auto_max) else items, auto_max, ver, bad)
+                else:                     # выбранные вручную — и в автоподбор
+                    auto = choose(items, auto_max, ver, bad, mode, keys)[:auto_max]
                 _white.update(stamp=stamp, all=items, verified=ver, failed=bad,
-                              sub=marked(pick_best(items, int(WHITE.get("sub_max") or 15), ver, bad), ver),
-                              list=marked(pick_best(items, int(WHITE.get("list_max") or 30), ver, bad), ver),
-                              auto=pick_best(no_ru if len(no_ru) >= min(2, auto_max) else items, auto_max, ver, bad),
+                              sub=marked(choose(items, int(WHITE.get("sub_max") or 15), ver, bad, mode, keys), ver),
+                              list=marked(choose(items, int(WHITE.get("list_max") or 30), ver, bad, mode, keys), ver),
+                              auto=auto,
                               phone=pick_best(items, int(PHONE.get("max") or 300), ver, bad))
             except (OSError, ValueError, AttributeError, TypeError):
                 pass                      # файл как раз переписывается — отдаём прежний список
@@ -911,7 +956,7 @@ def pick_best(items, limit, verified=None, failed=()):
     return mine + other + fastest([it for it in items if it.get("_key") in failed], limit - len(mine) - len(other))
 
 
-def white_auto(template, chosen, level):
+def white_auto(template, chosen, level, name=None, url=None, interval=None):
     """профиль автоподбора по пингу: лучшие белые списки в одном конфиге; приложение при включении
     пингует их все сразу из сети телефона, потом раз в interval, и ведёт трафик через самый быстрый
     из живых (не отвечает — отключается сам). Правила — как у остальных конфигов."""
@@ -936,10 +981,58 @@ def white_auto(template, chosen, level):
     conf.pop("burstObservatory", None)
     # пинг всех сразу при включении (enableConcurrency), дальше — раз в interval
     conf["observatory"] = {"subjectSelector": ["wl-"],
-                           "probeUrl": auto.get("url") or "http://www.gstatic.com/generate_204",
-                           "probeInterval": auto.get("interval") or "2m", "enableConcurrency": True}
-    conf["remarks"] = auto.get("name") or "Автовыбор"
+                           "probeUrl": url or auto.get("url") or "http://www.gstatic.com/generate_204",
+                           "probeInterval": interval or auto.get("interval") or "2m", "enableConcurrency": True}
+    conf["remarks"] = name or auto.get("name") or "Автовыбор"
     return conf
+
+
+# ---------- проверка через Happ (и любое приложение на Xray: v2rayNG, v2rayN) ----------
+# В JSON-подписке — профиль «🧪 Проверка БС»: все серверы белых списков, а адрес их пинга — этот
+# сервер. Пока профиль включён, приложение раз в HAPP_INTERVAL пингует каждый сервер из сети
+# телефона; пинг, прошедший через сервер белого списка, приходит сюда с IP его выхода (exit_ip,
+# его узнаёт проверка на сервере) — значит, этот сервер у телефона работает. Работает и на iPhone.
+HAPP_NAME = "🧪 Проверка БС (включите на 2 минуты)"
+HAPP_MAX = 60
+HAPP_INTERVAL = "30s"
+HAPP_LABEL = "Happ"
+_happ_seen = {}
+
+
+def happ_token():
+    seed = (ADMIN or str(WHITE.get("path") or "")).encode("utf-8")
+    return hmac.new(seed, b"happ-probe", hashlib.sha256).hexdigest()[:16]
+
+
+def happ_url():
+    base = str(PHONE.get("base") or "").rstrip("/")
+    wpath = str(WHITE.get("path") or "").rstrip("/")
+    return "%s%s/test/happ/%s" % (base, wpath, happ_token()) if base.startswith("http") and wpath and PHONE_DIR else ""
+
+
+def happ_probe(client):
+    """пинг из профиля проверки: отмечаем рабочими у телефона серверы с этим IP выхода"""
+    now = int(time.time())
+    if now - _happ_seen.get(client, 0) < 120:        # один сервер пингуется часто — пишем не чаще раза в 2 мин
+        return 0
+    _happ_seen[client] = now
+    if len(_happ_seen) > 5000:
+        for ip in [k for k, t in _happ_seen.items() if now - t > 600]:
+            del _happ_seen[ip]
+    hits = [it for it in white_items("all") if it.get("exit_ip") == client]
+    if not hits:
+        return 0
+    with _phone_lock:
+        os.makedirs(PHONE_DIR, exist_ok=True)
+        data = read_json(VERIFIED, {})
+        data = data if isinstance(data, dict) else {}
+        for it in hits:
+            nets = data.get(it["_key"]) if isinstance(data.get(it["_key"]), dict) else {}
+            ms = int(it["ms"]) if isinstance(it.get("ms"), (int, float)) else 1000
+            nets[HAPP_LABEL] = {"ok": True, "ms": ms, "time": now}
+            data[it["_key"]] = nets
+        write_file(VERIFIED, json.dumps(data, ensure_ascii=False))
+    return len(hits)
 
 
 def white_json(data, items, chosen):
@@ -970,6 +1063,12 @@ def white_json(data, items, chosen):
     auto = white_auto(template, chosen, level)
     if auto is not None:
         result.append(auto)
+    url = happ_url()
+    if url:                               # профиль проверки через Happ — серверы, у которых известен IP выхода
+        probe = [it for it in white_items("phone") if it.get("exit_ip")][:HAPP_MAX]
+        test = white_auto(template, probe, level, HAPP_NAME, url, HAPP_INTERVAL)
+        if test is not None:
+            result.append(test)
     for it in items:
         conf = copy.deepcopy(template)
         ob = with_level(it["outbound"], level) if isinstance(level, int) else copy.deepcopy(it["outbound"])
@@ -1491,7 +1590,8 @@ def phone_page(base):
     url = base + (WHITE.get("path") or "/").rstrip("/") + "/test"
     cmd = 'command -v curl >/dev/null || pkg install -y curl; curl -fsSL "%s/t.sh" -o t.sh && bash t.sh' % url
     auto = str((WHITE.get("auto") or {}).get("name") or "Автовыбор")
-    page = PHONE_HTML.replace("__CMD__", html.escape(cmd)).replace("__AUTO__", html.escape(auto))
+    page = PHONE_HTML.replace("__CMD__", html.escape(cmd)).replace("__AUTO__", html.escape(auto)) \
+        .replace("__HAPP__", html.escape(HAPP_NAME))
     return page.replace("__HOURS__", str(int(float(PHONE.get("hours") or 48)))).encode("utf-8")
 
 
@@ -1962,7 +2062,17 @@ td.n{text-align:right;white-space:nowrap}
 <p class="lead">Сервер VPN не видит белые списки вашего оператора: подключение, которое работает у сервера, в мобильной сети может не открываться. Здесь телефон сам проверяет серверы из своей сети — те, что работают у него, встают в подписке первыми (с ✅) и попадают в «__AUTO__».</p>
 
 <section class="card">
-<h2>Как проверить (Android)</h2>
+<h2>Проще всего: через Happ (Android и iPhone)</h2>
+<ol>
+<li>Обновите подписку в Happ — в ней появится профиль «__HAPP__».</li>
+<li>Выключите Wi-Fi, включите мобильный интернет, выберите этот профиль и подключитесь на 2–3 минуты.</li>
+<li>Готово: Happ сам пингует из вашей сети все серверы белых списков, а работающие у вас отмечаются здесь (сеть «Happ»), встают в подписке первыми (с ✅) и попадают в «__AUTO__». Обновите подписку ещё раз и переключитесь на обычный профиль.</li>
+</ol>
+<p class="note">Так отмечаются только работающие серверы (у неработающих пинг просто не доходит), и только те, чей адрес выхода в интернет сервер уже знает. Полная проверка с отчётом — через Termux, ниже.</p>
+</section>
+
+<section class="card">
+<h2>Подробно, через Termux (Android)</h2>
 <ol>
 <li>Установите <b>Termux</b>: <a href="https://f-droid.org/packages/com.termux/" rel="noopener">F-Droid</a> или <a href="https://github.com/termux/termux-app/releases/latest" rel="noopener">GitHub</a> (файл <i>…arm64-v8a.apk</i>).</li>
 <li>Один раз — по Wi-Fi или в любой сети, где открывается эта страница: откройте Termux и вставьте команду. Она скачает Xray и список серверов (около 15 МБ).
@@ -2073,6 +2183,696 @@ setInterval(load, 15000);
 '''
 
 
+# ---------- страница «Выбор серверов» (…/manage/КЛЮЧ/): все рабочие из всех списков, выбор для подписки ----------
+MANAGE_MAX = 64 * 1024
+
+
+def manage_data():
+    """все рабочие подключения из всех списков — с пингом с сервера, проверкой с телефона и выбором"""
+    items = white_items("all")
+    ver, bad = white_items("verified"), white_items("failed")
+    mode, keys = read_choice()
+    in_sub = {it.get("_key") for it in white_items("sub")}
+    in_auto = {it.get("_key") for it in white_items("auto")}
+    rows = []
+    for it in pick_best(items, len(items), ver, bad):
+        ob = it.get("outbound") or {}
+        st = ob.get("streamSettings") or {}
+        key = it.get("_key")
+        v = ver.get(key)
+        rows.append({"key": key, "name": it.get("name"), "src": it.get("src") or "",
+                     "ms": it["ms"] if isinstance(it.get("ms"), (int, float)) else None,
+                     "kind": "%s / %s / %s" % (ob.get("protocol") or "?", st.get("network") or "tcp",
+                                               st.get("security") or "none"),
+                     "host": server_host(ob), "in_ru": it.get("in_ru"), "out_ru": it.get("out_ru"),
+                     "phone": ({"ms": v["ms"], "label": v["label"], "time": v["time"]} if v
+                               else ("fail" if key in bad else None)),
+                     "sub": key in in_sub, "auto": key in in_auto})
+    try:
+        state = subprocess.run(["systemctl", "is-active", "vpn-white-lists.service"], capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        state = ""
+    stamp = file_stamp(WHITE.get("file"))
+    return {"now": int(time.time()), "mode": mode, "keys": keys, "items": rows,
+            "updated": int(stamp[0] // 10 ** 9) if stamp else 0, "checking": state in ("active", "activating"),
+            "in_sub": len(in_sub), "sub_max": int(WHITE.get("sub_max") or 15), "extras": extra_status()}
+
+
+def manage_save(body):
+    """сохранить режим и отмеченные; подписка меняется сразу (при следующем обновлении в приложении)"""
+    d = json.loads(body.decode("utf-8"))
+    if not isinstance(d, dict) or d.get("mode") not in MODES or not isinstance(d.get("keys"), list):
+        raise ValueError("нужны mode и keys")
+    keys = []
+    for k in d["keys"]:
+        if isinstance(k, str) and re.fullmatch(r"[0-9a-f]{12}", k) and k not in keys:
+            keys.append(k)
+    if len(keys) > 500:
+        raise ValueError("слишком много отмечено")
+    tmp = CHOICE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"mode": d["mode"], "keys": keys, "time": int(time.time())}, f)
+    os.replace(tmp, CHOICE)
+    return d["mode"], len(keys)
+
+
+def manage_check(download=False):
+    """проверить все списки на сервере прямо сейчас (служба vpn-white-lists); download — и скачать заново"""
+    if download:
+        with open(os.path.join(os.path.dirname(WHITE["file"]), "update-now"), "w") as f:
+            f.write(str(int(time.time())))
+    subprocess.Popen(["systemctl", "start", "--no-block", "vpn-white-lists.service"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------- сторонние подписки: добавляются здесь, скачивает и проверяет служба vpn-white-lists ----------
+EXTRA_MAX_TEXT = 4 * 1024 * 1024
+SUB_SCHEMES = ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2")
+
+
+def extra_path():
+    return os.path.join(os.path.dirname(WHITE["file"]), "extra.json")
+
+
+def extra_list():
+    d = read_json(extra_path(), {})
+    return [x for x in ((d.get("sources") if isinstance(d, dict) else None) or [])
+            if isinstance(x, dict) and re.fullmatch(r"[0-9a-f]{8}", str(x.get("id") or ""))]
+
+
+def count_links(text):
+    """сколько ссылок на подключения в тексте подписки (списком или в base64)"""
+    text = text.strip().lstrip("\ufeff")
+    if "://" not in text:
+        raw = "".join(text.split())
+        try:
+            text = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
+        except ValueError:
+            return 0
+    return sum(1 for line in text.splitlines() if line.strip().split("://", 1)[0].lower() in SUB_SCHEMES)
+
+
+def extra_add(body):
+    d = json.loads(body.decode("utf-8"))
+    if not isinstance(d, dict):
+        raise ValueError("неверный запрос")
+    name = re.sub(r"[\x00-\x1f<>]", "", str(d.get("name") or "")).strip()[:60]
+    url = str(d.get("url") or "").strip()
+    text = str(d.get("text") or "")
+    items = extra_list()
+    if len(items) >= 30:
+        raise ValueError("подписок уже 30 — сначала удалите ненужные")
+    new = {"id": secrets.token_hex(4), "added": int(time.time())}
+    if url:
+        if not re.fullmatch(r"https?://[^\s]{4,2000}", url):
+            raise ValueError("ссылка должна начинаться с http:// или https://")
+        if any(x.get("url") == url for x in items):
+            raise ValueError("эта подписка уже добавлена")
+        new.update(url=url, name=name or (urllib.parse.urlsplit(url).hostname or "подписка"))
+    elif text.strip():
+        if len(text.encode("utf-8")) > EXTRA_MAX_TEXT:
+            raise ValueError("текст больше 4 МБ")
+        n = count_links(text)
+        if not n:
+            raise ValueError("в тексте нет ссылок vless://, vmess://, trojan://, ss://, hysteria2://")
+        fname = "extra-%s.txt" % new["id"]
+        fpath = os.path.join(os.path.dirname(WHITE["file"]), fname)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(fpath, 0o600)
+        new.update(file=fname, name=name or "Текст (%d подключений)" % n)
+    else:
+        raise ValueError("укажите ссылку на подписку или вставьте её текст")
+    write_file(extra_path(), json.dumps({"sources": items + [new]}, ensure_ascii=False))
+    return new["name"]
+
+
+def extra_del(body):
+    d = json.loads(body.decode("utf-8"))
+    sid = str((d or {}).get("id") or "") if isinstance(d, dict) else ""
+    items = extra_list()
+    gone = [x for x in items if x["id"] == sid]
+    if not gone:
+        raise ValueError("такой подписки нет")
+    for x in gone:
+        if x.get("file"):
+            try:
+                os.unlink(os.path.join(os.path.dirname(WHITE["file"]), os.path.basename(str(x["file"]))))
+            except OSError:
+                pass
+    write_file(extra_path(), json.dumps({"sources": [x for x in items if x["id"] != sid]}, ensure_ascii=False))
+    return gone[0].get("name") or sid
+
+
+def extra_status():
+    st = read_json(os.path.join(os.path.dirname(WHITE["file"]), "state.json"), {})
+    res = {x.get("id"): x for x in ((st.get("extra") if isinstance(st, dict) else None) or []) if isinstance(x, dict)}
+    out = []
+    for x in extra_list():
+        r = res.get(x["id"]) or {}
+        out.append({"id": x["id"], "name": x.get("name") or "", "url": x.get("url") or "",
+                    "text": bool(x.get("file")), "added": x.get("added") or 0,
+                    "count": r.get("count"), "error": r.get("error") or "", "time": r.get("time") or 0})
+    return out
+
+
+def manage_page():
+    label = WHITE.get("label") or ""
+    auto_name = (WHITE.get("auto") or {}).get("name") or "Автовыбор"
+    return (MANAGE_HTML.replace("__LABEL__", html.escape(label))
+            .replace("__AUTO__", html.escape(auto_name))
+            .replace("__TEST__", html.escape((WHITE.get("path") or "").rstrip("/") + "/test/"))).encode("utf-8")
+
+
+MANAGE_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Выбор серверов</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--text:#1a1d21;--muted:#5f6873;--line:#e2e5e9;--accent:#2563eb;--ok:#15803d;--bad:#b91c1c;--warn:#b45309;--soft:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#181c22;--text:#e6e9ed;--muted:#9aa3ae;--line:#29303a;--accent:#6c9cff;--ok:#4ade80;--bad:#f87171;--warn:#f0b354;--soft:#222832}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:980px;margin:0 auto;padding:16px}
+h1{font-size:22px;line-height:1.25;margin:8px 0 6px}
+h2{font-size:17px;margin:0 0 10px}
+p{margin:0 0 10px}
+a{color:var(--accent)}
+.lead,.note{color:var(--muted)}
+.note{font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:14px 0}
+.modes{display:grid;gap:8px}
+.modes label{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer}
+.modes label:has(input:checked){border-color:var(--accent);background:var(--soft)}
+.modes input{margin-top:4px}
+.modes b{display:block}
+.modes span{color:var(--muted);font-size:14px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+button{border:0;border-radius:8px;background:var(--accent);color:#fff;font:600 14px system-ui,sans-serif;padding:0 14px;min-height:38px;cursor:pointer}
+button.alt{background:var(--soft);color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.55;cursor:default}
+input[type=search]{flex:1 1 220px;min-height:38px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--card);color:var(--text);font:inherit}
+.chk{display:inline-flex;gap:6px;align-items:center;font-size:14px;color:var(--muted)}
+.stats{display:flex;flex-wrap:wrap;gap:4px 18px;color:var(--muted);font-size:14px}
+.stats b{color:var(--text)}
+.list{list-style:none;margin:0;padding:0}
+.list li{display:flex;gap:12px;align-items:flex-start;padding:10px 2px;border-bottom:1px solid var(--line)}
+.list li>input{width:20px;height:20px;margin:2px 0 0;flex:none}
+.list label{flex:1;min-width:0;cursor:pointer}
+.name{font-weight:500;overflow-wrap:anywhere}
+.meta{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:13px;margin-top:2px}
+.sub{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
+.pill{display:inline-block;font-size:12px;border-radius:999px;padding:1px 8px;background:var(--soft);color:var(--muted);margin:2px 4px 0 0}
+.pill.on{background:var(--accent);color:#fff}
+.save{position:sticky;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px;margin:0 -16px -16px;border-radius:0 0 12px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#msg,#xmsg{font-size:14px}
+.add{display:grid;gap:8px;margin-top:10px}
+.add input,.add textarea{width:100%;min-height:38px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--text);font:inherit}
+.add textarea{margin-top:8px;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace}
+.add summary{cursor:pointer;color:var(--muted);font-size:14px}
+.list li .grow{flex:1;min-width:0}
+button.del{background:transparent;color:var(--bad);border:1px solid var(--line);min-height:32px;padding:0 10px}
+</style>
+</head>
+<body>
+<main>
+<h1>Выбор серверов для подписки</h1>
+<p class="lead">Здесь все рабочие серверы из всех списков, в том числе из добавленных вами подписок. Выберите, какие уйдут в подписку (__LABEL__ …): вручную или автоматически. Свои подключения VPN остаются в подписке всегда.</p>
+
+<section class="card">
+<h2>Как выбирать</h2>
+<div class="modes" id="modes">
+<label><input type="radio" name="mode" value="auto"><div><b>Авто</b><span>Сервер выбирает сам: первыми — работающие у телефона в мобильной сети при ограничениях интернета (проверка с телефона), дальше — самые быстрые с сервера.</span></div></label>
+<label><input type="radio" name="mode" value="manual"><div><b>Вручную</b><span>В подписке только отмеченные ниже. Если отмеченные перестанут работать (пропадут с сервера или телефон отметит их нерабочими в мобильной сети) — к ним сами добавятся рабочие, чтобы не остаться без связи.</span></div></label>
+<label><input type="radio" name="mode" value="mix"><div><b>Вручную + авто</b><span>Отмеченные — первыми, остальные места подписки заполняются автоматически.</span></div></label>
+</div>
+<p class="note" style="margin-top:10px">Выбранные попадают и в профиль «__AUTO__». Проверить серверы из своей мобильной сети: в Happ включите на 2 минуты профиль «🧪 Проверка БС» при выключенном Wi-Fi — работающие у вас отметятся здесь (сеть «Happ»); подробнее — <a href="__TEST__" target="_blank" rel="noopener">страница проверки с телефона</a>.</p>
+</section>
+
+<section class="card">
+<h2>Сторонние подписки</h2>
+<p class="note">Добавьте подписку любого VPN или список серверов — сервер скачает их, проверит вместе с остальными и покажет ниже (с названием подписки). Подписка скачивается заново каждые несколько часов.</p>
+<ul class="list" id="extras"></ul>
+<p class="note" id="extras-empty">Пока не добавлено ни одной.</p>
+<div class="add">
+<input type="text" id="xname" placeholder="Название (необязательно)" maxlength="60">
+<input type="url" id="xurl" placeholder="Ссылка на подписку: https://…">
+<details><summary>или вставьте текст подписки (ссылки vless://… или base64)</summary>
+<textarea id="xtext" rows="5" placeholder="vless://…&#10;trojan://…"></textarea></details>
+<div class="bar"><button type="button" id="xadd">Добавить подписку</button><span id="xmsg" class="muted"></span></div>
+</div>
+</section>
+
+<section class="card">
+<h2>Все серверы</h2>
+<div class="stats" id="stats"></div>
+<div class="bar">
+<input type="search" id="q" placeholder="Поиск: название, адрес, протокол">
+<label class="chk"><input type="checkbox" id="onlyphone"> только работающие у телефона</label>
+<label class="chk"><input type="checkbox" id="onlysel"> только отмеченные</label>
+</div>
+<div class="bar">
+<button type="button" class="alt" id="selphone">Отметить работающие у телефона</button>
+<button type="button" class="alt" id="selnone">Снять все отметки</button>
+<button type="button" class="alt" id="check">Проверить все на сервере сейчас</button>
+</div>
+<ul class="list" id="rows"></ul>
+<p class="note" id="empty" hidden>Рабочих серверов пока нет — нажмите «Проверить все на сервере сейчас» и подождите несколько минут.</p>
+<div class="save"><button type="button" id="save">Сохранить выбор</button><span id="msg" class="muted"></span></div>
+</section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let data = null, sel = new Set(), mode = "auto", dirty = false;
+function ago(t, now) {
+  const s = Math.max(0, now - t);
+  if (s < 90) return "только что";
+  if (s < 3600) return Math.round(s / 60) + " мин назад";
+  if (s < 172800) return Math.round(s / 3600) + " ч назад";
+  return Math.round(s / 86400) + " дн назад";
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function stat(label, value) {
+  const span = el("span");
+  span.append(label + ": ");
+  span.append(el("b", "", String(value)));
+  return span;
+}
+function setMsg(text, cls) { $("msg").textContent = text; $("msg").className = cls || "muted"; }
+function markDirty() { dirty = true; setMsg("Есть несохранённые изменения", "warn"); }
+function render() {
+  if (!data) return;
+  const q = $("q").value.trim().toLowerCase(), onlyPhone = $("onlyphone").checked, onlySel = $("onlysel").checked;
+  const rows = [];
+  for (const it of data.items) {
+    if (onlyPhone && !(it.phone && it.phone !== "fail")) continue;
+    if (onlySel && !sel.has(it.key)) continue;
+    if (q && !(it.name + " " + it.host + " " + it.kind + " " + it.src).toLowerCase().includes(q)) continue;
+    const li = el("li"), box = el("input"), id = "k" + it.key;
+    box.type = "checkbox"; box.id = id; box.checked = sel.has(it.key);
+    box.addEventListener("change", () => { box.checked ? sel.add(it.key) : sel.delete(it.key); markDirty(); renderStats(); });
+    const lab = el("label"); lab.htmlFor = id;
+    lab.append(el("div", "name", it.name));
+    const where = it.out_ru === true ? "выход в РФ" : (it.in_ru === true ? "вход РФ → выход за рубежом" : "");
+    lab.append(el("div", "sub", (it.src ? "из «" + it.src + "» · " : "") + it.kind + " · " + it.host + (where ? " · " + where : "")));
+    const meta = el("div", "meta");
+    meta.append(el("span", "", "сервер: " + (it.ms === null ? "—" : Math.round(it.ms) + " мс")));
+    if (it.phone === "fail") meta.append(el("span", "bad", "телефон: ✗ не работает"));
+    else if (it.phone) meta.append(el("span", "ok", "телефон: ✅ " + it.phone.ms + " мс · " + it.phone.label + ", " + ago(it.phone.time, data.now)));
+    else meta.append(el("span", "muted", "телефон: не проверялся"));
+    lab.append(meta);
+    if (it.sub || it.auto) {
+      const pills = el("div");
+      if (it.sub) pills.append(el("span", "pill on", "в подписке"));
+      if (it.auto) pills.append(el("span", "pill", "в автовыборе"));
+      lab.append(pills);
+    }
+    li.append(box, lab);
+    rows.push(li);
+  }
+  $("rows").replaceChildren(...rows);
+  $("empty").hidden = data.items.length > 0;
+}
+function renderStats() {
+  if (!data) return;
+  const ph = data.items.filter((x) => x.phone && x.phone !== "fail").length;
+  $("stats").replaceChildren(
+    stat("рабочих на сервере", data.items.length),
+    stat("работают у телефона", ph),
+    stat("отмечено", sel.size),
+    stat("в подписке сейчас", data.in_sub),
+    stat("проверка сервера", data.checking ? "идёт…" : (data.updated ? ago(data.updated, data.now) : "ещё не было")));
+}
+async function load() {
+  try {
+    const r = await fetch("data.json", {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json();
+    if (!dirty) {
+      sel = new Set(data.keys);
+      mode = data.mode;
+      for (const rb of document.querySelectorAll("input[name=mode]")) rb.checked = rb.value === mode;
+    }
+    renderStats(); render(); renderExtras();
+    $("check").disabled = data.checking;
+  } catch (e) { setMsg("Нет связи с сервером — повторю через 20 с.", "bad"); }
+}
+function renderExtras() {
+  const list = data.extras || [], rows = [];
+  for (const x of list) {
+    const li = el("li"), box = el("div", "grow");
+    box.append(el("div", "name", x.name));
+    box.append(el("div", "sub", x.text ? "вставленный текст" : x.url));
+    let st;
+    if (x.error) st = el("div", "sub bad", "✗ " + x.error);
+    else if (x.count !== null && x.count !== undefined) st = el("div", "sub ok", "подключений: " + x.count + " · скачано " + ago(x.time, data.now));
+    else st = el("div", "sub warn", data.checking ? "скачиваю и проверяю…" : "ещё не скачивалась — нажмите «Проверить все на сервере сейчас»");
+    box.append(st);
+    const del = el("button", "del", "Удалить"); del.type = "button";
+    del.addEventListener("click", () => extraPost("extra/del", {id: x.id}, "Удалено"));
+    li.append(box, del);
+    rows.push(li);
+  }
+  $("extras").replaceChildren(...rows);
+  $("extras-empty").hidden = list.length > 0;
+}
+async function extraPost(path, body, okText) {
+  $("xadd").disabled = true;
+  try {
+    const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const t = (await r.text()).trim();
+    if (!r.ok) throw new Error(t.replace(/^Ошибка: /, ""));
+    $("xmsg").textContent = t || okText; $("xmsg").className = "ok";
+    await load();
+    return true;
+  } catch (e) { $("xmsg").textContent = "Не получилось: " + e.message; $("xmsg").className = "bad"; return false; }
+  finally { $("xadd").disabled = false; }
+}
+$("xadd").addEventListener("click", async () => {
+  const url = $("xurl").value.trim(), text = $("xtext").value, name = $("xname").value.trim();
+  if (!url && !text.trim()) { $("xmsg").textContent = "Укажите ссылку или вставьте текст подписки."; $("xmsg").className = "bad"; return; }
+  if (await extraPost("extra/add", url ? {name, url} : {name, text}, "Добавлено")) { $("xurl").value = ""; $("xtext").value = ""; $("xname").value = ""; }
+});
+for (const rb of document.querySelectorAll("input[name=mode]")) rb.addEventListener("change", () => { mode = rb.value; markDirty(); });
+$("q").addEventListener("input", render);
+$("onlyphone").addEventListener("change", render);
+$("onlysel").addEventListener("change", render);
+$("selphone").addEventListener("click", () => {
+  if (!data) return;
+  for (const it of data.items) if (it.phone && it.phone !== "fail") sel.add(it.key);
+  markDirty(); renderStats(); render();
+});
+$("selnone").addEventListener("click", () => { sel.clear(); markDirty(); renderStats(); render(); });
+$("save").addEventListener("click", async () => {
+  if (mode !== "auto" && sel.size === 0) { setMsg("Отметьте хотя бы один сервер или выберите «Авто».", "bad"); return; }
+  $("save").disabled = true;
+  try {
+    const keys = data ? data.items.map((x) => x.key).filter((k) => sel.has(k)) : [...sel];
+    const r = await fetch("save", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({mode, keys})});
+    if (!r.ok) throw new Error(await r.text());
+    dirty = false;
+    setMsg("Сохранено. Обновите подписку в приложении.", "ok");
+    await load();
+  } catch (e) { setMsg("Не сохранилось: " + e.message, "bad"); }
+  $("save").disabled = false;
+});
+$("check").addEventListener("click", async () => {
+  $("check").disabled = true;
+  try {
+    const r = await fetch("check", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    if (!r.ok) throw new Error(r.status);
+    setMsg("Проверка запущена — займёт несколько минут, страница обновится сама.", "ok");
+    setTimeout(load, 3000);
+  } catch (e) { setMsg("Не удалось запустить проверку.", "bad"); $("check").disabled = false; }
+});
+load();
+setInterval(load, 20000);
+</script>
+</body>
+</html>
+"""
+
+
+# ---------- страница «Кто подключён» (/online/КЛЮЧ/) ----------
+# Xray пишет журнал подключений в память (/dev/shm); здесь он читается каждые 5 секунд и сразу стирается.
+# Из каждой записи остаётся только: клиент панели, IP устройства, через какое подключение и куда выход.
+# Сайты, которые открывают пользователи, не сохраняются и не показываются.
+ONLINE = CONF.get("online") or {}
+ONLINE_KEY = str(ONLINE.get("key") or "")
+ONLINE_NOW = 180                          # «сейчас онлайн» — была активность за последние 3 минуты
+ONLINE_KEEP = 86400                       # помним устройства сутки
+_online = {}                              # (клиент, IP) → сведения
+_online_lock = threading.Lock()
+_names = {"stamp": 0, "inbounds": {}, "outbounds": {}}
+LOG_LINE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)(?:\.\d+)?\s+from\s+(?:(?:tcp|udp):)?\[?([0-9A-Fa-f.:]+?)\]?:\d+\s+"
+                      r"accepted\s+(tcp|udp):\S+\s+\[([^\]]+?)\s*(?:->|>>)\s*([^\]]+?)\](?:\s+email:\s*(\S+))?")
+
+
+def flag(cc):
+    cc = str(cc or "").upper()
+    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc) if re.fullmatch(r"[A-Z]{2}", cc) else "🌐"
+
+
+def online_names():
+    """метка подключения → название (из панели); метка выхода → понятное описание (из конфига Xray)"""
+    now = time.time()
+    if now - _names["stamp"] < 60:
+        return _names
+    inbounds, outbounds = {}, {}
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % ONLINE.get("db", "/etc/x-ui/x-ui.db"), uri=True, timeout=5)
+        try:
+            for tag, remark, port, protocol in con.execute("SELECT tag, remark, port, protocol FROM inbounds"):
+                inbounds[str(tag)] = {"name": str(remark or tag), "port": port, "protocol": protocol}
+        finally:
+            con.close()
+    except Exception:                     # панель обновляется или старая база — покажем метки как есть
+        pass
+    cc = {}
+    for p in (read_json(ONLINE.get("bridge", ""), {}).get("exits") or []):
+        if isinstance(p, dict) and p.get("host"):
+            cc[str(p["host"])] = p.get("cc") or ""
+    for ob in (read_json(ONLINE.get("xray", ""), {}).get("outbounds") or []):
+        if not isinstance(ob, dict) or not ob.get("tag"):
+            continue
+        tag = str(ob["tag"])
+        host = server_host(ob)
+        if tag.startswith("bridge-exit-"):
+            kind = "XHTTP" if tag.endswith("-x") else "TCP"
+            outbounds[tag] = "%s %s (зарубежный сервер, %s)" % (flag(cc.get(host)), host, kind)
+        elif host:
+            outbounds[tag] = "%s (%s)" % (tag, host)
+    outbounds.update({"direct": "🇷🇺 напрямую с этого сервера", "blocked": "⛔ заблокировано (реклама)",
+                      "block": "⛔ заблокировано", "vpn-warp": "☁️ Cloudflare WARP"})
+    _names.update(stamp=now, inbounds=inbounds, outbounds=outbounds)
+    return _names
+
+
+def online_read():
+    """новые строки журнала Xray → сведения об устройствах; журнал после чтения стирается"""
+    path = ONLINE.get("log") or ""
+    try:
+        with open(path, "r+", encoding="utf-8", errors="replace") as f:
+            text = f.read(16 * 1024 * 1024)
+            f.truncate(0)                 # сайты из журнала нигде не остаются
+    except OSError:
+        return
+    now = time.time()
+    self_ips = set(ONLINE.get("self_ips") or []) | {"127.0.0.1", "::1"}
+    with _online_lock:
+        for line in text.splitlines():
+            m = LOG_LINE.match(line)
+            if not m:
+                continue
+            stamp, ip, net, inb, outb, email = m.groups()
+            if inb in ("api",) or inb.startswith("api"):
+                continue
+            try:
+                t = min(now, time.mktime(time.strptime(stamp, "%Y/%m/%d %H:%M:%S")))
+            except ValueError:
+                t = now
+            ip = ip[7:] if ip.startswith("::ffff:") else ip
+            key = (email or "—", ip)
+            d = _online.get(key)
+            if d is None:
+                d = _online[key] = {"email": email or "", "ip": ip, "first": t, "last": t, "inbounds": {},
+                                    "outbounds": {}, "hits": [], "self": ip in self_ips, "nets": set()}
+            d["last"] = max(d["last"], t)
+            d["inbounds"][inb] = max(d["inbounds"].get(inb, 0), t)
+            d["outbounds"][outb] = max(d["outbounds"].get(outb, 0), t)
+            d["nets"].add(net)
+            d["hits"].append(t)
+            if len(d["hits"]) > 2000:
+                del d["hits"][:1000]
+        for key in [k for k, d in _online.items() if now - d["last"] > ONLINE_KEEP]:
+            del _online[key]
+
+
+def online_loop():
+    while True:
+        try:
+            online_read()
+        except Exception:                 # журнал не должен останавливать фильтр подписки
+            pass
+        time.sleep(5)
+
+
+def online_data():
+    names = online_names()
+    now = time.time()
+    devices, by_in, by_out = [], {}, {}
+    with _online_lock:
+        items = [dict(d, hits=list(d["hits"]), nets=sorted(d["nets"])) for d in _online.values()]
+    for d in items:
+        live = now - d["last"] <= ONLINE_NOW
+        ins = sorted(d["inbounds"].items(), key=lambda kv: -kv[1])
+        outs = sorted(d["outbounds"].items(), key=lambda kv: -kv[1])
+        dev = {"email": d["email"], "ip": d["ip"], "self": d["self"], "online": live,
+               "last": int(d["last"]), "first": int(d["first"]),
+               "recent": sum(1 for t in d["hits"] if now - t <= 300),
+               "inbounds": [{"tag": t, "name": (names["inbounds"].get(t) or {}).get("name") or t,
+                             "last": int(ts), "now": now - ts <= ONLINE_NOW} for t, ts in ins],
+               "outbounds": [{"tag": t, "name": names["outbounds"].get(t) or t, "last": int(ts),
+                              "now": now - ts <= ONLINE_NOW} for t, ts in outs],
+               "udp": "udp" in d["nets"]}
+        devices.append(dev)
+        if live and not d["self"]:
+            for x in dev["inbounds"]:
+                if x["now"]:
+                    by_in[x["name"]] = by_in.get(x["name"], 0) + 1
+            for x in dev["outbounds"]:
+                if x["now"]:
+                    by_out[x["name"]] = by_out.get(x["name"], 0) + 1
+    devices.sort(key=lambda x: (not x["online"], x["self"], -x["last"]))
+    return {"now": int(now), "devices": devices, "online_window": ONLINE_NOW,
+            "by_inbound": sorted(by_in.items(), key=lambda kv: -kv[1]),
+            "by_outbound": sorted(by_out.items(), key=lambda kv: -kv[1]),
+            "log": os.path.exists(ONLINE.get("log") or "")}
+
+
+ONLINE_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Кто подключён</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--text:#1a1d21;--muted:#5f6873;--line:#e2e5e9;--accent:#2563eb;--ok:#15803d;--bad:#b91c1c;--soft:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#181c22;--text:#e6e9ed;--muted:#9aa3ae;--line:#29303a;--accent:#6c9cff;--ok:#4ade80;--bad:#f87171;--soft:#222832}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:900px;margin:0 auto;padding:16px}
+h1{font-size:22px;line-height:1.25;margin:8px 0 6px}
+h2{font-size:17px;margin:0 0 10px}
+p{margin:0 0 10px}
+.lead,.note{color:var(--muted)}
+.note{font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:14px 0}
+.big{display:flex;flex-wrap:wrap;gap:10px 28px;align-items:baseline}
+.big b{font-size:28px;line-height:1}
+.big span{color:var(--muted);font-size:14px}
+.cols{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin:14px 0}
+.cols .card{margin:0}
+.rows{list-style:none;margin:0;padding:0}
+.rows li{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--line);font-size:14px}
+.rows li:last-child{border-bottom:0}
+.rows b{white-space:nowrap}
+.dev{border-bottom:1px solid var(--line);padding:12px 0}
+.dev:last-child{border-bottom:0}
+.head{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+.ip{font:600 15px ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--muted);margin-right:6px}
+.dot.on{background:var(--ok)}
+.sub{font-size:13px;color:var(--muted);margin-top:4px}
+.pill{display:inline-block;font-size:12px;border-radius:999px;padding:1px 8px;background:var(--soft);color:var(--muted);margin:4px 6px 0 0}
+.pill.on{background:var(--accent);color:#fff}
+.bar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:0 0 6px}
+.chk{display:inline-flex;gap:6px;align-items:center;font-size:14px;color:var(--muted)}
+.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<main>
+<h1>Кто подключён</h1>
+<p class="lead">Устройства, которые сейчас ходят через этот сервер: через какое подключение и куда выходит их трафик. Обновляется само каждые 10 секунд.</p>
+
+<section class="card">
+<div class="big" id="big"></div>
+<p class="note bad" id="nolog" hidden>Журнал подключений Xray не найден — запустите установку ещё раз (с ONLINE_PAGE=1, по умолчанию так и есть) или перезапустите Xray в панели.</p>
+</section>
+
+<div class="cols">
+<section class="card"><h2>Через какие подключения</h2><ul class="rows" id="byin"></ul><p class="note" id="byin-empty">Сейчас никого.</p></section>
+<section class="card"><h2>Куда выходит трафик</h2><ul class="rows" id="byout"></ul><p class="note" id="byout-empty">Сейчас никого.</p></section>
+</div>
+
+<section class="card">
+<h2>Устройства</h2>
+<div class="bar">
+<label class="chk"><input type="checkbox" id="all"> показать и тех, кто был за сутки</label>
+<label class="chk"><input type="checkbox" id="self"> показать проверки самого сервера</label>
+</div>
+<div id="devs"></div>
+<p class="note" id="devs-empty">Сейчас никто не подключён.</p>
+</section>
+
+<p class="note">Сайты, которые открывают пользователи, здесь не показываются и не хранятся: журнал Xray лежит в памяти сервера и стирается каждые 5 секунд, остаётся только кто, откуда и через что. Все устройства с одной подпиской — это один клиент панели; чтобы различать людей, заведите каждому своего клиента в панели 3X-UI. Серверы белых списков и сторонних подписок — чужие: подключения через них сюда не попадают.</p>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let data = null;
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+function ago(t, now) {
+  const s = Math.max(0, now - t);
+  if (s < 15) return "сейчас";
+  if (s < 90) return s + " с назад";
+  if (s < 3600) return Math.round(s / 60) + " мин назад";
+  return Math.round(s / 3600) + " ч назад";
+}
+function rows(id, list) {
+  $(id).replaceChildren(...list.map(([name, n]) => { const li = el("li"); li.append(el("span", "", name), el("b", "", n + " устр.")); return li; }));
+  $(id + "-empty").hidden = list.length > 0;
+}
+function render() {
+  if (!data) return;
+  const showAll = $("all").checked, showSelf = $("self").checked;
+  const live = data.devices.filter((d) => d.online && !d.self);
+  const day = data.devices.filter((d) => !d.self);
+  const people = new Set(live.map((d) => d.email || d.ip));
+  const big = $("big"); big.replaceChildren();
+  for (const [v, t] of [[live.length, "устройств онлайн"], [people.size, "клиентов онлайн"], [day.length, "устройств за сутки"]]) {
+    const w = el("div"); w.append(el("b", "", String(v)), document.createTextNode(" "), el("span", "", t)); big.append(w);
+  }
+  $("nolog").hidden = data.log;
+  rows("byin", data.by_inbound); rows("byout", data.by_outbound);
+  const list = data.devices.filter((d) => (showAll || d.online) && (showSelf || !d.self));
+  $("devs").replaceChildren(...list.map((d) => {
+    const box = el("div", "dev"), head = el("div", "head");
+    const ip = el("span", "ip"); const dot = el("span", "dot" + (d.online ? " on" : "")); ip.append(dot, document.createTextNode(d.ip));
+    head.append(ip, el("span", "", d.email ? "клиент " + d.email : "клиент не указан"));
+    head.append(el("span", "note", (d.online ? "активен " : "был ") + ago(d.last, data.now) + (d.self ? " · проверка сервера" : "")));
+    box.append(head);
+    const ins = el("div"); ins.append(el("span", "sub", "через: "));
+    for (const x of d.inbounds.slice(0, 6)) ins.append(el("span", "pill" + (x.now ? " on" : ""), x.name));
+    box.append(ins);
+    const outs = el("div"); outs.append(el("span", "sub", "выход: "));
+    for (const x of d.outbounds.slice(0, 6)) outs.append(el("span", "pill" + (x.now ? " on" : ""), x.name));
+    box.append(outs);
+    box.append(el("div", "sub", "соединений за 5 мин: " + d.recent + " · первое за сутки: " + ago(d.first, data.now) + (d.udp ? " · есть UDP" : "")));
+    return box;
+  }));
+  $("devs-empty").hidden = list.length > 0;
+}
+async function load() {
+  try { const r = await fetch("data.json", {cache: "no-store"}); if (!r.ok) throw new Error(r.status); data = await r.json(); render(); }
+  catch (e) { /* повторим через 10 с */ }
+}
+$("all").addEventListener("change", render);
+$("self").addEventListener("change", render);
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "nginx"
@@ -2083,8 +2883,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.forward(True)
 
-    def do_POST(self):                    # только отчёт проверки с телефона
+    def do_POST(self):                    # отчёт проверки с телефона и действия страницы «Выбор серверов»
         wpath = (WHITE.get("path") or "").rstrip("/")
+        path = self.path.split("?", 1)[0]
+        if wpath and ADMIN and CHOICE and path.startswith(wpath + "/manage/"):
+            self.manage_post(path[len(wpath) + 8:])
+            return
         if not (PHONE_DIR and wpath and self.path.split("?", 1)[0] == wpath + "/test/report"):
             self.send_error(404)
             return
@@ -2144,6 +2948,18 @@ class Handler(BaseHTTPRequestHandler):
         if sub == "":
             self.send_body(301, "text/plain; charset=utf-8", b"", head, [("Location", wpath + "/test/")])
             return
+        if sub.startswith("/happ/"):         # пинг из профиля проверки через Happ
+            if hmac.compare_digest(sub[6:].encode("utf-8"), happ_token().encode("utf-8")):
+                client = self.client_address[0]
+                client = client[7:] if client.startswith("::ffff:") else client
+                try:
+                    happ_probe(client)
+                except (OSError, ValueError, TypeError):
+                    pass
+                self.send_body(204, "text/plain; charset=utf-8", b"", head)
+            else:
+                self.send_error(404)
+            return
         try:
             base = phone_base(self)
             if sub == "/":
@@ -2162,6 +2978,68 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError, TypeError, KeyError) as err:
             self.send_body(500, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), head)
 
+    def manage_key(self, sub):            # «КЛЮЧ/остаток» → остаток, если ключ верный; иначе None
+        key, _, rest = sub.partition("/")
+        if not hmac.compare_digest(key.encode("utf-8"), ADMIN.encode("utf-8")):
+            return None
+        return "/" + rest if _ else ""
+
+    def manage(self, sub, head):          # страница «Выбор серверов» и её данные
+        rest = self.manage_key(sub)
+        if rest is None:
+            self.send_error(404)
+            return
+        extra = [("X-Robots-Tag", "noindex"), ("Referrer-Policy", "no-referrer"), ("X-Frame-Options", "DENY")]
+        try:
+            if rest == "":
+                self.send_body(301, "text/plain; charset=utf-8", b"", head, [("Location", self.path.split("?", 1)[0] + "/")])
+            elif rest == "/":
+                self.send_body(200, "text/html; charset=utf-8", manage_page(), head, extra)
+            elif rest == "/data.json":
+                self.send_body(200, "application/json; charset=utf-8",
+                               json.dumps(manage_data(), ensure_ascii=False).encode("utf-8"), head, extra)
+            else:
+                self.send_error(405 if rest in ("/save", "/check", "/extra/add", "/extra/del") else 404)
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            self.send_body(500, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), head)
+
+    def manage_post(self, sub):
+        rest = self.manage_key(sub)
+        if rest not in ("/save", "/check", "/extra/add", "/extra/del"):
+            self.send_error(404)
+            return
+        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+            self.send_error(415)          # только запросы самой страницы
+            return
+        try:
+            size = int(self.headers.get("Content-Length") or "-1")
+        except ValueError:
+            size = -1
+        if size < 0 or size > (EXTRA_MAX_TEXT * 2 if rest == "/extra/add" else MANAGE_MAX):
+            self.send_error(411 if size < 0 else 413)
+            return
+        body = self.rfile.read(size)
+        try:
+            if rest == "/extra/add":
+                text = "Добавлена подписка «%s» — скачиваю и проверяю\n" % extra_add(body)
+                manage_check(download=True)
+            elif rest == "/extra/del":
+                text = "Удалена подписка «%s»\n" % extra_del(body)
+                manage_check(download=True)
+            elif rest == "/save":
+                mode, n = manage_save(body)
+                text = "Сохранено: %s, отмечено %d\n" % (mode, n)
+            else:
+                manage_check()
+                text = "Проверка запущена\n"
+        except (ValueError, UnicodeDecodeError) as err:
+            self.send_body(400, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), False)
+            return
+        except OSError as err:
+            self.send_body(500, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), False)
+            return
+        self.send_body(200, "text/plain; charset=utf-8", text.encode("utf-8"), False)
+
     def white_page(self, head):           # отдельная подписка: только белые списки
         links = [it["link"] for it in white_items("list")]
         body = base64.b64encode("\n".join(links).encode("utf-8")) if links else b""
@@ -2176,9 +3054,34 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(body)
 
+    def online(self, sub, head):          # страница «Кто подключён» и её данные
+        key, _, rest = sub.partition("/")
+        if not (ONLINE_KEY and hmac.compare_digest(key.encode("utf-8"), ONLINE_KEY.encode("utf-8"))):
+            self.send_error(404)
+            return
+        extra = [("X-Robots-Tag", "noindex"), ("Referrer-Policy", "no-referrer"), ("X-Frame-Options", "DENY")]
+        try:
+            if not _:
+                self.send_body(301, "text/plain; charset=utf-8", b"", head, [("Location", self.path.split("?", 1)[0] + "/")])
+            elif rest == "":
+                self.send_body(200, "text/html; charset=utf-8", ONLINE_HTML.encode("utf-8"), head, extra)
+            elif rest == "data.json":
+                self.send_body(200, "application/json; charset=utf-8",
+                               json.dumps(online_data(), ensure_ascii=False).encode("utf-8"), head, extra)
+            else:
+                self.send_error(404)
+        except (OSError, ValueError, TypeError, KeyError) as err:
+            self.send_body(500, "text/plain; charset=utf-8", ("Ошибка: %s\n" % err).encode("utf-8"), head)
+
     def forward(self, head):
         wpath = (WHITE.get("path") or "").rstrip("/")
         path = self.path.split("?", 1)[0]
+        if ONLINE_KEY and path.startswith("/online/"):
+            self.online(path[len("/online/"):], head)
+            return
+        if wpath and ADMIN and CHOICE and path.startswith(wpath + "/manage/"):
+            self.manage(path[len(wpath) + 8:], head)
+            return
         if wpath and PHONE_DIR and (path == wpath + "/test" or path.startswith(wpath + "/test/")):
             self.phone(path[len(wpath) + 5:], head)
             return
@@ -2300,6 +3203,8 @@ class Server(ThreadingHTTPServer):
 
 def main():
     port = int(CONF["port"])
+    if ONLINE_KEY:
+        threading.Thread(target=online_loop, daemon=True).start()
     if CERT:
         tls_context()                     # сертификат должен читаться сразу
     try:
@@ -2411,9 +3316,8 @@ def reason(err):
 
 
 # ---------------------------------------------------------------- скачивание списков
-def fetch(url, limit=MAX_BYTES):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (vpn-white-lists)",
-                                               "Cache-Control": "no-cache"})
+def fetch(url, limit=MAX_BYTES, ua="Mozilla/5.0 (vpn-white-lists)"):
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read(limit + 1)
     if len(raw) > limit:
@@ -2542,11 +3446,74 @@ def fetch_source(mirrors):
     return [], "", "; ".join(errors[-2:])
 
 
+# ---------------------------------------------------------------- сторонние подписки
+# Добавляются на странице «Выбор серверов» (ссылкой на подписку или текстом подписки) или при установке
+# (WHITE_SUBS). Хранятся в extra.json; серверы из них проверяются первыми, вместе с остальными списками.
+EXTRA_FILE = "extra.json"
+NAMES_FILE = "source-names.json"           # подключение → из какого источника (для страницы выбора)
+SUB_UAS = ("v2rayN/7.11.3", "Streisand/1.6", "Mozilla/5.0 (vpn-white-lists)")   # панели отдают ссылки приложениям
+
+
+def extra_sources(conf):
+    d = read_json(os.path.join(conf["data"], EXTRA_FILE), {})
+    out = []
+    for x in (d.get("sources") if isinstance(d, dict) else None) or []:
+        if not isinstance(x, dict) or not x.get("id"):
+            continue
+        name = str(x.get("name") or "подписка")[:60]
+        if x.get("file"):
+            path = os.path.join(conf["data"], os.path.basename(str(x["file"])))
+            out.append({"id": str(x["id"]), "name": name, "file": path})
+        elif re.match(r"^https?://", str(x.get("url") or "")):
+            out.append({"id": str(x["id"]), "name": name, "url": str(x["url"])})
+    return out
+
+
+def fetch_extra(src):
+    """сторонняя подписка: файл (вставленный текст) или ссылка; панели (3X-UI, Marzban, Remnawave)
+    браузеру отдают страницу, а приложению — ссылки, поэтому пробуем как приложение"""
+    if src.get("file"):
+        try:
+            with open(src["file"], "rb") as f:
+                got = extract_links(f.read(MAX_BYTES))
+        except OSError as err:
+            return [], reason(err)
+        return got, ("" if got else "в тексте нет подключений")
+    err = ""
+    for ua in SUB_UAS:
+        try:
+            got = extract_links(fetch(src["url"], ua=ua))
+        except (OSError, ValueError) as e:
+            err = reason(e)
+            continue
+        if got:
+            return got, ""
+        err = "в подписке нет ссылок на подключения"
+    return [], err
+
+
 def download(conf, state):
     sources = [s if isinstance(s, list) else [s] for s in conf["sources"] if s]
+    extras = extra_sources(conf)
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
         results = list(pool.map(fetch_source, sources))
+        extra_results = list(pool.map(fetch_extra, extras))
     links, seen, used, errors, failed, ok = [], set(), [], [], [], 0
+    names, extra_state = {}, []
+    for src, (got, err) in zip(extras, extra_results):   # сторонние подписки — первыми
+        extra_state.append({"id": src["id"], "count": len(got), "error": err, "time": int(time.time())})
+        if not got:
+            failed.append(src["name"])
+            if err:
+                errors.append("%s: %s" % (src["name"], err))
+            continue
+        ok += 1
+        for link in got:
+            key = link_key(link)
+            if key not in seen:
+                seen.add(key)
+                links.append(link)
+                names[key] = src["name"]
     for mirrors, (got, host, err) in zip(sources, results):   # по порядку источников — номера стабильны
         if not got:
             failed.append(source_name(mirrors))
@@ -2561,13 +3528,17 @@ def download(conf, state):
             if key not in seen:
                 seen.add(key)
                 links.append(link)
+                names[key] = source_name(mirrors)
     if not links:
         raise RuntimeError("; ".join(errors[-3:]) or "источник не указан")
     links = links[:20000]                          # защита от переполнения; разные подключения — max_items
     write_atomic(os.path.join(conf["data"], "source.txt"), "\n".join(links) + "\n")
+    write_atomic(os.path.join(conf["data"], NAMES_FILE),
+                 json.dumps({k: names[k] for k in map(link_key, links) if k in names}, ensure_ascii=False))
     state.update(downloaded=int(time.time()), download_from=used, download_error="", total=len(links),
-                 sources_ok=ok, sources_total=len(sources), sources_failed=failed)
-    log("Списки скачаны: источников %d из %d, подключений — %d" % (ok, len(sources), len(links)))
+                 sources_ok=ok, sources_total=len(sources) + len(extras), sources_failed=failed,
+                 extra=extra_state)
+    log("Списки скачаны: источников %d из %d, подключений — %d" % (ok, len(sources) + len(extras), len(links)))
     if failed:
         log("Не скачались (или пустые): %s" % ", ".join(failed))
     return links
@@ -2785,6 +3756,8 @@ def rename(link, name):
 def build_items(conf, links):
     """ссылки → подключения для проверки; одинаковые (тот же сервер и ключ из разных источников) — один раз"""
     items, seen, skipped = [], set(), collections.Counter()
+    src_names = read_json(os.path.join(conf["data"], NAMES_FILE), {})
+    src_names = src_names if isinstance(src_names, dict) else {}
     for n, link in enumerate(links, 1):
         try:
             outbound, original = to_outbound(link)
@@ -2800,7 +3773,8 @@ def build_items(conf, links):
         seen.add(key)
         name = nice_name(conf["label"], n, original)
         items.append({"n": n, "name": name, "link": rename(link, name), "outbound": outbound,
-                      "cidr": "cidr" in (original or "").lower()})
+                      "cidr": "cidr" in (original or "").lower(),
+                      "src": src_names.get(link_key(link), "")})
         if len(items) >= int(conf["max_items"]):
             break
     return items, skipped
@@ -3224,6 +4198,13 @@ def main():
             links = []
         now = time.time()
         due = now - float(state.get("downloaded") or 0) >= float(conf["refresh_hours"]) * 3600 - 60
+        flag = os.path.join(data, "update-now")   # страница «Выбор серверов»: подписки изменились — скачать сейчас
+        if os.path.exists(flag):
+            due = True
+            try:
+                os.unlink(flag)
+            except OSError:
+                pass
         rc, fresh = 0, False
         if cmd == "update" or (cmd == "auto" and (due or not links)):
             try:
@@ -3353,6 +4334,31 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(conf, f, indent=1)
 PY
   chmod 600 "$WHITE_CONF"
+  if [ -n "${WHITE_SUBS// /}" ]; then   # сторонние подписки из команды — к тем, что добавлены на странице
+    SUBS="$WHITE_SUBS" python3 - "$WHITE_DATA/extra.json" <<'PY' || ylw "    Сторонние подписки (WHITE_SUBS) не добавились."
+import json, os, re, secrets, sys, time, urllib.parse
+path = sys.argv[1]
+try:
+    d = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError):
+    d = {}
+items = d.get("sources") if isinstance(d, dict) and isinstance(d.get("sources"), list) else []
+have = {x.get("url") for x in items if isinstance(x, dict)}
+added = 0
+for url in os.environ["SUBS"].replace(",", " ").split():
+    if not re.fullmatch(r"https?://\S{4,2000}", url) or url in have or len(items) >= 30:
+        continue
+    items.append({"id": secrets.token_hex(4), "added": int(time.time()), "url": url,
+                  "name": urllib.parse.urlsplit(url).hostname or "подписка"})
+    have.add(url)
+    added += 1
+with open(path, "w", encoding="utf-8") as f:
+    json.dump({"sources": items}, f, ensure_ascii=False)
+os.chmod(path, 0o600)
+print("    Сторонние подписки (WHITE_SUBS): добавлено %d" % added)
+PY
+    : > "$WHITE_DATA/update-now"   # скачать списки заново — с новыми подписками
+  fi
   cat > "$WHITE_UNIT" <<UNIT
 [Unit]
 Description=VPN white lists: new lists every ${WHITE_REFRESH_HOURS}h, every connection checked, only working ones in the subscription
@@ -3460,11 +4466,57 @@ white_remove() {   # убрать белые списки: таймер, про�
   rm -rf "$WHITE_DATA"
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
+page_key() {   # page_key имя — секретный ключ страницы (создаётся один раз и хранится в PAGE_KEYS)
+  python3 - "$PAGE_KEYS" "$1" <<'PY'
+import json, os, secrets, sys
+path, name = sys.argv[1], sys.argv[2]
+try:
+    keys = json.load(open(path))
+except (OSError, ValueError):
+    keys = {}
+keys = keys if isinstance(keys, dict) else {}
+if not (isinstance(keys.get(name), str) and len(keys[name]) >= 16):
+    old = {}
+    try:                                  # ключ «Выбор серверов» прежних версий — из настроек фильтра
+        old = (json.load(open("/etc/x-ui/vpn-sub-filter.json")).get("white") or {})
+    except (OSError, ValueError, AttributeError):
+        pass
+    keys[name] = old.get("admin") if name == "admin" and isinstance(old.get("admin"), str) and len(old["admin"]) >= 16 \
+        else secrets.token_hex(12)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(keys, f)
+    os.chmod(path, 0o600)
+print(keys[name])
+PY
+}
+sub_filter_conf_online() {   # sub_filter_conf_online 1|0 — в настройки фильтра: страница «Кто подключён»
+  local key=""
+  if [ "$1" = "1" ]; then key="$(page_key online)" || return 1; fi
+  ONLINE="$1" KEY="$key" ALOG="$ACCESS_LOG" SELF="${SERVER_IP:-}" python3 - "$SUB_FILTER_CONF" <<'PY'
+import json, os, sys
+e = os.environ
+conf = json.load(open(sys.argv[1]))
+conf.pop("online", None)
+if e["ONLINE"] == "1" and e["KEY"]:
+    conf["online"] = {"key": e["KEY"], "log": e["ALOG"], "db": "/etc/x-ui/x-ui.db",
+                      "xray": "/usr/local/x-ui/bin/config.json", "bridge": "/etc/x-ui/vpn-bridge.json",
+                      "self_ips": [x for x in [e.get("SELF") or ""] if x]}
+with open(sys.argv[1], "w") as f:
+    json.dump(conf, f, indent=1)
+PY
+}
+online_key() {   # ключ страницы «Кто подключён» из настроек фильтра (пусто — страницы нет)
+  python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("online") or {}).get("key") or "")' "$SUB_FILTER_CONF" 2>/dev/null || true
+}
 sub_filter_conf_white() {   # sub_filter_conf_white 1|0 — в настройки фильтра подписки: белые списки или без них
-  WHITE="$1" WHITE_CONF="$WHITE_CONF" SUB_BASE="${SUB_BASE:-}" python3 - "$SUB_FILTER_CONF" <<'PY'
+  local admin=""
+  if [ "$1" = "1" ]; then admin="$(page_key admin)" || return 1; fi
+  WHITE="$1" WHITE_CONF="$WHITE_CONF" SUB_BASE="${SUB_BASE:-}" ADMIN="$admin" python3 - "$SUB_FILTER_CONF" <<'PY'
 import json, os, sys
 conf = json.load(open(sys.argv[1]))
 conf.pop("white", None)
+admin = os.environ["ADMIN"]
 if os.environ["WHITE"] == "1":
     w = json.load(open(os.environ["WHITE_CONF"], encoding="utf-8"))
     conf["white"] = {"file": os.path.join(w["data"], "alive.json"), "path": w["path"],
@@ -3474,10 +4526,15 @@ if os.environ["WHITE"] == "1":
                      # проверка с телефона (страница …/test/): отчёты, Xray для Android; работающие у телефона
                      # за последние hours часов — первыми в подписке; max — сколько серверов проверяет телефон
                      "phone": {"dir": os.path.join(w["data"], "phone"), "hours": 48, "max": 300,
-                               "base": os.environ.get("SUB_BASE", "")}}
+                               "base": os.environ.get("SUB_BASE", "")},
+                     # страница «Выбор серверов» (…/manage/КЛЮЧ/): ключ один и тот же при повторных запусках
+                     "admin": admin}
 with open(sys.argv[1], "w") as f:
     json.dump(conf, f, indent=1)
 PY
+}
+white_admin() {   # секретный ключ страницы «Выбор серверов»
+  python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("white") or {}).get("admin") or "")' "$SUB_FILTER_CONF" 2>/dev/null || true
 }
 white_path() {   # адрес отдельной подписки белых списков (путь на порту подписки)
   python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("path") or "")' "$WHITE_CONF" 2>/dev/null || true
@@ -3533,6 +4590,14 @@ white_summary() {   # итог для экрана и для файла с до�
     echo "  ${WHITE_URL_SUB}test/"
     echo "  Откройте на телефоне и выполните команду оттуда в Termux; работающие у вас серверы встанут"
     echo "  в подписке первыми (с ✅) и попадут в автоподбор."
+    echo "  Проще — через Happ (Android и iPhone): выключите Wi-Fi и подключитесь на 2 минуты к профилю"
+    echo "  «🧪 Проверка БС» из подписки: Happ сам пропингует все серверы, работающие у вас отметятся ✅."
+    WHITE_ADMIN_KEY="$(white_admin)"
+    if [ -n "$WHITE_ADMIN_KEY" ]; then
+      echo "Выбор серверов для подписки — все рабочие из всех списков; вручную, вручную + авто или авто"
+      echo "(ссылку никому не давайте — по ней меняется подписка):"
+      echo "  ${WHITE_URL_SUB}manage/${WHITE_ADMIN_KEY}/"
+    fi
   fi
   echo "Проверить сейчас: systemctl start vpn-white-lists   Журнал: journalctl -u vpn-white-lists -e"
 }
@@ -5823,6 +6888,7 @@ if api POST /xray/ > "$WORK/xray-get.json" && api_ok "$WORK/xray-get.json" >/dev
     BRIDGE_OUTS="${BRIDGE_OUTS[*]:-}" BRIDGE_FALLBACK="$BRIDGE_FALLBACK" PEXIT_MAP="$PEXIT_MAP" \
     BRIDGE_PREF="$BRIDGE_PREF" BRIDGE_ALT="$BRIDGE_ALT" POOL_EXPECTED="$POOL_EXPECTED" MAX_RTT="$BALANCE_MAX_RTT" \
     PANEL_LOCAL_PORT="$PANEL_LOCAL_PORT" PANEL_LOCAL_TAGS="$PANEL_LOCAL_TAGS" YOUTUBE_DIRECT="$YOUTUBE_DIRECT" \
+    ACCESS="$([ "$ONLINE_PAGE" = "1" ] && [ "$VPN_ROLE" != "exit" ] && printf '%s' "$ACCESS_LOG")" OUR_ACCESS="$ACCESS_LOG" \
     python3 - "$WORK/xray-get.json" "$WORK/xray-new.json" <<'PY' || echo "error"
 import json, os, sys
 obj = json.load(open(sys.argv[1]))["obj"]
@@ -5832,6 +6898,12 @@ tpl = obj["xraySetting"]
 if isinstance(tpl, str):
     tpl = json.loads(tpl)
 before = json.dumps(tpl, sort_keys=True)
+# журнал подключений для страницы «Кто подключён»: в памяти (/dev/shm), его читает и стирает фильтр подписки
+log_conf = tpl.setdefault("log", {})
+if os.environ.get("ACCESS"):
+    log_conf["access"] = os.environ["ACCESS"]
+elif log_conf.get("access") == os.environ.get("OUR_ACCESS"):
+    log_conf["access"] = "none"
 rules = tpl.setdefault("routing", {}).setdefault("rules", [])
 outs = tpl.setdefault("outbounds", [])
 tags = {o.get("tag") for o in outs}
@@ -6259,6 +7331,7 @@ print(json.dumps({"port": int(e["PORT"]), "upstream": int(e["UP"]), "cert": e["C
                  indent=1))
 PY
   sub_filter_conf_white "$WHITE_READY" || return 1   # белые списки: файл с рабочими и отдельный адрес
+  sub_filter_conf_online "$ONLINE_PAGE" || return 1   # страница «Кто подключён»
   sub_filter_conf_clash "$MIHOMO" || return 1         # профиль Mihomo: автовыбор, белые списки, автопереключение
   chmod 600 "$SUB_FILTER_CONF"
   cat > "$SUB_FILTER_UNIT" <<UNIT
@@ -7091,6 +8164,13 @@ else
   rm -f "$BRIDGE_FILE"
   BRIDGE_TEXT="Мост: не используется (один сервер)"
 fi
+ONLINE_URL=""
+if [ "$FILTER" = "1" ] && [ "$ONLINE_PAGE" = "1" ] && [ -n "$(online_key)" ]; then
+  ONLINE_URL="${SUB_BASE}/online/$(online_key)/"
+  echo
+  grn "Кто подключён сейчас и через что (ссылку никому не давайте):"
+  grn "${ONLINE_URL}"
+fi
 cat > "$PROFILE" <<TXT
 === Веб-панель 3X-UI ===
 Адрес:  ${PANEL_URL}
@@ -7101,6 +8181,7 @@ SSL:    $([ "$SSL_OK" = "1" ] && echo "включён (сертификат на
 === Подписка (добавлять в приложение) ===
 Ссылка:      ${SUB_URL}
 JSON-версия: ${JSON_URL}
+$([ -n "$ONLINE_URL" ] && echo "Кто подключён: ${ONLINE_URL}")
 Правила: РФ-сайты и РФ-IP — напрямую; реклама и трекеры — ${ADS_TEXT}; остальное — через VPN.
 ${BRIDGE_TEXT}
 

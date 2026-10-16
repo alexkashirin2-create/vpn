@@ -50,6 +50,12 @@
 #     Первыми в подписке и в автоподборе — вход в России (проходит белые списки по IP), выход за рубежом
 #     («… · РФ→🌍»); с выходом в России («… · выход РФ») заблокированные сайты не откроются — они в конце
 #     списка и не попадают в автоподбор. WHITE_RU_EXIT=drop — убрать их из подписки совсем.
+#   • ВАРИАНТЫ ПОДКЛЮЧЕНИЯ — если провайдер режет один, работает другой («Автовыбор» сам берёт рабочий):
+#       Reality и XHTTP + Reality — на российском сервере маскируются под СВОЙ домен (REALITY_SELF=auto):
+#       провайдер видит SNI, который и правда указывает на IP сервера, а посторонним отвечает панель
+#       с настоящим сертификатом; запасной XHTTP-RU — маскировка под российский сайт (ya.ru, ozon.ru…);
+#       XHTTP + TLS и WebSocket + TLS — свой сертификат; Hysteria2 — QUIC по UDP.
+#       Служба vpn-watch каждые 2 минуты проверяет каждое подключение и ставит рабочие Reality первыми.
 #   • TUNNEL (Android, github.com/hussaroff/tunnel) И ДРУГИЕ ПРИЛОЖЕНИЯ НА MIHOMO (FlClash, Clash Meta,
 #     Clash Verge) получают полный профиль Mihomo: свои подключения и «🚀 Автовыбор», белые списки
 #     с автовыбором и «🔀 Автопереключение» — свой VPN, а когда он не отвечает (белые списки), сразу
@@ -107,6 +113,9 @@ SNI_USER="${SNI:-}"                   # SNI указан в команде — �
 SNI="${SNI:-www.microsoft.com}"       # домен-маскировка Reality (TLS 1.3, открыт из РФ)
 VPN_PORT="${VPN_PORT:-443}"           # порт VPN-подключения
 XHTTP_PORT="${XHTTP_PORT:-8443}"      # второе подключение VLESS + XHTTP (сайты открываются быстрее); 0 — не создавать
+REALITY_SELF="${REALITY_SELF:-auto}"   # Reality под свой домен (SNI — домен этого сервера, посторонним отвечает панель с настоящим
+                                       # сертификатом): auto — на российском сервере с SSL; 1 — всегда (нужен SSL на домен); 0 — нет
+XHTTP_TLS_PORT="${XHTTP_TLS_PORT:-2087}"   # вариант VLESS + XHTTP + TLS на свой сертификат (как WS, но HTTP/2 — быстрее); 0 — нет
 REALITY_ALT="${REALITY_ALT:-auto}"   # запасной Reality с российской маскировкой: auto — если сервер в РФ, а SNI зарубежный; 1 — всегда; 0 — нет
 REALITY_ALT_PORT="${REALITY_ALT_PORT:-9443}"   # его порт
 REALITY_ALT_SNI="${REALITY_ALT_SNI:-ya.ru www.ozon.ru www.wildberries.ru vk.com mail.ru www.gosuslugi.ru}"   # кандидаты: берётся первый, что открывается с сервера
@@ -203,6 +212,7 @@ if ! [[ "$XHTTP_PORT" =~ ^[0-9]+$ ]] || [ "$XHTTP_PORT" -gt 65535 ]; then die "X
 XHTTP_LABEL="${XHTTP_LABEL:-${LABEL%-Reality}-XHTTP}"
 if ! [[ "$WS_PORT" =~ ^[0-9]+$ ]] || [ "$WS_PORT" -gt 65535 ]; then die "WS_PORT указан неверно: ${WS_PORT}"; fi
 WS_LABEL="${WS_LABEL:-${LABEL%-Reality}-WS}"
+XTLS_LABEL="${XTLS_LABEL:-${LABEL%-Reality}-XHTTP-TLS}"
 if ! [[ "$HY2_PORT" =~ ^[0-9]+$ ]] || [ "$HY2_PORT" -gt 65535 ]; then die "HY2_PORT указан неверно: ${HY2_PORT}"; fi
 HY2_LABEL="${HY2_LABEL:-${LABEL%-Reality}-Hysteria2}"
 AUTO_LABEL="${AUTO_LABEL:-🚀 Автовыбор}"          # профиль, в котором телефон сам выбирает лучшие пути
@@ -218,6 +228,13 @@ if [[ "$BALANCE_APP_RTT" =~ ^[0-9]+$ ]]; then BALANCE_APP_RTT="${BALANCE_APP_RTT
 case "$BALANCE_APP_RTT" in *ms) APP_RTT_TEXT="${BALANCE_APP_RTT%ms} мс" ;; *) APP_RTT_TEXT="${BALANCE_APP_RTT%s} с" ;; esac
 [ "$SUB_FILTER" = "0" ] || SUB_FILTER=1
 { [[ "$REALITY_ALT_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$REALITY_ALT_PORT" -le 65535 ]; } || die "REALITY_ALT_PORT указан неверно: ${REALITY_ALT_PORT}"
+{ [[ "$XHTTP_TLS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$XHTTP_TLS_PORT" -le 65535 ]; } || die "XHTTP_TLS_PORT указан неверно: ${XHTTP_TLS_PORT}"
+case "$SNI_USER" in
+  auto) SNI_USER=""; SNI="www.microsoft.com" ;;
+  self) REALITY_SELF=1 ;;   # SNI=self — то же, что REALITY_SELF=1
+esac
+EXIT_SNI_ARG="$SNI_USER"   # зарубежным выходам моста — только явно заданный сайт (свой домен у них не нужен)
+if [ "$SNI_USER" = "self" ]; then EXIT_SNI_ARG=""; fi
 [ "$EXIT_DIRECT" = "0" ] || EXIT_DIRECT=1
 case "$(printf '%s' "$WHITE_LISTS" | tr '[:upper:]' '[:lower:]')" in
   "") WHITE_LISTS="" ;;
@@ -608,7 +625,8 @@ PY
 }
 reality_sni_hint() {   # reality_sni_hint IP-сервера SNI — подсказка: российский сервер с зарубежной маскировкой
   local cc
-  case "$2" in *.ru|*.su|*.xn--p1ai|*.рф) return 0 ;; esac
+  if [ "${SELF_ON:-0}" = "1" ]; then return 0; fi
+  case "$2" in *.ru|*.su|*.xn--p1ai|*.рф|*.sslip.io|*.nip.io) return 0 ;; esac
   cc="$(ip_country "$1")"
   if [ "$cc" = "RU" ]; then
     ylw "    ! Сервер в России, а маскировка Reality — зарубежный сайт (${2}). Провайдеры часто режут такие"
@@ -628,7 +646,8 @@ if [ "${CHECK:-}" = "1" ]; then   # только самопроверка: ни�
 for (s,) in sqlite3.connect(sys.argv[1], timeout=30).execute("SELECT stream_settings FROM inbounds WHERE port=?", (int(sys.argv[2]),)):
     n = ((json.loads(s or "{}").get("realitySettings") or {}).get("serverNames") or [""])[0]
     if n: print(n); break' "$DB" "$VPN_PORT" 2>/dev/null || true)"
-  if [ -n "$C_SNI" ] && [ -n "$C_IP" ]; then reality_sni_hint "$C_IP" "$C_SNI"; fi
+  C_HOST="$(printf '%s' "$C_SUB" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
+  if [ -n "$C_SNI" ] && [ -n "$C_IP" ] && [ "$C_SNI" != "$C_HOST" ]; then reality_sni_hint "$C_IP" "$C_SNI"; fi
   echo "Итог: работают ${OWN_OK}, не работают ${OWN_FAIL}. Проверка идёт с сервера: если здесь ✓, а в приложении «н/д» — подключение режет сеть телефона."
   exit 0
 fi
@@ -4127,7 +4146,9 @@ for (s,) in sqlite3.connect(sys.argv[1], timeout=30).execute("SELECT stream_sett
     n = ((json.loads(s or "{}").get("realitySettings") or {}).get("serverNames") or [""])[0]
     if n: print(n); break' "$DB" "$VPN_PORT" 2>/dev/null || true)}"
 SNI_NOW="${SNI_NOW:-$SNI}"
-if sni_check "$SNI_NOW"; then
+if [ "$SNI_NOW" = "self" ] || [ "$SNI_NOW" = "$ADDR" ]; then
+  grn "    Маскировка Reality — свой домен (${ADDR})."
+elif sni_check "$SNI_NOW"; then
   grn "    Маскировка Reality ${SNI_NOW}: открывается с сервера."
 else
   ylw "    ✗ Маскировка Reality ${SNI_NOW} не открывается с этого сервера по TLS 1.3 — подключения Reality"
@@ -4201,7 +4222,7 @@ setup_exit() {
   exit_ssh "cat > install-vpn-all.sh && chmod 700 install-vpn-all.sh" < "$self" \
     || die "Не удалось передать скрипт на ${EXIT_HOST}."
   printf -v cmd '%sVPN_ROLE=exit VPN_PORT=%q XHTTP_PORT=%q SNI=%q LABEL=%q XUI_VERSION=%q EXIT_LOGIN=%q FREETURN=%q FREETURN_PORT=%q FREETURN_CALL=%q bash install-vpn-all.sh' \
-    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$EXIT_XHTTP_PORT" "$SNI" "bridge-exit" "$XUI_VERSION" "$EXIT_USER" \
+    "${sudo:+$sudo }" "$EXIT_VPN_PORT" "$EXIT_XHTTP_PORT" "$EXIT_SNI_ARG" "bridge-exit" "$XUI_VERSION" "$EXIT_USER" \
     "$FREETURN" "$FREETURN_PORT" "$FREETURN_CALL"
   rm -f "$EXIT_OUT"
   if ! exit_input | exit_ssh "$cmd" 2>&1 | exit_filter; then
@@ -4556,7 +4577,30 @@ if [ "$VPN_ROLE" != "exit" ]; then   # выходу моста сертифик�
 fi
 
 # ============================================================================
+# Reality под свой домен (self): SNI — домен этого сервера, который и правда указывает на его IP, а посторонним
+# (и проверкам провайдера) отвечает сама панель с настоящим сертификатом на этот домен. Маскировку под чужой
+# сайт (apple.com, ya.ru) провайдеры режут, сверяя SNI с IP; свой домен эту проверку проходит.
+REALITY_TARGET=""; SELF_ON=0
+if [ "$VPN_ROLE" != "exit" ]; then
+  WANT_SELF=0
+  case "$REALITY_SELF" in
+    1|on|yes) WANT_SELF=1 ;;
+    0|off|no) WANT_SELF=0 ;;
+    *) if [ -z "$SNI_USER" ] && [ "$(ip_country "$SERVER_IP")" = "RU" ]; then WANT_SELF=1; fi ;;
+  esac
+  if [ "$WANT_SELF" = "1" ]; then
+    if [ "$SSL_OK" = "1" ] && ! is_ipv4 "$ADDR"; then
+      SELF_ON=1; SNI="$ADDR"; SNI_USER="$ADDR"; REALITY_TARGET="127.0.0.1:${PANEL_PORT}"
+    else
+      ylw "    Reality под свой домен невозможен без SSL-сертификата на домен — маскировка остаётся прежней."
+    fi
+  fi
+  if [ "$SNI_USER" = "self" ]; then SNI_USER=""; SNI="www.microsoft.com"; fi   # не получилось — как обычно
+fi
 step "Готовлю подключение VLESS + Reality..."
+if [ "$SELF_ON" = "1" ]; then
+  grn "    Reality маскируется под свой домен ${ADDR}: посторонним отвечает панель с настоящим сертификатом."
+fi
 XRAY_BIN=""
 for f in "$XUI_DIR"/bin/xray-linux-*; do
   if [ -x "$f" ]; then XRAY_BIN="$f"; break; fi
@@ -4623,7 +4667,7 @@ create_inbound() {
       if [ "$n" -gt 1 ]; then email="bridge-${SERVER_IP}-${n}"; fi
     fi
     UUID="$UUID" PRIVATE_KEY="$PRIVATE_KEY" PUBLIC_KEY="$PUBLIC_KEY" SHORT_ID="$SHORT_ID" SUB_ID="$SUB_ID" \
-    SNI="$SNI" VPN_PORT="$VPN_PORT" LABEL="$LABEL" SHARE_ADDR="$ADDR" CLIENT_EMAIL="$email" COMMENT="$BRIDGE_COMMENT" \
+    SNI="$SNI" TARGET="$REALITY_TARGET" VPN_PORT="$VPN_PORT" LABEL="$LABEL" SHARE_ADDR="$ADDR" CLIENT_EMAIL="$email" COMMENT="$BRIDGE_COMMENT" \
     python3 - > "$WORK/inbound.json" <<'PY'
 import json, os
 e = os.environ
@@ -4633,7 +4677,7 @@ settings = {"clients": [{"id": e["UUID"], "flow": "xtls-rprx-vision", "email": e
             # "encryption" обязателен: без него JSON-подписка даёт конфиг, который новый Xray не принимает
             "decryption": "none", "encryption": "none", "fallbacks": []}
 stream = {"network": "tcp", "security": "reality", "externalProxy": [],
-          "realitySettings": {"show": False, "xver": 0, "target": e["SNI"] + ":443",
+          "realitySettings": {"show": False, "xver": 0, "target": e.get("TARGET") or e["SNI"] + ":443",
                               "serverNames": [e["SNI"]], "privateKey": e["PRIVATE_KEY"],
                               "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
                               "shortIds": [e["SHORT_ID"]], "mldsa65Seed": "",
@@ -4666,7 +4710,7 @@ PY
 sync_share_addr() {   # sync_share_addr [id] [название] [метка] [адрес|keep] — ссылки ведут на выбранный адрес (после смены IP или домена)
   local st id="${1:-$INB_ID}"
   api GET "/inbounds/get/${id}" > "$WORK/inb-get.json" || return 1
-  st="$(SHARE_ADDR="${4:-$ADDR}" NEW_REMARK="${2:-}" NEW_TAG="${3:-}" NEW_SNI="$([ -z "${4:-}" ] && printf '%s' "$SNI_USER")" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
+  st="$(SHARE_ADDR="${4:-$ADDR}" NEW_REMARK="${2:-}" NEW_TAG="${3:-}" NEW_SNI="$([ -z "${4:-}" ] && printf '%s' "$SNI_USER")" NEW_TARGET="$([ -z "${4:-}" ] && printf '%s' "$REALITY_TARGET")" python3 - "$WORK/inb-get.json" "$WORK/inb-upd.json" <<'PY' 2>/dev/null || echo "error"
 import json, os, sys
 ib = json.load(open(sys.argv[1]))["obj"]
 if isinstance(ib, str):
@@ -4687,10 +4731,11 @@ if sni:                                 # SNI из команды: новая м
     st = ib.get("streamSettings")
     st = json.loads(st) if isinstance(st, str) and st else (st or {})
     rs = st.get("realitySettings") if st.get("security") == "reality" else None
-    if isinstance(rs, dict) and (rs.get("serverNames") != [sni] or (rs.get("target") or rs.get("dest")) != sni + ":443"):
+    target = e.get("NEW_TARGET") or sni + ":443"   # свой домен — цель сама панель, иначе сайт маскировки
+    if isinstance(rs, dict) and (rs.get("serverNames") != [sni] or (rs.get("target") or rs.get("dest")) != target):
         rs["serverNames"] = [sni]
         rs.pop("dest", None)
-        rs["target"] = sni + ":443"
+        rs["target"] = target
         ib["streamSettings"] = st
         if state == "same":
             state = "changed"
@@ -4778,14 +4823,14 @@ create_xhttp_inbound() {   # create_xhttp_inbound порт название по
   new_reality_keys || { ylw "    Не удалось сгенерировать ключи Reality."; return 1; }
   MK_PBK="$NK_PUB"; MK_SID="$(openssl rand -hex 8)"; MK_PATH="/assets/$(openssl rand -hex 4)/media"
   PRIV="$NK_PRIV" PUB="$MK_PBK" SID="$MK_SID" XSNI="$SNI" XPATH="$MK_PATH" XPORT="$1" XLABEL="$2" SORT="$3" \
-  XTAG="${4:-}" SHARE_ADDR="$ADDR" XMUX="$XMUX_JSON" python3 - > "$WORK/mk.json" <<'PY'
+  XTAG="${4:-}" XTARGET="$REALITY_TARGET" SHARE_ADDR="$ADDR" XMUX="$XMUX_JSON" python3 - > "$WORK/mk.json" <<'PY'
 import json, os
 e = os.environ
 stream = {"network": "xhttp", "security": "reality", "externalProxy": [],
           "xhttpSettings": {"path": e["XPATH"], "host": "", "headers": {}, "mode": "auto",
                             "xPaddingBytes": "100-1000", "scStreamUpServerSecs": "20-80",
                             "noSSEHeader": False, "xmux": json.loads(e["XMUX"])},
-          "realitySettings": {"show": False, "xver": 0, "target": e["XSNI"] + ":443",
+          "realitySettings": {"show": False, "xver": 0, "target": e.get("XTARGET") or e["XSNI"] + ":443",
                               "serverNames": [e["XSNI"]], "privateKey": e["PRIV"],
                               "minClientVer": "", "maxClientVer": "", "maxTimediff": 0,
                               "shortIds": [e["SID"]], "mldsa65Seed": "",
@@ -4983,6 +5028,98 @@ elif [ "$WS_PORT" != "0" ] && [ "$VPN_ROLE" != "exit" ] && [ "$SSL_OK" = "1" ]; 
   ylw "    WebSocket не настроился — остаются другие подключения."
 fi
 
+# Ещё вариант — VLESS + XHTTP + настоящий TLS на сертификат этого сервера: проходит там же, где WebSocket
+# (провайдер видит обычный HTTPS на свой домен), но по HTTP/2 и с переиспользованием соединений — быстрее.
+XTLS_OK=0; XTLS_ID=""; XTLS_PATH=""
+ensure_xhttp_tls() {
+  local st id has msg p
+  if [ "$XHTTP_TLS_PORT" = "0" ] || [ "$VPN_ROLE" = "exit" ] || [ "$SSL_OK" != "1" ]; then return 0; fi
+  for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80 "$REALITY_ALT_PORT"; do
+    if [ "$XHTTP_TLS_PORT" = "$p" ]; then ylw "    XHTTP_TLS_PORT совпадает с другим портом — XHTTP + TLS пропускаю."; return 0; fi
+  done
+  if [ "${CLIENT_EMAIL:--}" = "-" ]; then return 0; fi
+  api GET /inbounds/list > "$WORK/inbounds-xt.json" || return 1
+  read -r st id has < <(PORT="$XHTTP_TLS_PORT" UUID="$UUID" ADDR="$ADDR" CERT="$CERT" python3 - "$WORK/inbounds-xt.json" <<'PY' 2>/dev/null || echo "error - -"
+import json, os, sys
+def obj(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v) if v else {}
+        except ValueError:
+            return {}
+    return v or {}
+for ib in json.load(open(sys.argv[1])).get("obj") or []:
+    if int(ib.get("port") or 0) != int(os.environ["PORT"]):
+        continue
+    s, st = obj(ib.get("settings")), obj(ib.get("streamSettings"))
+    if ib.get("protocol") in ("hysteria", "wireguard", "amneziawg", "tuic") or st.get("network") in ("kcp", "quic"):
+        continue        # UDP-подключение TCP-порту не мешает
+    ts = st.get("tlsSettings") or {}
+    cert = ((ts.get("certificates") or [{}])[0]).get("certificateFile")
+    if (ib.get("protocol") == "vless" and st.get("network") == "xhttp" and st.get("security") == "tls"
+            and ts.get("serverName") == os.environ["ADDR"] and cert == os.environ["CERT"]):
+        has = any(c.get("id") == os.environ["UUID"] for c in (s.get("clients") or []))
+        print("reuse", ib["id"], "yes" if has else "no")
+    elif ib.get("tag") == "vpn-xhttp-tls":
+        print("replace", ib["id"], "-")     # наше, но сертификат на другой адрес — создаём заново
+    else:
+        print("busy", ib["id"], "-")
+    break
+else:
+    print("none - -")
+PY
+)
+  case "$st" in
+    reuse)
+      XTLS_ID="$id"
+      sync_share_addr "$XTLS_ID" "$XTLS_LABEL" || true ;;
+    replace|none)
+      if [ "$st" = "replace" ]; then api POST "/inbounds/del/${id}" >/dev/null 2>&1 || true; fi
+      XTLS_PATH="/api/v1/stream/$(openssl rand -hex 8)"
+      XPORT="$XHTTP_TLS_PORT" XPATH="$XTLS_PATH" XLABEL="$XTLS_LABEL" ADDR="$ADDR" CERT="$CERT" KEY="$KEY" \
+      XMUX="$XMUX_JSON" python3 - > "$WORK/xtls.json" <<'PY'
+import json, os
+e = os.environ
+stream = {"network": "xhttp", "security": "tls", "externalProxy": [],
+          "xhttpSettings": {"path": e["XPATH"], "host": e["ADDR"], "headers": {}, "mode": "auto",
+                            "xPaddingBytes": "100-1000", "scStreamUpServerSecs": "20-80",
+                            "noSSEHeader": False, "xmux": json.loads(e["XMUX"])},
+          "tlsSettings": {"serverName": e["ADDR"], "minVersion": "1.2", "maxVersion": "1.3",
+                          "cipherSuites": "", "rejectUnknownSni": False, "disableSystemRoot": False,
+                          "enableSessionResumption": False,
+                          "certificates": [{"certificateFile": e["CERT"], "keyFile": e["KEY"],
+                                            "ocspStapling": 3600, "oneTimeLoading": False,
+                                            "usage": "encipherment", "buildChain": False}],
+                          "alpn": ["h2", "http/1.1"],
+                          "settings": {"allowInsecure": False, "fingerprint": "chrome", "echConfigList": ""}}}
+settings = {"clients": [], "decryption": "none", "encryption": "none", "fallbacks": []}
+sniffing = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"],
+            "metadataOnly": False, "routeOnly": False}
+print(json.dumps({"remark": e["XLABEL"], "enable": True, "listen": "", "port": int(e["XPORT"]),
+                  "protocol": "vless", "expiryTime": 0, "total": 0, "tag": "vpn-xhttp-tls",
+                  "shareAddrStrategy": "custom", "shareAddr": e["ADDR"],
+                  "disableFlow": True, "subSortIndex": 4,
+                  "settings": json.dumps(settings), "streamSettings": json.dumps(stream),
+                  "sniffing": json.dumps(sniffing)}))
+PY
+      api POST /inbounds/add "$WORK/xtls.json" > "$WORK/xtls-res.json" || return 1
+      if ! msg="$(api_ok "$WORK/xtls-res.json")"; then ylw "    Панель не приняла XHTTP + TLS: ${msg:-нет ответа}"; return 1; fi
+      XTLS_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["obj"]["id"])' "$WORK/xtls-res.json" 2>/dev/null || true)"
+      [ -n "$XTLS_ID" ] || return 1
+      has="no" ;;
+    busy) ylw "    Порт ${XHTTP_TLS_PORT} занят другим подключением — XHTTP + TLS пропускаю (другой порт: XHTTP_TLS_PORT=…)."; return 0 ;;
+    *) return 1 ;;
+  esac
+  if [ "$has" != "yes" ]; then attach_client "$XTLS_ID" || return 1; fi   # тот же клиент, та же подписка
+  if command -v ufw >/dev/null 2>&1; then ufw allow "${XHTTP_TLS_PORT}/tcp" >/dev/null 2>&1 || true; fi
+  XTLS_OK=1
+}
+if ensure_xhttp_tls && [ "$XTLS_OK" = "1" ]; then
+  grn "    Вариант XHTTP + TLS на порту ${XHTTP_TLS_PORT}: свой сертификат и HTTP/2 — проходит там же, где WebSocket, но быстрее."
+elif [ "$XHTTP_TLS_PORT" != "0" ] && [ "$VPN_ROLE" != "exit" ] && [ "$SSL_OK" = "1" ]; then
+  ylw "    XHTTP + TLS не настроился — остаются другие подключения."
+fi
+
 # Четвёртое подключение — Hysteria2: QUIC по UDP. На мобильном интернете с потерями
 # обычно быстрее TCP. С Reality на том же номере порта не мешает: там TCP, здесь UDP.
 HY2_OK=0; HY2_ID=""
@@ -5131,10 +5268,10 @@ PY
     if [ "$has" != "yes" ]; then attach_client "$ALT_ID" || return 1; fi
   else
     if [ "$st" = "reuse" ]; then api POST "/inbounds/del/${id}" >/dev/null 2>&1 || true; fi
-    local main_sni="$SNI" rc=0
-    SNI="$ALT_SNI"   # create_xhttp_inbound берёт маскировку из SNI
+    local main_sni="$SNI" main_target="$REALITY_TARGET" rc=0
+    SNI="$ALT_SNI"; REALITY_TARGET=""   # create_xhttp_inbound берёт маскировку из SNI
     create_xhttp_inbound "$REALITY_ALT_PORT" "$ALT_LABEL" 3 "vpn-reality-alt" || rc=1
-    SNI="$main_sni"
+    SNI="$main_sni"; REALITY_TARGET="$main_target"
     [ "$rc" = "0" ] || return 1
     ALT_ID="$MK_ID"
     attach_client "$ALT_ID" || return 1   # тот же клиент, та же подписка
@@ -5235,7 +5372,7 @@ PY
   for n in "${EXIT_OK_N[@]}"; do
     port=$((PEXIT_BASE + n)); host="${EX_HOST[$n]}"; id=""
     remark="$(exit_base "$n") (через РФ)"; tag="${PEXIT_TAG_PREFIX}${host}"
-    for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80 "$REALITY_ALT_PORT"; do
+    for p in "$VPN_PORT" "$XHTTP_PORT" "$WS_PORT" "$SUB_PORT" "$PANEL_PORT" 80 "$REALITY_ALT_PORT" "$XHTTP_TLS_PORT"; do
       if [ "$port" = "$p" ]; then port=""; fi
     done
     if [ -z "$port" ]; then ylw "    Выход ${n}: порт $((PEXIT_BASE + n)) занят другой настройкой — отдельного подключения не будет."; continue; fi
@@ -5299,6 +5436,7 @@ ensure_autoselect() {
   if [ "$XHTTP_OK" = "1" ]; then ids+=("$XHTTP_ID"); fi
   if [ -n "${INB_ID:-}" ] && [ "$INB_ID" != "-" ]; then ids+=("$INB_ID"); fi
   if [ "$WS_OK" = "1" ]; then ids+=("$WS_ID"); fi
+  if [ "$XTLS_OK" = "1" ]; then ids+=("$XTLS_ID"); fi
   if [ "$HY2_OK" = "1" ]; then ids+=("$HY2_ID"); fi
   if [ "$ALT_OK" = "1" ]; then ids+=("$ALT_ID"); fi
   for n in "${EXIT_OK_N[@]}"; do
@@ -6198,6 +6336,10 @@ if own_conn_test "$OWN_URL" "$XRAY_BIN" "$([ "$WHITE_READY" = "1" ] && printf '%
   fi
 fi
 reality_sni_hint "$SERVER_IP" "$SNI"
+if [ "$SELF_ON" = "1" ] && [ "$SSL_OK" != "1" ]; then
+  ylw "    ! Reality под свой домен отвечает посторонним через панель, а SSL у панели не включился —"
+  ylw "      запустите скрипт ещё раз (или с SNI=www.apple.com, чтобы вернуть маскировку под чужой сайт)."
+fi
 case "$CHECK_SERVER" in
   ok)   grn "    ✓ Сервер: рекламный домен уходит в блок" ;;
   fail) ylw "    ✗ Сервер: проверка фильтра рекламы не прошла" ;;
@@ -6623,15 +6765,17 @@ if [ -n "$TUNNEL_URL" ]; then
   echo "  • Tunnel (Android): ссылка «Открыть в Tunnel» — ниже, в разделе TUNNEL."
   echo "  • FlClash, Clash Meta, Clash Verge: эта же ссылка — они сами получат профиль Mihomo."
 fi
-if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUTO_OK" = "1" ] || [ -n "$WHITE_URL_SUB" ]; then
+if [ "$XHTTP_OK" = "1" ] || [ "$WS_OK" = "1" ] || [ "$XTLS_OK" = "1" ] || [ "$HY2_OK" = "1" ] || [ "$AUTO_OK" = "1" ] || [ -n "$WHITE_URL_SUB" ]; then
   echo "Подключения в подписке:"
   if [ "$FILTER_TUNE" = "1" ]; then
     echo "  • «${AUTO_LABEL}» — приложение само ведёт трафик через лучшие подключения (одновременно — ${BALANCE_EXPECTED});"
     echo "    пинг больше ${APP_RTT_TEXT} или потери — подключение отключается (выберите этот профиль);"
   elif [ "$AUTO_OK" = "1" ]; then echo "  • «${AUTO_LABEL}» — приложение само выбирает лучший путь (выберите его);"; fi
-  if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}» — XHTTP: сайты открываются быстрее;"; fi
-  echo "  • «${LABEL}» — обычное Reality, запасное;"
+  if [ "$SELF_ON" = "1" ]; then MASK_TEXT="маскировка под свой домен ${ADDR}"; else MASK_TEXT="маскировка под ${SNI}"; fi
+  if [ "$XHTTP_OK" = "1" ]; then echo "  • «${XHTTP_LABEL}» — XHTTP + Reality (${MASK_TEXT}): сайты открываются быстрее;"; fi
+  echo "  • «${LABEL}» — Reality (${MASK_TEXT});"
   if [ "$WS_OK" = "1" ]; then echo "  • «${WS_LABEL}» — WebSocket + TLS, как «LTE»-профили; через CDN — для режима белых списков;"; fi
+  if [ "$XTLS_OK" = "1" ]; then echo "  • «${XTLS_LABEL}» — XHTTP + TLS на свой сертификат: как WebSocket, но быстрее (HTTP/2);"; fi
   if [ "$ALT_OK" = "1" ]; then echo "  • «${ALT_LABEL}» — запасной XHTTP с маскировкой под ${ALT_SNI}: если обычный XHTTP «н/д», берите его;"; fi
   if [ "$HY2_OK" = "1" ]; then echo "  • «${HY2_LABEL}» — Hysteria2 (QUIC по UDP): быстрее на мобильном интернете с потерями; если оператор режет UDP, не подключится — тогда берите другие;"; fi
   if [ -n "$PEXIT_LIST" ]; then echo "  • через РФ к одному зарубежному серверу, каждый отдельно: ${PEXIT_LIST};"; fi
@@ -6730,8 +6874,11 @@ SNI:       ${SNI}
 UUID:      ${UUID}
 PublicKey: ${PUBLIC_KEY}
 ShortID:   ${SHORT_ID}
+Маскировка: $([ "$SELF_ON" = "1" ] && echo "свой домен ${ADDR} (посторонним отвечает панель, порт ${PANEL_PORT})" || echo "${SNI}")
 XHTTP:     $([ "$XHTTP_OK" = "1" ] && echo "порт ${XHTTP_PORT}, путь ${XHTTP_PATH} (в подписке — первым)" || echo "не настроен")
 WebSocket: $([ "$WS_OK" = "1" ] && echo "порт ${WS_PORT}, путь ${WS_PATH}, TLS на ${ADDR}" || echo "не настроен")
+XHTTP-TLS: $([ "$XTLS_OK" = "1" ] && echo "порт ${XHTTP_TLS_PORT}, TLS на ${ADDR}" || echo "не настроен")
+XHTTP-RU:  $([ "$ALT_OK" = "1" ] && echo "порт ${REALITY_ALT_PORT}, маскировка под ${ALT_SNI}" || echo "нет")
 Hysteria2: $([ "$HY2_OK" = "1" ] && echo "UDP-порт ${HY2_PORT}, TLS на ${ADDR} (пароль у каждого клиента свой — в подписке)" || echo "не настроен")
 Автовыбор: $(if [ "$FILTER_TUNE" = "1" ]; then echo "лучших подключений одновременно — ${BALANCE_EXPECTED}, пинг до ${APP_RTT_TEXT} (настройки дописывает фильтр подписки vpn-sub-filter)"; elif [ "$AUTO_OK" = "1" ]; then echo "есть, без тонких настроек"; else echo "нет"; fi)
 Одиночная ссылка (БЕЗ правил подписки — весь трафик через VPN):

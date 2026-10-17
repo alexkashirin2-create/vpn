@@ -33,7 +33,7 @@
 #     открывается и при белых списках), сборка all_subs и другие
 #     (около 2000 разных подключений). Сервер скачивает все списки каждые 5 часов (с GitHub или
 #     зеркал), объединяет без повторов и проверяет КАЖДОЕ подключение настоящим запросом через Xray:
-#     все — раз в час, рабочие — каждые 15 минут. Нерабочее подключение пропадает из подписки сразу
+#     все — раз в час, рабочие — каждые 30 минут. Нерабочее подключение пропадает из подписки сразу
 #     после проверки. В подписку идут 15 самых быстрых рабочих по пингу (самые быстрые — первыми),
 #     после своих подключений («🏳️ БС 12 · 🇷🇺 Russia»…); есть и отдельная ссылка — только на них (до 30).
 #     АВТОПОДБОР ДЛЯ КОНКРЕТНОГО УСТРОЙСТВА — профиль «🏳️ БС 🚀 Автовыбор» (Happ, v2rayNG, v2rayN):
@@ -306,16 +306,14 @@ white_icmp_build() {
       grn "    Префиксы AS${a}…"
       js="$(curl -fsS --max-time 30 "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${a}" 2>/dev/null || true)"
       if [ -n "$js" ]; then
-        printf '%s' "$js" | python3 - >> "$pfx" <<'PY' || true
-import sys, json
+        printf '%s' "$js" | python3 -c 'import sys, json
 try:
     d = json.load(sys.stdin)
     for p in d["data"]["prefixes"]:
         if ":" not in p["prefix"]:
             print(p["prefix"])
 except Exception:
-    pass
-PY
+    pass' >> "$pfx" || true
       elif command -v whois >/dev/null 2>&1; then
         whois -h whois.radb.net -- "-i origin AS${a}" 2>/dev/null | awk '/^route:/{print $2}' >> "$pfx" || true
       else
@@ -370,6 +368,8 @@ PY
     fping -a -q -r "$WHITE_ICMP_RETRY" -t "$WHITE_ICMP_TMO" < "$cand" > "$alive" 2>/dev/null || true
   else
     local ts=$(( (WHITE_ICMP_TMO + 999) / 1000 )); [ "$ts" -lt 1 ] && ts=1
+    # $TS/$RETRY намеренно раскрываются во вложенном sh (переданы ему через окружение), не здесь
+    # shellcheck disable=SC2016
     TS="$ts" RETRY="$WHITE_ICMP_RETRY" xargs -P "$WHITE_ICMP_CONC" -I{} sh -c '
       n=0; while [ "$n" -le "$RETRY" ]; do
         ping -c1 -W "$TS" "{}" >/dev/null 2>&1 && { echo "{}"; break; }
@@ -1870,7 +1870,7 @@ stage_xray() {   # запуск Xray; порт, который Android не да
       grep -v 'deprecated' "$T/xray.log" | tail -n 3 >&2
       fail "Xray на телефоне не запустился."
     fi
-    while grep -q "\"port\":$next[,}]" "$T/run.json" || [ "$next" = "$p" ]; do next=$((next + 1)); done
+    while grep -q "\"port\":${next}[,}]" "$T/run.json" || [ "$next" = "$p" ]; do next=$((next + 1)); done
     if [ "$p" = "${BASE_PORT:-$base}" ]; then
       BASE_PORT=$next
     else
@@ -3549,6 +3549,7 @@ def download(conf, state):
                 seen.add(key)
                 links.append(link)
                 names[key] = src["name"]
+    buckets = []                                      # по источнику — свои ссылки (после общей дедупликации)
     for mirrors, (got, host, err) in zip(sources, results):   # по порядку источников — номера стабильны
         if not got:
             failed.append(source_name(mirrors))
@@ -3558,12 +3559,21 @@ def download(conf, state):
         ok += 1
         if host not in used:
             used.append(host)
+        name, bucket = source_name(mirrors), []
         for link in got:
             key = link_key(link)
             if key not in seen:
                 seen.add(key)
-                links.append(link)
-                names[key] = source_name(mirrors)
+                names[key] = name
+                bucket.append(link)
+        if bucket:
+            buckets.append(bucket)
+    # по очереди из каждого источника (round-robin): при ограничении max_items проверяются
+    # все источники поровну, а не только первые (большой список больше не вытесняет остальные)
+    for i in range(max((len(b) for b in buckets), default=0)):
+        for bucket in buckets:
+            if i < len(bucket):
+                links.append(bucket[i])
     if not links:
         raise RuntimeError("; ".join(errors[-3:]) or "источник не указан")
     links = links[:20000]                          # защита от переполнения; разные подключения — max_items

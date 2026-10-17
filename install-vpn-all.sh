@@ -4653,7 +4653,7 @@ white_summary() {   # итог для экрана и для файла с до�
 # и Mihomo отверг бы весь профиль. Российские сайты узнаются по домену.
 CLASH_DIRECT_DOMAINS="ru su xn--p1ai xn--p1acf xn--80adxhks xn--d1acj3b yandex.net yandex.com yastatic.net
 yandexcloud.net yandex.cloud vk.com vk.me vk.cc userapi.com vkuser.net vkuseraudio.net vkuservideo.net vk-cdn.net
-vk-portal.net mycdn.me mradx.net wbstatic.net ozonusercontent.com avito.st 2gis.com sberbank.com"
+vk-portal.net mycdn.me mradx.net wbstatic.net ozonusercontent.com avito.st 2gis.com sberbank.com p.rapidnas.org cdn.balelbrus.com"
 clash_rules_yaml() {   # правила профиля Mihomo: локальные сети и российские сайты — напрямую, остальное — VPN
   local c
   echo "rules:"
@@ -7346,7 +7346,7 @@ print(json.dumps({
     "RemoteDNSIP": "1.1.1.1",
     "DomesticDNSType": "DoU", "DomesticDNSDomain": "", "DomesticDNSIP": "77.88.8.8",
     "DnsHosts": {"cloudflare-dns.com": "1.1.1.1"},
-    "DirectSites": ["geosite:private", "geosite:category-ru"],   # .ru .su .рф + российские сервисы
+    "DirectSites": ["geosite:private", "geosite:category-ru", "domain:p.rapidnas.org", "domain:cdn.balelbrus.com"],   # .ru .su .рф + российские сервисы + p.rapidnas.org + cdn.balelbrus.com
     "DirectIp": ["geoip:private", "geoip:ru"],                   # локальная сеть + все IP в России
     "ProxySites": [], "ProxyIp": [],
     "BlockSites": ["geosite:category-ads-all"] if ads else [],   # реклама и трекеры
